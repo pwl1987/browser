@@ -17,10 +17,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
-const log = @import("../../log.zig");
+const lp = @import("lightpanda");
 const string = @import("../../string.zig");
+
+const Page = @import("../Page.zig");
+const FinalizerCallback = @import("../Session.zig").FinalizerCallback;
 
 const js = @import("js.zig");
 const bridge = @import("bridge.zig");
@@ -29,18 +30,16 @@ const Context = @import("Context.zig");
 const Isolate = @import("Isolate.zig");
 const TaggedOpaque = @import("TaggedOpaque.zig");
 
-const IS_DEBUG = @import("builtin").mode == .Debug;
-
 const v8 = js.v8;
+const log = lp.log;
 const CallOpts = Caller.CallOpts;
-const Allocator = std.mem.Allocator;
 
-// Where js.Context has a lifetime tied to the page, and holds the
+// Where js.Context has a lifetime tied to the frame, and holds the
 // v8::Global<v8::Context>, this has a much shorter lifetime and holds a
 // v8::Local<v8::Context>. In V8, you need a Local<v8::Context> or get anything
 // done, but the local only exists for the lifetime of the HandleScope it was
 // created on. When V8 calls into Zig, things are pretty straightforward, since
-// that callback gives us the currenty-entered V8::Local<Context>. But when Zig
+// that callback gives us the currently-entered V8::Local<Context>. But when Zig
 // has to call into V8, it's a bit more messy.
 // As a general rule, think of it this way:
 // 1 - Caller.zig is for V8 -> Zig
@@ -121,14 +120,14 @@ pub fn exec(self: *const Local, src: []const u8, name: ?[]const u8) !js.Value {
 /// https://v8.github.io/api/head/classv8_1_1ScriptCompiler.html#a3a15bb5a7dfc3f998e6ac789e6b4646a
 pub fn compileFunction(
     self: *const Local,
-    function_body: []const u8,
+    src: anytype,
     /// We tend to know how many params we'll pass; can remove the comptime if necessary.
     comptime parameter_names: []const []const u8,
     extensions: []const v8.Object,
 ) !js.Function {
     // TODO: Make configurable.
     const script_name = self.isolate.initStringHandle("anonymous");
-    const script_source = self.isolate.initStringHandle(function_body);
+    const script_source = if (@TypeOf(src) == js.String) src.handle else self.isolate.initStringHandle(src);
 
     var parameter_list: [parameter_names.len]*const v8.String = undefined;
     inline for (0..parameter_names.len) |i| {
@@ -202,20 +201,21 @@ pub fn compileAndRun(self: *const Local, src: []const u8, name: ?[]const u8) !js
 //      we can just grab it from the identity_map)
 pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object, value: anytype) !js.Object {
     const ctx = self.ctx;
-    const origin_arena = ctx.origin.arena;
+    const context_arena = ctx.arena;
 
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
         .@"struct" => {
             // Struct, has to be placed on the heap
-            const heap = try origin_arena.create(T);
+            const heap = try context_arena.create(T);
             heap.* = value;
             return self.mapZigInstanceToJs(js_obj_handle, heap);
         },
         .pointer => |ptr| {
             const resolved = resolveValue(value);
 
-            const gop = try ctx.origin.addIdentity(@intFromPtr(resolved.ptr));
+            const resolved_ptr_id = @intFromPtr(resolved.ptr);
+            const gop = try ctx.addIdentity(resolved_ptr_id);
             if (gop.found_existing) {
                 // we've seen this instance before, return the same object
                 return (js.Object.Global{ .handle = gop.value_ptr.* }).local(self);
@@ -244,7 +244,10 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object, 
                 // The TAO contains the pointer to our Zig instance as
                 // well as any meta data we'll need to use it later.
                 // See the TaggedOpaque struct for more details.
-                const tao = try origin_arena.create(TaggedOpaque);
+                // Use identity_arena so TAOs survive context destruction. V8 objects
+                // are stored in identity_map (session-level) and may be referenced
+                // after their creating context is destroyed (e.g., via microtasks).
+                const tao = try ctx.identity_arena.create(TaggedOpaque);
                 tao.* = .{
                     .value = resolved.ptr,
                     .prototype_chain = resolved.prototype_chain.ptr,
@@ -264,31 +267,34 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object, 
             // dont' use js_obj.persist(), because we don't want to track this in
             // context.global_objects, we want to track it in context.identity_map.
             v8.v8__Global__New(isolate.handle, js_obj.handle, gop.value_ptr);
-            if (@hasDecl(JsApi.Meta, "finalizer")) {
-                // It would be great if resolved knew the resolved type, but I
-                // can't figure out how to make that work, since it depends on
-                // the [runtime] `value`.
-                // We need the resolved finalizer, which we have in resolved.
-                //
-                // The above if statement would be more clear as:
-                //    if (resolved.finalizer_from_v8) |finalizer| {
-                // But that's a runtime check.
-                // Instead, we check if the base has finalizer. The assumption
-                // here is that if a resolve type has a finalizer, then the base
-                // should have a finalizer too.
-                const fc = try ctx.origin.createFinalizerCallback(ctx.session, gop.value_ptr.*, resolved.ptr, resolved.finalizer_from_zig.?);
-                {
-                    errdefer fc.deinit();
-                    try ctx.origin.finalizer_callbacks.put(ctx.origin.arena, @intFromPtr(resolved.ptr), fc);
-                }
+            if (resolved.finalizer) |finalizer| {
+                const finalizer_ptr_id = finalizer.ptr_id;
 
-                conditionallyReference(value);
-                if (@hasDecl(JsApi.Meta, "weak")) {
-                    if (comptime IS_DEBUG) {
-                        std.debug.assert(JsApi.Meta.weak == true);
-                    }
-                    v8.v8__Global__SetWeakFinalizer(gop.value_ptr, fc, resolved.finalizer_from_v8, v8.kParameter);
+                const page = ctx.page;
+                const session = page.session;
+                const finalizer_gop = try page.finalizer_callbacks.getOrPut(page.frame_arena, finalizer_ptr_id);
+                if (finalizer_gop.found_existing == false) {
+                    // This is the first context (and very likely only one) to
+                    // see this Zig instance. We need to create the FinalizerCallback
+                    // so that we can cleanup on Page teardown if v8 doesn't finalize.
+                    errdefer _ = page.finalizer_callbacks.remove(finalizer_ptr_id);
+                    finalizer.acquire_ref(finalizer_ptr_id);
+                    finalizer_gop.value_ptr.* = try self.createFinalizerCallback(resolved_ptr_id, finalizer_ptr_id, finalizer.release_ref_from_zig);
                 }
+                const fc = finalizer_gop.value_ptr.*;
+                const identity_finalizer = try session.fc_identity_pool.create();
+                identity_finalizer.* = .{
+                    .page = page,
+                    .session = session,
+                    .identity = ctx.identity,
+                    .finalizer_ptr_id = finalizer_ptr_id,
+                    .resolved_ptr_id = resolved_ptr_id,
+                    .next = fc.identities,
+                };
+                fc.identities = identity_finalizer;
+                fc.identity_count += 1;
+
+                v8.v8__Global__SetWeakFinalizer(gop.value_ptr, identity_finalizer, finalizer.release_ref, v8.kParameter);
             }
             return js_obj;
         },
@@ -332,7 +338,15 @@ pub fn zigValueToJs(self: *const Local, value: anytype, comptime opts: CallOpts)
                 }
 
                 if (@typeInfo(ptr.child) == .@"struct" and @hasDecl(ptr.child, "runtimeGenericWrap")) {
-                    const wrap = try value.runtimeGenericWrap(self.ctx.page);
+                    const frame = switch (self.ctx.global) {
+                        .frame => |f| f,
+                        .worker => {
+                            // No Worker-related API currently uses this, so haven't
+                            // added support for it
+                            unreachable;
+                        },
+                    };
+                    const wrap = try value.runtimeGenericWrap(frame);
                     return self.zigValueToJs(wrap, opts);
                 }
 
@@ -404,12 +418,23 @@ pub fn zigValueToJs(self: *const Local, value: anytype, comptime opts: CallOpts)
                 js.Promise.Temp,
                 js.PromiseResolver.Global,
                 js.Module.Global => return .{ .local = self, .handle = @ptrCast(value.local(self).handle) },
+
+                js.Undefined => return .{.local = self, .handle = isolate.initUndefined() },
+
                 else => {}
             }
             // zig fmt: on
 
             if (@hasDecl(T, "runtimeGenericWrap")) {
-                const wrap = try value.runtimeGenericWrap(self.ctx.page);
+                const frame = switch (self.ctx.global) {
+                    .frame => |f| f,
+                    .worker => {
+                        // No Worker-related API currently uses this, so haven't
+                        // added support for it
+                        unreachable;
+                    },
+                };
+                const wrap = try value.runtimeGenericWrap(frame);
                 return self.zigValueToJs(wrap, opts);
             }
 
@@ -503,7 +528,7 @@ pub fn jsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !T {
         .optional => |o| {
             // If type type is a ?js.Value or a ?js.Object, then we want to pass
             // a js.Object, not null. Consider a function,
-            //    _doSomething(arg: ?Env.JsObjet) void { ... }
+            //    _doSomething(arg: ?Env.JsObject) void { ... }
             //
             // And then these two calls:
             //   doSomething();
@@ -719,6 +744,7 @@ fn jsValueToStruct(self: *const Local, comptime T: type, js_val: js.Value) !?T {
                 else => unreachable,
             };
         },
+        js.String => return js_val.isString(),
         string.String => {
             const js_str = js_val.isString() orelse return null;
             return try js_str.toSSO(false);
@@ -779,64 +805,78 @@ fn jsValueToTypedArray(comptime T: type, js_val: js.Value) !?[]T {
     }
 
     const backing_store_ptr = v8.v8__ArrayBuffer__GetBackingStore(array_buffer orelse return null);
+    if (byte_len == 0) {
+        return &[_]T{};
+    }
+
     const backing_store_handle = v8.std__shared_ptr__v8__BackingStore__get(&backing_store_ptr).?;
     const data = v8.v8__BackingStore__Data(backing_store_handle);
+    const base = @as([*]u8, @ptrCast(data)) + byte_offset;
+
+    // 2. Validate alignment
+    if (@intFromPtr(base) % @alignOf(T) != 0) {
+        return error.InvalidAlignment;
+    }
+    const num_elements = byte_len / @sizeOf(T);
 
     switch (T) {
         u8 => {
             if (force_u8 or js_val.isUint8Array() or js_val.isUint8ClampedArray()) {
-                if (byte_len == 0) return &[_]u8{};
-                const arr_ptr = @as([*]u8, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len];
+                return base[0..num_elements];
             }
         },
         i8 => {
             if (js_val.isInt8Array()) {
-                if (byte_len == 0) return &[_]i8{};
-                const arr_ptr = @as([*]i8, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len];
+                const ptr = @as([*]i8, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         u16 => {
             if (js_val.isUint16Array()) {
-                if (byte_len == 0) return &[_]u16{};
-                const arr_ptr = @as([*]u16, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len / 2];
+                const ptr = @as([*]u16, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         i16 => {
             if (js_val.isInt16Array()) {
-                if (byte_len == 0) return &[_]i16{};
-                const arr_ptr = @as([*]i16, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len / 2];
+                const ptr = @as([*]i16, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         u32 => {
             if (js_val.isUint32Array()) {
-                if (byte_len == 0) return &[_]u32{};
-                const arr_ptr = @as([*]u32, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len / 4];
+                const ptr = @as([*]u32, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         i32 => {
             if (js_val.isInt32Array()) {
-                if (byte_len == 0) return &[_]i32{};
-                const arr_ptr = @as([*]i32, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len / 4];
+                const ptr = @as([*]i32, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         u64 => {
             if (js_val.isBigUint64Array()) {
-                if (byte_len == 0) return &[_]u64{};
-                const arr_ptr = @as([*]u64, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len / 8];
+                const ptr = @as([*]u64, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         i64 => {
             if (js_val.isBigInt64Array()) {
-                if (byte_len == 0) return &[_]i64{};
-                const arr_ptr = @as([*]i64, @ptrCast(@alignCast(data)));
-                return arr_ptr[byte_offset .. byte_offset + byte_len / 8];
+                const ptr = @as([*]i64, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
+            }
+        },
+        f32 => {
+            if (js_val.isFloat32Array()) {
+                const ptr = @as([*]f32, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
+            }
+        },
+        f64 => {
+            if (js_val.isFloat64Array()) {
+                const ptr = @as([*]f64, @ptrCast(@alignCast(base)));
+                return ptr[0..num_elements];
             }
         },
         else => {},
@@ -965,6 +1005,12 @@ fn probeJsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !Pr
                             return .{ .ok = {} };
                         },
                         i64 => if (js_val.isBigInt64Array()) {
+                            return .{ .ok = {} };
+                        },
+                        f32 => if (js_val.isFloat32Array()) {
+                            return .{ .ok = {} };
+                        },
+                        f64 => if (js_val.isFloat64Array()) {
                             return .{ .ok = {} };
                         },
                         else => {},
@@ -1123,12 +1169,19 @@ fn jsUnsignedIntToZig(comptime T: type, max: comptime_int, maybe: u32) !T {
 // This function recursively walks the _type union field (if there is one) to
 // get the most specific class_id possible.
 const Resolved = struct {
-    weak: bool,
     ptr: *anyopaque,
     class_id: u16,
     prototype_chain: []const @import("TaggedOpaque.zig").PrototypeChainEntry,
-    finalizer_from_v8: ?*const fn (handle: ?*const v8.WeakCallbackInfo) callconv(.c) void = null,
-    finalizer_from_zig: ?*const fn (ptr: *anyopaque, session: *Session) void = null,
+    finalizer: ?Finalizer,
+
+    const Finalizer = struct {
+        // Resolved.ptr is the most specific value in a chain (e.g. IFrame, not EventTarget, Node,  ...)
+        // Finalizer.ptr_id is the most specific value in a chain that defines an acquireRef
+        ptr_id: usize,
+        acquire_ref: *const fn (ptr_id: usize) void,
+        release_ref: *const fn (handle: ?*const v8.WeakCallbackInfo) callconv(.c) void,
+        release_ref_from_zig: *const fn (ptr_id: usize, page: *Page) void,
+    };
 };
 pub fn resolveValue(value: anytype) Resolved {
     const T = bridge.Struct(@TypeOf(value));
@@ -1155,27 +1208,108 @@ pub fn resolveValue(value: anytype) Resolved {
     unreachable;
 }
 
-fn resolveT(comptime T: type, value: *anyopaque) Resolved {
+fn resolveT(comptime T: type, value: *T) Resolved {
     const Meta = T.JsApi.Meta;
     return .{
         .ptr = value,
         .class_id = Meta.class_id,
         .prototype_chain = &Meta.prototype_chain,
-        .weak = if (@hasDecl(Meta, "weak")) Meta.weak else false,
-        .finalizer_from_v8 = if (@hasDecl(Meta, "finalizer")) Meta.finalizer.from_v8 else null,
-        .finalizer_from_zig = if (@hasDecl(Meta, "finalizer")) Meta.finalizer.from_zig else null,
+        .finalizer = blk: {
+            const FT = (comptime findFinalizerType(T)) orelse break :blk null;
+            const getFinalizerPtr = comptime finalizerPtrGetter(T, FT);
+            const finalizer_ptr = getFinalizerPtr(value);
+
+            const Wrap = struct {
+                fn acquireRef(ptr_id: usize) void {
+                    FT.acquireRef(@ptrFromInt(ptr_id));
+                }
+
+                fn releaseRef(handle: ?*const v8.WeakCallbackInfo) callconv(.c) void {
+                    const ptr = v8.v8__WeakCallbackInfo__GetParameter(handle.?).?;
+                    const identity_finalizer: *FinalizerCallback.Identity = @ptrCast(@alignCast(ptr));
+
+                    // Identity is allocated from pool, so it's valid even after frame reset.
+                    const page = identity_finalizer.page;
+                    const resolved_ptr_id = identity_finalizer.resolved_ptr_id;
+                    defer page.session.fc_identity_pool.destroy(identity_finalizer);
+
+                    // Always clean up the identity map entry
+                    if (identity_finalizer.identity.identity_map.fetchRemove(resolved_ptr_id)) |kv| {
+                        var global = kv.value;
+                        v8.v8__Global__Reset(&global);
+                    }
+
+                    // If done, FC was already cleaned up during Page teardown.
+                    // The finalizer_ptr_id may have been reused for a new object,
+                    // so we must not look it up in the map. It's also unsafe to
+                    // dereference identity_finalizer.page after done is true.
+                    if (identity_finalizer.done) return;
+
+                    const finalizer_ptr_id = identity_finalizer.finalizer_ptr_id;
+                    const fc = page.finalizer_callbacks.get(finalizer_ptr_id) orelse return;
+
+                    const identity_count = fc.identity_count;
+                    if (identity_count == 1) {
+                        // Last identity - clean up the FC.
+                        // Remove from map before releaseRef to prevent address reuse issues.
+                        _ = page.finalizer_callbacks.remove(finalizer_ptr_id);
+                        FT.releaseRef(@ptrFromInt(finalizer_ptr_id), page);
+                        page.releaseArena(fc.arena);
+                    } else {
+                        fc.identity_count = identity_count - 1;
+                    }
+                }
+
+                fn releaseRefFromZig(ptr_id: usize, page: *Page) void {
+                    FT.releaseRef(@ptrFromInt(ptr_id), page);
+                }
+            };
+            break :blk .{
+                .ptr_id = @intFromPtr(finalizer_ptr),
+                .acquire_ref = Wrap.acquireRef,
+                .release_ref = Wrap.releaseRef,
+                .release_ref_from_zig = Wrap.releaseRefFromZig,
+            };
+        },
     };
 }
 
-fn conditionallyReference(value: anytype) void {
-    const T = bridge.Struct(@TypeOf(value));
-    if (@hasDecl(T, "acquireRef")) {
-        value.acquireRef();
-        return;
+// Start at the "resolved" type (the most specific) and work our way up the
+// prototype chain looking for the type that defines acquireRef
+fn findFinalizerType(comptime T: type) ?type {
+    const S = bridge.Struct(T);
+    if (@hasDecl(S, "acquireRef")) {
+        return S;
     }
-    if (@hasField(T, "_proto")) {
-        conditionallyReference(value._proto);
+    if (@hasField(S, "_proto")) {
+        const ProtoPtr = std.meta.fieldInfo(S, ._proto).type;
+        const ProtoChild = @typeInfo(ProtoPtr).pointer.child;
+        return findFinalizerType(ProtoChild);
     }
+    return null;
+}
+
+// Generate a function that follows the _proto pointer chain to get to the finalizer type
+fn finalizerPtrGetter(comptime T: type, comptime FT: type) *const fn (*T) *FT {
+    const S = bridge.Struct(T);
+    if (S == FT) {
+        return struct {
+            fn get(v: *T) *FT {
+                return v;
+            }
+        }.get;
+    }
+    if (@hasField(S, "_proto")) {
+        const ProtoPtr = std.meta.fieldInfo(S, ._proto).type;
+        const ProtoChild = @typeInfo(ProtoPtr).pointer.child;
+        const childGetter = comptime finalizerPtrGetter(ProtoChild, FT);
+        return struct {
+            fn get(v: *T) *FT {
+                return childGetter(v._proto);
+            }
+        }.get;
+    }
+    @compileError("Cannot find path from " ++ @typeName(T) ++ " to " ++ @typeName(FT));
 }
 
 pub fn stackTrace(self: *const Local) !?[]const u8 {
@@ -1206,9 +1340,15 @@ pub fn stackTrace(self: *const Local) !?[]const u8 {
 }
 
 // == Promise Helpers ==
-pub fn rejectPromise(self: *const Local, value: anytype) !js.Promise {
+pub fn rejectPromise(self: *const Local, err: js.PromiseResolver.RejectError) js.Promise {
     var resolver = js.PromiseResolver.init(self);
-    resolver.reject("Local.rejectPromise", value);
+    resolver.rejectError("Local.rejectPromise", err);
+    return resolver.promise();
+}
+
+pub fn rejectErrorPromise(self: *const Local, value: js.PromiseResolver.RejectError) !js.Promise {
+    var resolver = js.PromiseResolver.init(self);
+    resolver.rejectError("Local.rejectPromise", value);
     return resolver.promise();
 }
 
@@ -1337,7 +1477,7 @@ pub fn throw(self: *const Local, err: []const u8) js.Exception {
 }
 
 // Convert a Global (or optional Global) to a Local (or optional Local).
-// Meant to be used from either page.js.toLocal, where the context must have an
+// Meant to be used from either frame.js.toLocal, where the context must have an
 // non-null local (orelse panic), or from a LocalScope
 pub fn toLocal(self: *const Local, global: anytype) ToLocalReturnType(@TypeOf(global)) {
     const T = @TypeOf(global);
@@ -1377,6 +1517,34 @@ pub fn debugContextId(self: *const Local) i32 {
     return v8.v8__Context__DebugContextId(self.handle);
 }
 
+fn createFinalizerCallback(
+    self: *const Local,
+
+    // Key in identity map
+    // The most specific value (KeyboardEvent, not Event)
+    resolved_ptr_id: usize,
+
+    // The most specific value where finalizers are defined
+    // What actually gets acquired / released / deinit
+    finalizer_ptr_id: usize,
+    release_ref: *const fn (ptr_id: usize, page: *Page) void,
+) !*FinalizerCallback {
+    const page = self.ctx.page;
+
+    const arena = try page.getArena(.tiny, "FinalizerCallback");
+    errdefer page.releaseArena(arena);
+
+    const fc = try arena.create(FinalizerCallback);
+    fc.* = .{
+        .page = page,
+        .arena = arena,
+        .release_ref = release_ref,
+        .resolved_ptr_id = resolved_ptr_id,
+        .finalizer_ptr_id = finalizer_ptr_id,
+    };
+    return fc;
+}
+
 // Encapsulates a Local and a HandleScope. When we're going from V8->Zig
 // we easily get both a Local and a HandleScope via Caller.init.
 // But when we're going from Zig -> V8, things are more complicated.
@@ -1396,12 +1564,12 @@ pub fn debugContextId(self: *const Local) i32 {
 // initiated or not), we need to create a Local.Scope:
 //
 //   var ls: js.Local.Scope = udnefined;
-//   page.js.localScope(&ls);
+//   frame.js.localScope(&ls);
 //   defer ls.deinit();
 //   // can use ls.local as needed.
 //
 // Note: Zig code that is 100% guaranteed to be v8-initiated can get a local via:
-//   page.js.local.?
+//   frame.js.local.?
 pub const Scope = struct {
     local: Local,
     handle_scope: js.HandleScope,

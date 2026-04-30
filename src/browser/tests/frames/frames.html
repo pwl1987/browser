@@ -28,7 +28,7 @@
   $('#f2').src = 'support/sub2.html';
   testing.expectEqual(true, true);
 
-  testing.eventually(() => {
+  testing.onload(() => {
     testing.expectEqual(undefined, window[20]);
 
     testing.expectEqual(window, window[1].top);
@@ -84,7 +84,7 @@
     f3.src = 'invalid'; // still fires load!
     document.documentElement.appendChild(f3);
 
-    testing.eventually(() => {
+    testing.onload(() => {
       testing.expectEqual('f1_onload_loaded', window.f1_onload);
       testing.expectEqual(true, f3_load_event);
     });
@@ -98,7 +98,7 @@
     f4.src = "about:blank";
     document.documentElement.appendChild(f4);
 
-    testing.eventually(() => {
+    testing.onload(() => {
       testing.expectEqual("<html><head></head><body></body></html>", f4.contentDocument.documentElement.outerHTML);
     });
   }
@@ -112,35 +112,59 @@
     document.documentElement.appendChild(f5);
     f5.src = "about:blank";
 
-    testing.eventually(() => {
+    testing.onload(() => {
       testing.expectEqual("<html><head></head><body></body></html>", f5.contentDocument.documentElement.outerHTML);
     });
   }
 </script>
 
-<script id=link_click>
-  testing.async(async (restore) => {
-    await new Promise((resolve) => {
-      let count = 0;
-      let f6 = document.createElement('iframe');
-      f6.id = 'f6';
-      f6.addEventListener('load', () => {
-        if (++count == 2) {
-          resolve();
-          return;
-        }
-        f6.contentDocument.querySelector('#link').click();
-      });
-      f6.src = "support/with_link.html";
-      document.documentElement.appendChild(f6);
-    });
-    restore();
+<script id=link_click type=module>
+  const state = await testing.async();
+
+  let count = 0;
+  let f6 = document.createElement('iframe');
+  f6.id = 'f6';
+  f6.addEventListener('load', () => {
+    if (++count == 2) {
+      state.resolve();
+      return;
+    }
+    f6.contentDocument.querySelector('#link').click();
+  });
+
+  f6.src = 'support/with_link.html';
+  document.documentElement.appendChild(f6);
+
+  await state.done(() => {
     testing.expectEqual("<html><head></head><body>It was clicked!\n</body></html>", f6.contentDocument.documentElement.outerHTML);
   });
 </script>
 
+<script id=about_blank_nav>
+  {
+    let i = document.createElement('iframe');
+    document.documentElement.appendChild(i);
+    i.contentWindow.location.href = 'support/page.html';
+    testing.onload(() => {
+      testing.expectEqual('<html><head></head><body>a-page\n</body></html>', i.contentDocument.documentElement.outerHTML);
+    });
+  }
+</script>
+
+<iframe id=f7></iframe>
+<script id=onloadorder type=module>
+  {
+    const state = await testing.async();
+    $('#f7').onload = state.resolve;
+    $('#f7').src = "about:blank";
+    await state.done(() => {
+      testing.expectEqual(true, true);
+    });
+  }
+</script>
+
 <script id=count>
-  testing.eventually(() => {
-    testing.expectEqual(8, window.length);
+  testing.onload(() => {
+    testing.expectEqual(10, window.length);
   });
 </script>

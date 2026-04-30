@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
+const lp = @import("lightpanda");
 
 const URL = @import("../../URL.zig");
-const log = @import("../../../log.zig");
 const DateTime = @import("../../../datetime.zig").DateTime;
 const public_suffix_list = @import("../../../data/public_suffix_list.zig").lookup;
+
+const log = lp.log;
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Cookie = @This();
 
@@ -41,7 +43,7 @@ secure: bool = false,
 http_only: bool = false,
 same_site: SameSite = .none,
 
-const SameSite = enum {
+pub const SameSite = enum {
     strict,
     lax,
     none,
@@ -58,7 +60,7 @@ pub fn deinit(self: *const Cookie) void {
 //   - any shenanigans with the domain attribute - it has to be the current
 //     domain or one of higher order, excluding TLD.
 // Anything else, will turn into a cookie.
-// Single value? That's a cookie with an emtpy name and a value
+// Single value? That's a cookie with an empty name and a value
 // Key or Values with characters the RFC says aren't allowed? Allowed! (
 //   (as long as the characters are 32...126)
 // Invalid attributes? Ignored.
@@ -75,6 +77,13 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
     const cookie_name, const cookie_value, const rest = parseNameValue(str) catch {
         return error.InvalidNameValue;
     };
+
+    if (cookie_name.len == 0 and (std.ascii.startsWithIgnoreCase(cookie_value, "__Host-") or std.ascii.startsWithIgnoreCase(cookie_value, "__Secure-"))) {
+        // A nameless cookie whose value begins with __Host- or __Secure-
+        // (case-insensitive) would otherwise impersonate a cookie with that
+        // prefix. Reject per the cookie-name-prefix rules.
+        return error.InvalidNameValue;
+    }
 
     var scrap: [8]u8 = undefined;
 
@@ -127,6 +136,34 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
         return error.InsecureSameSite;
     }
 
+    // Enforce cookie-name-prefix rules. Match is case-insensitive to
+    // cover impersonation attempts (e.g. "__HoSt-").
+    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#name-cookie-name-prefixes
+    if (std.ascii.startsWithIgnoreCase(cookie_name, "__Host-")) {
+        if (secure == null) {
+            return error.InvalidPrefixedCookie;
+        }
+
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return error.InvalidPrefixedCookie;
+        }
+
+        if (domain != null and domain.?.len > 0) {
+            return error.InvalidPrefixedCookie;
+        }
+
+        if (path == null or !std.mem.eql(u8, path.?, "/")) {
+            return error.InvalidPrefixedCookie;
+        }
+    } else if (std.ascii.startsWithIgnoreCase(cookie_name, "__Secure-")) {
+        if (secure == null) {
+            return error.InvalidPrefixedCookie;
+        }
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return error.InvalidPrefixedCookie;
+        }
+    }
+
     if (cookie_value.len > max_cookie_size) {
         return error.CookieSizeExceeded;
     }
@@ -161,7 +198,7 @@ pub fn parse(allocator: Allocator, url: [:0]const u8, str: []const u8) !Cookie {
                 // Algolia, for example, will call document.setCookie with
                 // an expired value which is literally 'Invalid Date'
                 // (it's trying to do something like: `new Date() + undefined`).
-                log.debug(.page, "cookie expires date", .{ .date = expires_ });
+                log.debug(.frame, "cookie expires date", .{ .date = expires_ });
             }
         }
     }
@@ -183,6 +220,7 @@ const ValidateCookieError = error{ Empty, InvalidByteSequence };
 
 /// Returns an error if cookie str length is 0
 /// or contains characters outside of the ascii range 32...126.
+/// Tab (0x09) is also allowed, matching browser behavior and WPT.
 fn validateCookieString(str: []const u8) ValidateCookieError!void {
     if (str.len == 0) {
         return error.Empty;
@@ -195,17 +233,16 @@ fn validateCookieString(str: []const u8) ValidateCookieError!void {
     if (comptime vec_size_suggestion) |size| {
         while (str.len - offset >= size) : (offset += size) {
             const Vec = @Vector(size, u8);
+            const tab: Vec = @splat(9);
             const space: Vec = @splat(32);
             const tilde: Vec = @splat(126);
             const chunk: Vec = str[offset..][0..size].*;
 
-            // This creates a mask where invalid characters represented
-            // as ones and valid characters as zeros. We then bitCast this
-            // into an unsigned integer. If the integer is not equal to 0,
-            // we know that we've invalid characters in this chunk.
-            // @popCount can also be used but using integers are simpler.
-            const mask = (@intFromBool(chunk < space) | @intFromBool(chunk > tilde));
-            const reduced: std.meta.Int(.unsigned, size) = @bitCast(mask);
+            // Invalid if (c < 32 AND c != 9) OR c > 126. Tab is the one
+            // sub-space byte we allow through (per browser/WPT behavior).
+            const below = @intFromBool(chunk < space) & @intFromBool(chunk != tab);
+            const above = @intFromBool(chunk > tilde);
+            const reduced: std.meta.Int(.unsigned, size) = @bitCast(below | above);
 
             // Got match.
             if (reduced != 0) {
@@ -221,11 +258,10 @@ fn validateCookieString(str: []const u8) ValidateCookieError!void {
     }
 
     // Either remaining slice or the original if fast path not taken.
-    const slice = str[offset..];
-    // Slow path.
-    const min, const max = std.mem.minMax(u8, slice);
-    if (min < 32 or max > 126) {
-        return error.InvalidByteSequence;
+    for (str[offset..]) |c| {
+        if ((c < 32 and c != 9) or c > 126) {
+            return error.InvalidByteSequence;
+        }
     }
 }
 
@@ -273,8 +309,22 @@ pub fn parseDomain(arena: Allocator, url_: ?[:0]const u8, explicit_domain: ?[]co
                 // can't set a cookie for a TLD
                 return error.InvalidDomain;
             }
+
+            // Can't set a cookie for a public suffix (e.g. co.uk, com.au).
+            if (public_suffix_list(owned_domain[1..])) {
+                return error.InvalidDomain;
+            }
+
             if (encoded_host) |host| {
-                if (std.mem.endsWith(u8, host, owned_domain[1..]) == false) {
+                // The host must match the requested domain exactly or as a
+                // proper subdomain. A raw suffix check would incorrectly
+                // accept "attackerexample.com" as matching "example.com",
+                // letting a lookalike origin overwrite cookies on the victim
+                // domain. `owned_domain` always has a leading dot, so
+                // endsWith against it enforces the label boundary.
+                const exact_match = std.mem.eql(u8, host, owned_domain[1..]);
+                const subdomain_match = std.mem.endsWith(u8, host, owned_domain);
+                if (exact_match == false and subdomain_match == false) {
                     return error.InvalidDomain;
                 }
             }
@@ -283,7 +333,10 @@ pub fn parseDomain(arena: Allocator, url_: ?[:0]const u8, explicit_domain: ?[]co
         }
     }
 
-    return encoded_host orelse return error.InvalidDomain; // default-domain
+    if (encoded_host) |host| {
+        if (host.len > 0) return host;
+    }
+    return error.InvalidDomain;
 }
 
 pub fn percentEncode(arena: Allocator, part: []const u8, comptime isValidChar: fn (u8) bool) ![]u8 {
@@ -353,6 +406,9 @@ pub fn appliesTo(self: *const Cookie, url: *const PreparedUri, same_site: bool, 
     }
 
     {
+        if (self.domain.len == 0) {
+            return false;
+        }
         if (self.domain[0] == '.') {
             // When a Set-Cookie header has a Domain attribute
             // Then we will _always_ prefix it with a dot, extending its
@@ -372,7 +428,7 @@ pub fn appliesTo(self: *const Cookie, url: *const PreparedUri, same_site: bool, 
     {
         if (self.path[self.path.len - 1] == '/') {
             // If our cookie has a trailing slash, we can only match is
-            // the target path is a perfix. I.e., if our path is
+            // the target path is a prefix. I.e., if our path is
             // /doc/  we can only match /doc/*
             if (std.mem.startsWith(u8, url.path, self.path) == false) {
                 return false;
@@ -421,6 +477,8 @@ pub const Jar = struct {
         self: *Jar,
         cookie: Cookie,
         request_time: i64,
+        /// Checks if addition comes from HTTP request or JS context.
+        comptime is_http: bool,
     ) !void {
         const is_expired = isCookieExpired(&cookie, request_time);
         defer if (is_expired) {
@@ -435,15 +493,25 @@ pub const Jar = struct {
         }
 
         for (self.cookies.items, 0..) |*c, i| {
-            if (areCookiesEqual(&cookie, c)) {
-                c.deinit();
-                if (is_expired) {
-                    _ = self.cookies.swapRemove(i);
-                } else {
-                    self.cookies.items[i] = cookie;
-                }
+            // We're only looking for the equal one.
+            if (areCookiesEqual(&cookie, c) == false) {
+                continue;
+            }
+
+            // RFC 6265bis 5.7.2: a non-HTTP API (e.g. document.cookie) must
+            // not replace an HttpOnly cookie.
+            if (c.http_only and is_http == false) {
+                if (is_expired == false) cookie.deinit();
                 return;
             }
+
+            c.deinit();
+            if (is_expired) {
+                _ = self.cookies.swapRemove(i);
+            } else {
+                self.cookies.items[i] = cookie;
+            }
+            return;
         }
 
         if (!is_expired) {
@@ -502,12 +570,12 @@ pub const Jar = struct {
 
     pub fn populateFromResponse(self: *Jar, url: [:0]const u8, set_cookie: []const u8) !void {
         const c = Cookie.parse(self.allocator, url, set_cookie) catch |err| {
-            log.warn(.page, "cookie parse failed", .{ .raw = set_cookie, .err = err });
+            log.warn(.frame, "cookie parse failed", .{ .raw = set_cookie, .err = err });
             return;
         };
 
         const now = std.time.timestamp();
-        try self.add(c, now);
+        try self.add(c, now, true);
     }
 
     fn writeCookie(cookie: *const Cookie, writer: anytype) !void {
@@ -629,29 +697,48 @@ test "Jar: add" {
     defer jar.deinit();
     try expectCookies(&.{}, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9000;Max-Age=0"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9000;Max-Age=0"), now, true);
     try expectCookies(&.{}, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9000"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9000"), now, true);
     try expectCookies(&.{.{ "over", "9000" }}, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9000!!"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9000!!"), now, true);
     try expectCookies(&.{.{ "over", "9000!!" }}, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "spice=flow"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "spice=flow"), now, true);
     try expectCookies(&.{ .{ "over", "9000!!" }, .{ "spice", "flow" } }, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "spice=flows;Path=/"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "spice=flows;Path=/"), now, true);
     try expectCookies(&.{ .{ "over", "9000!!" }, .{ "spice", "flows" } }, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9001;Path=/other"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9001;Path=/other"), now, true);
     try expectCookies(&.{ .{ "over", "9000!!" }, .{ "spice", "flows" }, .{ "over", "9001" } }, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9002;Path=/;Domain=lightpanda.io"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=9002;Path=/;Domain=lightpanda.io"), now, true);
     try expectCookies(&.{ .{ "over", "9000!!" }, .{ "spice", "flows" }, .{ "over", "9001" }, .{ "over", "9002" } }, jar);
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=x;Path=/other;Max-Age=-200"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "over=x;Path=/other;Max-Age=-200"), now, true);
     try expectCookies(&.{ .{ "over", "9000!!" }, .{ "spice", "flows" }, .{ "over", "9002" } }, jar);
+}
+
+test "Jar: non-HTTP add must not replace or duplicate an HttpOnly cookie" {
+    const now = std.time.timestamp();
+
+    var jar = Jar.init(testing.allocator);
+    defer jar.deinit();
+
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "session=REAL;Path=/;HttpOnly"), now, true);
+    try testing.expectEqual(@as(usize, 1), jar.cookies.items.len);
+
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "session=ATTACKER;Path=/"), now, false);
+    try testing.expectEqual(@as(usize, 1), jar.cookies.items.len);
+    try testing.expectEqual("REAL", jar.cookies.items[0].value);
+    try testing.expectEqual(true, jar.cookies.items[0].http_only);
+
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "session=REFRESHED;Path=/;HttpOnly"), now, true);
+    try testing.expectEqual(@as(usize, 1), jar.cookies.items.len);
+    try testing.expectEqual("REFRESHED", jar.cookies.items[0].value);
 }
 
 test "Jar: add limit" {
@@ -668,7 +755,7 @@ test "Jar: add limit" {
         .path = "/",
         .expires = null,
         .value = "v" ** 4096 ++ "v",
-    }, now));
+    }, now, true));
 
     // generate unique names.
     const names = comptime blk: {
@@ -692,7 +779,7 @@ test "Jar: add limit" {
             .value = "v",
         };
 
-        try jar.add(c, now);
+        try jar.add(c, now, true);
     }
 
     try testing.expectError(error.CookieJarQuotaExceeded, jar.add(.{
@@ -702,7 +789,7 @@ test "Jar: add limit" {
         .path = "/",
         .expires = null,
         .value = "v",
-    }, now));
+    }, now, true));
 }
 
 test "Jar: forRequest" {
@@ -727,15 +814,15 @@ test "Jar: forRequest" {
         try expectCookies("", &jar, test_url, .{ .is_http = true });
     }
 
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "global1=1"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "global2=2;Max-Age=30;domain=lightpanda.io"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "path1=3;Path=/about"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "path2=4;Path=/docs/"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "secure=5;Secure"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "sitenone=6;SameSite=None;Path=/x/;Secure"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "sitelax=7;SameSite=Lax;Path=/x/"), now);
-    try jar.add(try Cookie.parse(testing.allocator, test_url, "sitestrict=8;SameSite=Strict;Path=/x/"), now);
-    try jar.add(try Cookie.parse(testing.allocator, url2, "domain1=9;domain=test.lightpanda.io"), now);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "global1=1"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "global2=2;Max-Age=30;domain=lightpanda.io"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "path1=3;Path=/about"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "path2=4;Path=/docs/"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "secure=5;Secure"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "sitenone=6;SameSite=None;Path=/x/;Secure"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "sitelax=7;SameSite=Lax;Path=/x/"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, test_url, "sitestrict=8;SameSite=Strict;Path=/x/"), now, true);
+    try jar.add(try Cookie.parse(testing.allocator, url2, "domain1=9;domain=test.lightpanda.io"), now, true);
 
     // nothing fancy here
     try expectCookies("global1=1; global2=2", &jar, test_url, .{ .is_http = true });
@@ -859,6 +946,52 @@ test "Cookie: parse key=value" {
     try expectError(error.InvalidByteSequence, null, &.{ 'a', 127, '=', 'b' });
     try expectError(error.InvalidByteSequence, null, &.{ 'a', '=', 'b', 20 });
     try expectError(error.InvalidByteSequence, null, &.{ 'a', '=', 'b', 128 });
+
+    // Tab (0x09) is allowed in name and value, matching browser/WPT behavior.
+    try expectAttribute(.{ .name = "a\tb", .value = "c" }, null, "a\tb=c");
+    try expectAttribute(.{ .name = "a", .value = "b\tc" }, null, "a=b\tc");
+    // Other control characters remain rejected.
+    try expectError(error.InvalidByteSequence, null, "a\nb=c");
+    try expectError(error.InvalidByteSequence, null, "a\rb=c");
+    try expectError(error.InvalidByteSequence, null, &.{ 'a', '=', 'b', 0 });
+
+    // Nameless cookies whose value begins with __Host- or __Secure-
+    // (case-insensitive) are rejected so they can't impersonate prefixed cookies.
+    try expectError(error.InvalidNameValue, null, "=__Host-abc=1");
+    try expectError(error.InvalidNameValue, null, "=__Secure-abc=1");
+    try expectError(error.InvalidNameValue, null, "=__HoSt-abc");
+    try expectError(error.InvalidNameValue, null, "__Secure-abc");
+
+    // __Host- cookie-name-prefix rules:
+    //   - must be Secure
+    //   - must be set from an https origin
+    //   - must not have a Domain attribute
+    //   - must have Path=/
+    try expectAttribute(.{ .name = "__Host-abc", .value = "1" }, "https://lightpanda.io/", "__Host-abc=1; Secure; Path=/");
+    try expectAttribute(.{ .name = "__HoSt-abc", .value = "1" }, "https://lightpanda.io/", "__HoSt-abc=1; Secure; Path=/");
+    try expectError(error.InvalidPrefixedCookie, "https://lightpanda.io/", "__Host-abc=1; Path=/");
+    try expectError(error.InvalidPrefixedCookie, null, "__Host-abc=1; Secure; Path=/");
+    try expectError(error.InvalidPrefixedCookie, "https://lightpanda.io/", "__Host-abc=1; Secure");
+    try expectError(error.InvalidPrefixedCookie, "https://lightpanda.io/", "__Host-abc=1; Secure; Path=/foo");
+    try expectError(error.InvalidPrefixedCookie, "https://lightpanda.io/", "__Host-abc=1; Secure; Path=/; Domain=lightpanda.io");
+
+    // __Secure- cookie-name-prefix rules: must be Secure and from https.
+    try expectAttribute(.{ .name = "__Secure-abc", .value = "1" }, "https://lightpanda.io/", "__Secure-abc=1; Secure");
+    try expectAttribute(.{ .name = "__SeCuRe-abc", .value = "1" }, "https://lightpanda.io/", "__SeCuRe-abc=1; Secure; Domain=lightpanda.io");
+    try expectError(error.InvalidPrefixedCookie, "https://lightpanda.io/", "__Secure-abc=1");
+    try expectError(error.InvalidPrefixedCookie, null, "__Secure-abc=1; Secure");
+
+    // Empty Domain= is treated as no Domain and accepted on __Host-.
+    try expectAttribute(.{ .name = "__Host-abc", .value = "1" }, "https://lightpanda.io/", "__Host-abc=1; Secure; Path=/; Domain=");
+
+    // __Host- with additional unrelated attributes remains valid.
+    try expectAttribute(.{ .name = "__Host-abc", .value = "1" }, "https://lightpanda.io/", "__Host-abc=1; Secure; Path=/; Max-Age=60; HttpOnly");
+
+    // Near-misses are not subject to the prefix rules.
+    try expectAttribute(.{ .name = "__Host", .value = "1" }, null, "__Host=1");
+    try expectAttribute(.{ .name = "_Host-abc", .value = "1" }, null, "_Host-abc=1");
+    try expectAttribute(.{ .name = "__Hos-abc", .value = "1" }, null, "__Hos-abc=1");
+    try expectAttribute(.{ .name = "__Secure", .value = "1" }, null, "__Secure=1");
 
     try expectAttribute(.{ .name = "", .value = "a" }, null, "a");
     try expectAttribute(.{ .name = "", .value = "a" }, null, "a;");
@@ -1027,6 +1160,20 @@ test "Cookie: parse domain" {
     try expectError(error.InvalidDomain, "http://lightpanda.io/", "b;domain=other.lightpanda.io");
     try expectError(error.InvalidDomain, "http://lightpanda.io/", "b;domain=other.lightpanda.com");
     try expectError(error.InvalidDomain, "http://lightpanda.io/", "b;domain=other.example.com");
+
+    try expectError(error.InvalidDomain, "http://attackerexample.com/", "b;domain=example.com");
+    try expectError(error.InvalidDomain, "http://attackerexample.com/", "b;domain=.example.com");
+    try expectError(error.InvalidDomain, "http://xyzlightpanda.io/", "b;domain=lightpanda.io");
+    try expectError(error.InvalidDomain, "http://notlocalhost/", "b;domain=localhost");
+
+    // Public suffixes should be rejected (test PSL entries: "gov.uk", "api.gov.uk")
+    try expectError(error.InvalidDomain, "http://example.gov.uk/", "b;domain=gov.uk");
+    try expectError(error.InvalidDomain, "http://example.gov.uk/", "b;domain=.gov.uk");
+    try expectError(error.InvalidDomain, "http://test.api.gov.uk/", "b;domain=api.gov.uk");
+
+    // Subdomains of public suffixes should still be accepted
+    try expectAttribute(.{ .domain = ".example.gov.uk" }, "http://example.gov.uk/", "b;domain=example.gov.uk");
+    try expectAttribute(.{ .domain = ".example.gov.uk" }, "http://sub.example.gov.uk/", "b;domain=example.gov.uk");
 }
 
 test "Cookie: parse limit" {
@@ -1078,4 +1225,29 @@ fn expectAttribute(expected: anytype, url_: ?[:0]const u8, set_cookie: []const u
 
 fn expectError(expected: anyerror, url: ?[:0]const u8, set_cookie: []const u8) !void {
     try testing.expectError(expected, Cookie.parse(testing.allocator, url orelse test_url, set_cookie));
+}
+
+test "Cookie: appliesTo with empty domain" {
+    const cookie = Cookie{
+        .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        .name = "test",
+        .value = "value",
+        .domain = "",
+        .path = "/",
+        .expires = null,
+    };
+    defer cookie.deinit();
+
+    const target = PreparedUri{
+        .host = "example.com",
+        .path = "/",
+        .secure = false,
+    };
+
+    try testing.expectEqual(false, cookie.appliesTo(&target, true, true, true));
+}
+
+test "Cookie: parse rejects URL with empty host" {
+    try testing.expectError(error.InvalidDomain, Cookie.parse(testing.allocator, "http:///path", "name=value"));
+    try testing.expectError(error.InvalidDomain, Cookie.parse(testing.allocator, "http://", "name=value"));
 }

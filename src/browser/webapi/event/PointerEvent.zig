@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
+
 const Event = @import("../Event.zig");
 const MouseEvent = @import("MouseEvent.zig");
+
+const String = lp.String;
 
 const PointerEvent = @This();
 
@@ -83,13 +85,13 @@ const Options = Event.inheritOptions(
     PointerEventOptions,
 );
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*PointerEvent {
-    const arena = try page.getArena(.{ .debug = "UIEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*PointerEvent {
+    const arena = try frame.getArena(.tiny, "PointerEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
 
     const opts = _opts orelse Options{};
-    const event = try page._factory.mouseEvent(
+    const event = try frame._factory.mouseEvent(
         arena,
         type_string,
         MouseEvent{
@@ -126,10 +128,6 @@ pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*PointerEvent {
 
     Event.populatePrototypes(event, opts, false);
     return event;
-}
-
-pub fn deinit(self: *PointerEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *PointerEvent) *Event {
@@ -191,8 +189,6 @@ pub const JsApi = struct {
         pub const name = "PointerEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(PointerEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(PointerEvent.init, .{});

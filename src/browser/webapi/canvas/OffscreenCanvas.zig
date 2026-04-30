@@ -18,10 +18,11 @@
 
 const std = @import("std");
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
 
 const Blob = @import("../Blob.zig");
 const OffscreenCanvasRenderingContext2D = @import("OffscreenCanvasRenderingContext2D.zig");
+
+const Execution = js.Execution;
 
 /// https://developer.mozilla.org/en-US/docs/Web/API/OffscreenCanvas
 const OffscreenCanvas = @This();
@@ -31,14 +32,14 @@ pub const _prototype_root = true;
 _width: u32,
 _height: u32,
 
-/// Since there's no base class rendering contextes inherit from,
+/// Since there's no base class rendering contexts inherit from,
 /// we're using tagged union.
 const DrawingContext = union(enum) {
     @"2d": *OffscreenCanvasRenderingContext2D,
 };
 
-pub fn constructor(width: u32, height: u32, page: *Page) !*OffscreenCanvas {
-    return page._factory.create(OffscreenCanvas{
+pub fn constructor(width: u32, height: u32, exec: *Execution) !*OffscreenCanvas {
+    return exec._factory.create(OffscreenCanvas{
         ._width = width,
         ._height = height,
     });
@@ -60,9 +61,9 @@ pub fn setHeight(self: *OffscreenCanvas, value: u32) void {
     self._height = value;
 }
 
-pub fn getContext(_: *OffscreenCanvas, context_type: []const u8, page: *Page) !?DrawingContext {
+pub fn getContext(_: *OffscreenCanvas, context_type: []const u8, exec: *Execution) !?DrawingContext {
     if (std.mem.eql(u8, context_type, "2d")) {
-        const ctx = try page._factory.create(OffscreenCanvasRenderingContext2D{});
+        const ctx = try exec._factory.create(OffscreenCanvasRenderingContext2D{});
         return .{ .@"2d" = ctx };
     }
 
@@ -71,9 +72,9 @@ pub fn getContext(_: *OffscreenCanvas, context_type: []const u8, page: *Page) !?
 
 /// Returns a Promise that resolves to a Blob containing the image.
 /// Since we have no actual rendering, this returns an empty blob.
-pub fn convertToBlob(_: *OffscreenCanvas, page: *Page) !js.Promise {
-    const blob = try Blob.init(null, null, page);
-    return page.js.local.?.resolvePromise(blob);
+pub fn convertToBlob(_: *OffscreenCanvas, exec: *Execution) !js.Promise {
+    const blob = try Blob.init(null, null, exec.context.page);
+    return exec.context.local.?.resolvePromise(blob);
 }
 
 /// Returns an ImageBitmap with the rendered content (stub).

@@ -17,15 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
 
-const log = @import("../../../log.zig");
-const String = @import("../../../string.zig").String;
-const Allocator = std.mem.Allocator;
-
-const Page = @import("../../Page.zig");
 const FormData = @import("FormData.zig");
 const KeyValueList = @import("../KeyValueList.zig");
+
+const log = lp.log;
+const String = lp.String;
+const Execution = js.Execution;
+const Allocator = std.mem.Allocator;
 
 const URLSearchParams = @This();
 
@@ -38,33 +40,38 @@ const InitOpts = union(enum) {
     query_string: []const u8,
 };
 
-pub fn init(opts_: ?InitOpts, page: *Page) !*URLSearchParams {
-    const arena = page.arena;
+pub fn init(opts_: ?InitOpts, exec: *const Execution) !*URLSearchParams {
+    const arena = exec.arena;
     const params: KeyValueList = blk: {
         const opts = opts_ orelse break :blk .empty;
         switch (opts) {
-            .query_string => |qs| break :blk try paramsFromString(arena, qs, &page.buf),
-            .form_data => |fd| break :blk try KeyValueList.copy(arena, fd._list),
+            .query_string => |qs| break :blk try paramsFromString(arena, qs, exec.buf),
+            .form_data => |fd| break :blk try fd.toKeyValueList(arena),
             .value => |js_val| {
+                // Order matters here; Array is also an Object.
+                if (js_val.isArray()) {
+                    break :blk try paramsFromArray(arena, js_val.toArray());
+                }
                 if (js_val.isObject()) {
-                    break :blk try KeyValueList.fromJsObject(arena, js_val.toObject(), null, page);
+                    // normalizer is null, so frame won't be used
+                    break :blk try KeyValueList.fromJsObject(arena, js_val.toObject(), null, exec.buf);
                 }
                 if (js_val.isString()) |js_str| {
-                    break :blk try paramsFromString(arena, try js_str.toSliceWithAlloc(arena), &page.buf);
+                    break :blk try paramsFromString(arena, try js_str.toSliceWithAlloc(arena), exec.buf);
                 }
                 return error.InvalidArgument;
             },
         }
     };
 
-    return page._factory.create(URLSearchParams{
+    return exec._factory.create(URLSearchParams{
         ._arena = arena,
         ._params = params,
     });
 }
 
-pub fn updateFromString(self: *URLSearchParams, query_string: []const u8, page: *Page) !void {
-    self._params = try paramsFromString(self._arena, query_string, &page.buf);
+pub fn updateFromString(self: *URLSearchParams, query_string: []const u8, exec: *const Execution) !void {
+    self._params = try paramsFromString(self._arena, query_string, exec.buf);
 }
 
 pub fn getSize(self: *const URLSearchParams) usize {
@@ -75,8 +82,8 @@ pub fn get(self: *const URLSearchParams, name: []const u8) ?[]const u8 {
     return self._params.get(name);
 }
 
-pub fn getAll(self: *const URLSearchParams, name: []const u8, page: *Page) ![]const []const u8 {
-    return self._params.getAll(name, page);
+pub fn getAll(self: *const URLSearchParams, name: []const u8, exec: *const Execution) ![]const []const u8 {
+    return self._params.getAll(exec.call_arena, name);
 }
 
 pub fn has(self: *const URLSearchParams, name: []const u8) bool {
@@ -95,20 +102,21 @@ pub fn delete(self: *URLSearchParams, name: []const u8, value: ?[]const u8) void
     self._params.delete(name, value);
 }
 
-pub fn keys(self: *URLSearchParams, page: *Page) !*KeyValueList.KeyIterator {
-    return KeyValueList.KeyIterator.init(.{ .list = self, .kv = &self._params }, page);
+pub fn keys(self: *URLSearchParams, exec: *const Execution) !*KeyValueList.KeyIterator {
+    return KeyValueList.KeyIterator.init(.{ .list = self, .kv = &self._params }, exec);
 }
 
-pub fn values(self: *URLSearchParams, page: *Page) !*KeyValueList.ValueIterator {
-    return KeyValueList.ValueIterator.init(.{ .list = self, .kv = &self._params }, page);
+pub fn values(self: *URLSearchParams, exec: *const Execution) !*KeyValueList.ValueIterator {
+    return KeyValueList.ValueIterator.init(.{ .list = self, .kv = &self._params }, exec);
 }
 
-pub fn entries(self: *URLSearchParams, page: *Page) !*KeyValueList.EntryIterator {
-    return KeyValueList.EntryIterator.init(.{ .list = self, .kv = &self._params }, page);
+pub fn entries(self: *URLSearchParams, exec: *const Execution) !*KeyValueList.EntryIterator {
+    return KeyValueList.EntryIterator.init(.{ .list = self, .kv = &self._params }, exec);
 }
 
 pub fn toString(self: *const URLSearchParams, writer: *std.Io.Writer) !void {
-    return self._params.urlEncode(.query, writer);
+    // URLSearchParams always uses UTF-8 per the URL Standard
+    return self._params.urlEncode(.query, null, "UTF-8", writer);
 }
 
 pub fn format(self: *const URLSearchParams, writer: *std.Io.Writer) !void {
@@ -132,6 +140,37 @@ pub fn sort(self: *URLSearchParams) void {
             return std.mem.order(u8, a.name.str(), b.name.str()) == .lt;
         }
     }.cmp);
+}
+
+fn paramsFromArray(allocator: Allocator, array: js.Array) !KeyValueList {
+    const array_len = array.len();
+    if (array_len == 0) {
+        return .empty;
+    }
+
+    var params = KeyValueList.init();
+    try params.ensureTotalCapacity(allocator, array_len);
+    // TODO: Release `params` on error.
+
+    var i: u32 = 0;
+    while (i < array_len) : (i += 1) {
+        const item = try array.get(i);
+        if (!item.isArray()) return error.InvalidArgument;
+
+        const as_array = item.toArray();
+        // Need 2 items for KV.
+        if (as_array.len() != 2) return error.InvalidArgument;
+
+        const name_val = try as_array.get(0);
+        const value_val = try as_array.get(1);
+
+        params._entries.appendAssumeCapacity(.{
+            .name = try name_val.toSSOWithAlloc(allocator),
+            .value = try value_val.toSSOWithAlloc(allocator),
+        });
+    }
+
+    return params;
 }
 
 fn paramsFromString(allocator: Allocator, input_: []const u8, buf: []u8) !KeyValueList {
@@ -164,7 +203,7 @@ fn paramsFromString(allocator: Allocator, input_: []const u8, buf: []u8) !KeyVal
             value = try unescape(allocator, entry[idx + 1 ..], buf);
         } else {
             name = try unescape(allocator, entry, buf);
-            value = String.init(undefined, "", .{}) catch unreachable;
+            value = comptime .wrap("");
         }
 
         // optimized, unescape returns a String directly (Because unescape may
@@ -180,7 +219,7 @@ fn paramsFromString(allocator: Allocator, input_: []const u8, buf: []u8) !KeyVal
 
 fn unescape(arena: Allocator, value: []const u8, buf: []u8) !String {
     if (value.len == 0) {
-        return String.init(undefined, "", .{});
+        return comptime .wrap("");
     }
 
     var has_plus = false;
@@ -245,41 +284,13 @@ inline fn decodeHex(char: u8) u8 {
     return @as([*]const u8, @ptrFromInt((@intFromPtr(&HEX_DECODE_ARRAY) - @as(usize, '0'))))[char];
 }
 
-fn escape(input: []const u8, writer: *std.Io.Writer) !void {
-    for (input) |c| {
-        if (isUnreserved(c)) {
-            try writer.writeByte(c);
-        } else if (c == ' ') {
-            try writer.writeByte('+');
-        } else if (c == '*') {
-            try writer.writeByte('*');
-        } else if (c >= 0x80) {
-            // Double-encode: treat byte as Latin-1 code point, encode to UTF-8, then percent-encode
-            // For bytes 0x80-0xFF (U+0080 to U+00FF), UTF-8 encoding is 2 bytes:
-            // [0xC0 | (c >> 6), 0x80 | (c & 0x3F)]
-            const byte1 = 0xC0 | (c >> 6);
-            const byte2 = 0x80 | (c & 0x3F);
-            try writer.print("%{X:0>2}%{X:0>2}", .{ byte1, byte2 });
-        } else {
-            try writer.print("%{X:0>2}", .{c});
-        }
-    }
-}
-
-fn isUnreserved(c: u8) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_' => true,
-        else => false,
-    };
-}
-
 pub const Iterator = struct {
     index: u32 = 0,
     list: *const URLSearchParams,
 
     const Entry = struct { []const u8, []const u8 };
 
-    pub fn next(self: *Iterator, _: *Page) !?Iterator.Entry {
+    pub fn next(self: *Iterator, _: *const Execution) !?Iterator.Entry {
         const index = self.index;
         const items = self.list._params.items;
         if (index >= items.len) {
@@ -317,8 +328,8 @@ pub const JsApi = struct {
     pub const sort = bridge.function(URLSearchParams.sort, .{});
 
     pub const toString = bridge.function(_toString, .{});
-    fn _toString(self: *const URLSearchParams, page: *Page) ![]const u8 {
-        var buf = std.Io.Writer.Allocating.init(page.call_arena);
+    fn _toString(self: *const URLSearchParams, exec: *const Execution) ![]const u8 {
+        var buf = std.Io.Writer.Allocating.init(exec.call_arena);
         try self.toString(&buf.writer);
         return buf.written();
     }

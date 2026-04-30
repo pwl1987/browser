@@ -17,59 +17,42 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
-const String = @import("../../../string.zig").String;
+const Node = @import("../Node.zig");
+const Frame = @import("../../Frame.zig");
 
 const Parser = @import("Parser.zig");
-const Node = @import("../Node.zig");
-const Page = @import("../../Page.zig");
 pub const List = @import("List.zig");
 
-pub fn querySelector(root: *Node, input: []const u8, page: *Page) !?*Node.Element {
+const String = lp.String;
+const Allocator = std.mem.Allocator;
+
+pub fn parseLeaky(arena: Allocator, input: []const u8) !Parsed {
     if (input.len == 0) {
         return error.SyntaxError;
     }
-
-    const arena = page.call_arena;
-    const selectors = try Parser.parseList(arena, input, page);
-
-    for (selectors) |selector| {
-        // Fast path: single compound with only an ID selector
-        if (selector.segments.len == 0 and selector.first.parts.len == 1) {
-            const first = selector.first.parts[0];
-            if (first == .id) {
-                const el = page.getElementByIdFromNode(root, first.id) orelse continue;
-                // Check if the element is within the root subtree
-                const node = el.asNode();
-                if (node != root and root.contains(node)) {
-                    return el;
-                }
-                continue;
-            }
-        }
-
-        if (List.initOne(root, selector, page)) |node| {
-            if (node.is(Node.Element)) |el| {
-                return el;
-            }
-        }
-    }
-    return null;
+    return .{ .selectors = try Parser.parseList(arena, input) };
 }
 
-pub fn querySelectorAll(root: *Node, input: []const u8, page: *Page) !*List {
+pub fn querySelector(root: *Node, input: []const u8, frame: *Frame) !?*Node.Element {
+    const parsed = try parseLeaky(frame.call_arena, input);
+    return parsed.query(root, frame);
+}
+
+pub fn querySelectorAll(root: *Node, input: []const u8, frame: *Frame) !*List {
     if (input.len == 0) {
         return error.SyntaxError;
     }
 
-    const arena = try page.getArena(.{ .debug = "querySelectorAll" });
-    errdefer page.releaseArena(arena);
+    const arena = try frame.getArena(.small, "querySelectorAll");
+    errdefer frame.releaseArena(arena);
 
     var nodes: std.AutoArrayHashMapUnmanaged(*Node, void) = .empty;
 
-    const selectors = try Parser.parseList(arena, input, page);
+    const selectors = try Parser.parseList(arena, input);
     for (selectors) |selector| {
-        try List.collect(arena, root, selector, &nodes, page);
+        try List.collect(arena, root, selector, &nodes, frame);
     }
 
     const list = try arena.create(List);
@@ -80,16 +63,16 @@ pub fn querySelectorAll(root: *Node, input: []const u8, page: *Page) !*List {
     return list;
 }
 
-pub fn matches(el: *Node.Element, input: []const u8, page: *Page) !bool {
+pub fn matches(el: *Node.Element, input: []const u8, frame: *Frame) !bool {
     if (input.len == 0) {
         return error.SyntaxError;
     }
 
-    const arena = page.call_arena;
-    const selectors = try Parser.parseList(arena, input, page);
+    const arena = frame.call_arena;
+    const selectors = try Parser.parseList(arena, input);
 
     for (selectors) |selector| {
-        if (List.matches(el.asNode(), selector, el.asNode(), page)) {
+        if (List.matches(el.asNode(), selector, el.asNode(), frame)) {
             return true;
         }
     }
@@ -98,16 +81,16 @@ pub fn matches(el: *Node.Element, input: []const u8, page: *Page) !bool {
 
 // Like matches, but allows the caller to specify a scope node distinct from el.
 // Used by closest() so that :scope always refers to the original context element.
-pub fn matchesWithScope(el: *Node.Element, input: []const u8, scope: *Node.Element, page: *Page) !bool {
+pub fn matchesWithScope(el: *Node.Element, input: []const u8, scope: *Node.Element, frame: *Frame) !bool {
     if (input.len == 0) {
         return error.SyntaxError;
     }
 
-    const arena = page.call_arena;
-    const selectors = try Parser.parseList(arena, input, page);
+    const arena = frame.call_arena;
+    const selectors = try Parser.parseList(arena, input);
 
     for (selectors) |selector| {
-        if (List.matches(el.asNode(), selector, scope.asNode(), page)) {
+        if (List.matches(el.asNode(), selector, scope.asNode(), frame)) {
             return true;
         }
     }
@@ -290,5 +273,34 @@ pub const Selector = struct {
         for (self.segments) |segment| {
             try segment.format(writer);
         }
+    }
+};
+
+pub const Parsed = struct {
+    selectors: []const Selector,
+
+    pub fn query(self: Parsed, root: *Node, frame: *Frame) !?*Node.Element {
+        for (self.selectors) |selector| {
+            // Fast path: single compound with only an ID selector
+            if (selector.segments.len == 0 and selector.first.parts.len == 1) {
+                const first = selector.first.parts[0];
+                if (first == .id) {
+                    const el = frame.getElementByIdFromNode(root, first.id) orelse continue;
+                    // Check if the element is within the root subtree
+                    const node = el.asNode();
+                    if (node != root and root.contains(node)) {
+                        return el;
+                    }
+                    continue;
+                }
+            }
+
+            if (List.initOne(root, selector, frame)) |node| {
+                if (node.is(Node.Element)) |el| {
+                    return el;
+                }
+            }
+        }
+        return null;
     }
 };

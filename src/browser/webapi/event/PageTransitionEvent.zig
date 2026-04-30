@@ -17,12 +17,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
+
 const Event = @import("../Event.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 // https://developer.mozilla.org/en-US/docs/Web/API/PageTransitionEvent
@@ -37,23 +39,23 @@ const PageTransitionEventOptions = struct {
 
 const Options = Event.inheritOptions(PageTransitionEvent, PageTransitionEventOptions);
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*PageTransitionEvent {
-    const arena = try page.getArena(.{ .debug = "PageTransitionEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*PageTransitionEvent {
+    const arena = try frame.getArena(.tiny, "PageTransitionEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, _opts, false, page);
+    return initWithTrusted(arena, type_string, _opts, false, frame);
 }
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*PageTransitionEvent {
-    const arena = try page.getArena(.{ .debug = "PageTransitionEvent.trusted" });
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*PageTransitionEvent {
+    const arena = try frame.getArena(.tiny, "PageTransitionEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*PageTransitionEvent {
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*PageTransitionEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         PageTransitionEvent{
@@ -64,10 +66,6 @@ fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool
 
     Event.populatePrototypes(event, opts, trusted);
     return event;
-}
-
-pub fn deinit(self: *PageTransitionEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *PageTransitionEvent) *Event {
@@ -85,8 +83,6 @@ pub const JsApi = struct {
         pub const name = "PageTransitionEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(PageTransitionEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(PageTransitionEvent.init, .{});

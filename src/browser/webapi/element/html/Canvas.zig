@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const js = @import("../../../js/js.zig");
-const Page = @import("../../../Page.zig");
+const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
@@ -27,8 +27,11 @@ const CanvasRenderingContext2D = @import("../../canvas/CanvasRenderingContext2D.
 const WebGLRenderingContext = @import("../../canvas/WebGLRenderingContext.zig");
 const OffscreenCanvas = @import("../../canvas/OffscreenCanvas.zig");
 
+const Execution = js.Execution;
+
 const Canvas = @This();
 _proto: *HtmlElement,
+_cached: ?DrawingContext = null,
 
 pub fn asElement(self: *Canvas) *Element {
     return self._proto._proto;
@@ -45,9 +48,9 @@ pub fn getWidth(self: *const Canvas) u32 {
     return std.fmt.parseUnsigned(u32, attr, 10) catch 300;
 }
 
-pub fn setWidth(self: *Canvas, value: u32, page: *Page) !void {
-    const str = try std.fmt.allocPrint(page.call_arena, "{d}", .{value});
-    try self.asElement().setAttributeSafe(comptime .wrap("width"), .wrap(str), page);
+pub fn setWidth(self: *Canvas, value: u32, frame: *Frame) !void {
+    const str = try std.fmt.allocPrint(frame.call_arena, "{d}", .{value});
+    try self.asElement().setAttributeSafe(comptime .wrap("width"), .wrap(str), frame);
 }
 
 pub fn getHeight(self: *const Canvas) u32 {
@@ -55,38 +58,57 @@ pub fn getHeight(self: *const Canvas) u32 {
     return std.fmt.parseUnsigned(u32, attr, 10) catch 150;
 }
 
-pub fn setHeight(self: *Canvas, value: u32, page: *Page) !void {
-    const str = try std.fmt.allocPrint(page.call_arena, "{d}", .{value});
-    try self.asElement().setAttributeSafe(comptime .wrap("height"), .wrap(str), page);
+pub fn setHeight(self: *Canvas, value: u32, frame: *Frame) !void {
+    const str = try std.fmt.allocPrint(frame.call_arena, "{d}", .{value});
+    try self.asElement().setAttributeSafe(comptime .wrap("height"), .wrap(str), frame);
 }
 
-/// Since there's no base class rendering contextes inherit from,
+/// Since there's no base class rendering contexts inherit from,
 /// we're using tagged union.
 const DrawingContext = union(enum) {
     @"2d": *CanvasRenderingContext2D,
     webgl: *WebGLRenderingContext,
 };
 
-pub fn getContext(_: *Canvas, context_type: []const u8, page: *Page) !?DrawingContext {
-    if (std.mem.eql(u8, context_type, "2d")) {
-        const ctx = try page._factory.create(CanvasRenderingContext2D{});
-        return .{ .@"2d" = ctx };
+pub fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingContext {
+    if (self._cached) |cached| {
+        const matches = switch (cached) {
+            .@"2d" => std.mem.eql(u8, context_type, "2d"),
+            .webgl => std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl"),
+        };
+        return if (matches) cached else null;
     }
 
-    if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
-        const ctx = try page._factory.create(WebGLRenderingContext{});
-        return .{ .webgl = ctx };
-    }
+    const drawing_context: DrawingContext = blk: {
+        if (std.mem.eql(u8, context_type, "2d")) {
+            const ctx = try frame._factory.create(CanvasRenderingContext2D{ ._canvas = self });
+            break :blk .{ .@"2d" = ctx };
+        }
 
-    return null;
+        // We only stub a tiny slice of the WebGL API (getParameter,
+        // getExtension, getSupportedExtensions). Real WebGL consumers like
+        // Three.js immediately call createTexture/createBuffer/etc. and
+        // throw `TypeError: e.createTexture is not a function`. Pretending
+        // WebGL works until the first non-stubbed call is the worst of both
+        // worlds: pages that have an error boundary above the WebGL widget
+        // catch the throw, reset, re-render, and loop forever.
+        // Spec-correct signal for "no WebGL" is null, so apps that check
+        // (Three.js does) can degrade gracefully.
+        if (std.mem.eql(u8, context_type, "webgl") or std.mem.eql(u8, context_type, "experimental-webgl")) {
+            return null;
+        }
+        return null;
+    };
+    self._cached = drawing_context;
+    return drawing_context;
 }
 
 /// Transfers control of the canvas to an OffscreenCanvas.
 /// Returns an OffscreenCanvas with the same dimensions.
-pub fn transferControlToOffscreen(self: *Canvas, page: *Page) !*OffscreenCanvas {
+pub fn transferControlToOffscreen(self: *Canvas, exec: *Execution) !*OffscreenCanvas {
     const width = self.getWidth();
     const height = self.getHeight();
-    return OffscreenCanvas.constructor(width, height, page);
+    return OffscreenCanvas.constructor(width, height, exec);
 }
 
 pub const JsApi = struct {

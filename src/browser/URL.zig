@@ -17,36 +17,85 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const idna = @import("../sys/idna.zig");
+
 const Allocator = std.mem.Allocator;
 
-const ResolveOpts = struct {
-    encode: bool = false,
+pub const ResolveOpts = struct {
+    /// null = don't encode, "UTF-8" = standard percent encoding,
+    /// other charset = encode query string using that charset with NCR fallback
+    encoding: ?[]const u8 = null,
     always_dupe: bool = false,
 };
 
 // path is anytype, so that it can be used with both []const u8 and [:0]const u8
-pub fn resolve(allocator: Allocator, base: [:0]const u8, path: anytype, comptime opts: ResolveOpts) ![:0]const u8 {
-    const PT = @TypeOf(path);
-    if (base.len == 0 or isCompleteHTTPUrl(path)) {
-        if (comptime opts.always_dupe or !isNullTerminated(PT)) {
-            const duped = try allocator.dupeZ(u8, path);
-            return processResolved(allocator, duped, opts);
+pub fn resolve(allocator: Allocator, base: [:0]const u8, source_path: anytype, opts: ResolveOpts) ![:0]const u8 {
+    const PT = @TypeOf(source_path);
+
+    const needs_dupe = comptime !isNullTerminated(PT);
+    var path: [:0]const u8 = if (needs_dupe or opts.always_dupe) try allocator.dupeZ(u8, source_path) else source_path;
+
+    if (base.len == 0) {
+        return processResolved(allocator, path, opts);
+    }
+
+    // Minimum is "x:" and skip relative path (very common case)
+    if (path.len >= 2 and path[0] != '/') {
+        if (std.mem.indexOfScalar(u8, path[0..], ':')) |scheme_path_end| {
+            scheme_check: {
+                const scheme_path = path[0..scheme_path_end];
+                //from "ws" to "https"
+                if (scheme_path_end >= 2 and scheme_path_end <= 5) {
+                    const has_double_slashes: bool = scheme_path_end + 3 <= path.len and path[scheme_path_end + 1] == '/' and path[scheme_path_end + 2] == '/';
+                    const special_schemes = [_][]const u8{ "https", "http", "ws", "wss", "file", "ftp" };
+
+                    for (special_schemes) |special_scheme| {
+                        if (std.ascii.eqlIgnoreCase(scheme_path, special_scheme)) {
+                            const base_scheme_end = std.mem.indexOf(u8, base, "://") orelse 0;
+
+                            if (base_scheme_end > 0 and std.mem.eql(u8, base[0..base_scheme_end], scheme_path) and !has_double_slashes) {
+                                //Skip ":" and exit as relative state
+                                path = path[scheme_path_end + 1 ..];
+                                break :scheme_check;
+                            } else {
+                                var rest_start: usize = scheme_path_end + 1;
+                                //Skip any slashas after "scheme:"
+                                while (rest_start < path.len and (path[rest_start] == '/' or path[rest_start] == '\\')) {
+                                    rest_start += 1;
+                                }
+                                // A special scheme (exclude "file") must contain at least any chars after "://"
+                                if (rest_start == path.len and !std.ascii.eqlIgnoreCase(scheme_path, "file")) {
+                                    return error.TypeError;
+                                }
+                                //File scheme allow empty host
+                                const separator: []const u8 = if (!has_double_slashes and std.ascii.eqlIgnoreCase(scheme_path, "file")) ":///" else "://";
+
+                                path = try std.mem.joinZ(allocator, "", &.{ scheme_path, separator, path[rest_start..] });
+                                return processResolved(allocator, path, opts);
+                            }
+                        }
+                    }
+                }
+                if (scheme_path.len > 0) {
+                    for (scheme_path[1..]) |c| {
+                        if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') {
+                            //Exit as relative state
+                            break :scheme_check;
+                        }
+                    }
+                }
+                //path is complete http url
+                return processResolved(allocator, path, opts);
+            }
         }
-        if (comptime opts.encode) {
-            return processResolved(allocator, path, opts);
-        }
-        return path;
     }
 
     if (path.len == 0) {
-        if (comptime opts.always_dupe) {
-            const duped = try allocator.dupeZ(u8, base);
-            return processResolved(allocator, duped, opts);
+        if (opts.always_dupe) {
+            const dupe = try allocator.dupeZ(u8, base);
+            return processResolved(allocator, dupe, opts);
         }
-        if (comptime opts.encode) {
-            return processResolved(allocator, base, opts);
-        }
-        return base;
+        return processResolved(allocator, base, opts);
     }
 
     if (path[0] == '?') {
@@ -63,14 +112,7 @@ pub fn resolve(allocator: Allocator, base: [:0]const u8, path: anytype, comptime
     if (std.mem.startsWith(u8, path, "//")) {
         // network-path reference
         const index = std.mem.indexOfScalar(u8, base, ':') orelse {
-            if (comptime isNullTerminated(PT)) {
-                if (comptime opts.encode) {
-                    return processResolved(allocator, path, opts);
-                }
-                return path;
-            }
-            const duped = try allocator.dupeZ(u8, path);
-            return processResolved(allocator, duped, opts);
+            return processResolved(allocator, path, opts);
         };
         const protocol = base[0 .. index + 1];
         const result = try std.mem.joinZ(allocator, "", &.{ protocol, path });
@@ -96,6 +138,7 @@ pub fn resolve(allocator: Allocator, base: [:0]const u8, path: anytype, comptime
     // trailing space so that we always have space to append the null terminator
     // and so that we can compare the next two characters without needing to length check
     var out = try std.mem.join(allocator, "", &.{ normalized_base, "/", path, "  " });
+
     const end = out.len - 2;
 
     const path_marker = path_start + 1;
@@ -148,14 +191,36 @@ pub fn resolve(allocator: Allocator, base: [:0]const u8, path: anytype, comptime
     return processResolved(allocator, out[0..out_i :0], opts);
 }
 
-fn processResolved(allocator: Allocator, url: [:0]const u8, comptime opts: ResolveOpts) ![:0]const u8 {
-    if (!comptime opts.encode) {
-        return url;
-    }
-    return ensureEncoded(allocator, url);
+fn processResolved(allocator: Allocator, url: [:0]const u8, opts: ResolveOpts) ![:0]const u8 {
+    const encoding = opts.encoding orelse return ensureHostAscii(allocator, url);
+    return ensureEncoded(allocator, url, encoding);
 }
 
-pub fn ensureEncoded(allocator: Allocator, url: [:0]const u8) ![:0]const u8 {
+/// IDNA-only pass: converts a non-ASCII host (`räksmörgås.se`) to its
+/// punycode form (`xn--rksmrgs-5wao1o.se`) and leaves everything else alone.
+fn ensureHostAscii(allocator: Allocator, url: [:0]const u8) ![:0]const u8 {
+    const hostname = getHostname(url);
+    if (hostname.len == 0 or !idna.needsAscii(hostname)) {
+        return url;
+    }
+
+    const ascii = try idna.toAscii(allocator, hostname);
+
+    // hostname is a slice of url, so its start offset is just pointer arithmetic.
+    const start = @intFromPtr(hostname.ptr) - @intFromPtr(url.ptr);
+    const end = start + hostname.len;
+    var buf = try std.ArrayList(u8).initCapacity(allocator, url.len - hostname.len + ascii.len + 1);
+    buf.appendSliceAssumeCapacity(url[0..start]);
+    buf.appendSliceAssumeCapacity(ascii);
+    buf.appendSliceAssumeCapacity(url[end..]);
+    buf.appendAssumeCapacity(0);
+    return buf.items[0 .. buf.items.len - 1 :0];
+}
+
+pub fn ensureEncoded(allocator: Allocator, url_in: [:0]const u8, encoding: []const u8) ![:0]const u8 {
+    // Resolve any IDN host first; everything below operates on the ASCII form.
+    const url = try ensureHostAscii(allocator, url_in);
+
     const scheme_end = std.mem.indexOf(u8, url, "://");
     const authority_start = if (scheme_end) |end| end + 3 else 0;
     const path_start = std.mem.indexOfScalarPos(u8, url, authority_start, '/') orelse return url;
@@ -167,18 +232,18 @@ pub fn ensureEncoded(allocator: Allocator, url: [:0]const u8) ![:0]const u8 {
     const query_end = if (query_start) |_| (fragment_start orelse url.len) else path_end;
 
     const path_to_encode = url[path_start..path_end];
+    // Path is always UTF-8 percent encoded per URL spec
     const encoded_path = try percentEncodeSegment(allocator, path_to_encode, .path);
 
+    // Query string uses document encoding
     const encoded_query = if (query_start) |qs| blk: {
         const query_to_encode = url[qs + 1 .. query_end];
-        const encoded = try percentEncodeSegment(allocator, query_to_encode, .query);
-        break :blk encoded;
+        break :blk try encodeQueryString(allocator, query_to_encode, encoding);
     } else null;
 
     const encoded_fragment = if (fragment_start) |fs| blk: {
         const fragment_to_encode = url[fs + 1 ..];
-        const encoded = try percentEncodeSegment(allocator, fragment_to_encode, .query);
-        break :blk encoded;
+        break :blk try percentEncodeSegment(allocator, fragment_to_encode, .query);
     } else null;
 
     if (encoded_path.ptr == path_to_encode.ptr and
@@ -204,7 +269,7 @@ pub fn ensureEncoded(allocator: Allocator, url: [:0]const u8) ![:0]const u8 {
     return buf.items[0 .. buf.items.len - 1 :0];
 }
 
-const EncodeSet = enum { path, query, userinfo };
+const EncodeSet = enum { path, query, query_legacy, userinfo, fragment };
 
 fn percentEncodeSegment(allocator: Allocator, segment: []const u8, comptime encode_set: EncodeSet) ![]const u8 {
     // Check if encoding is needed
@@ -247,17 +312,67 @@ fn percentEncodeSegment(allocator: Allocator, segment: []const u8, comptime enco
     return buf.items;
 }
 
+const h5e = @import("parser/html5ever.zig");
+
+/// Encode a query string using the specified encoding.
+/// For UTF-8, this is standard percent encoding.
+/// For legacy encodings, unmappable characters are replaced with NCRs (&#codepoint;).
+fn encodeQueryString(allocator: Allocator, query: []const u8, encoding: []const u8) ![]const u8 {
+    // For UTF-8, use standard percent encoding
+    if (std.mem.eql(u8, encoding, "UTF-8")) {
+        return percentEncodeSegment(allocator, query, .query);
+    }
+
+    // For legacy encodings, first encode to the target charset with NCR fallback
+    const enc_info = h5e.encoding_for_label(encoding.ptr, encoding.len);
+    if (!enc_info.isValid()) {
+        // Unknown encoding, fall back to UTF-8
+        return percentEncodeSegment(allocator, query, .query);
+    }
+
+    // Calculate max buffer size for encoded output
+    const max_encoded_len = h5e.encoding_max_encode_buffer_length(enc_info.handle.?, query.len);
+    if (max_encoded_len == 0) {
+        return percentEncodeSegment(allocator, query, .query);
+    }
+
+    const encode_buf = try allocator.alloc(u8, max_encoded_len);
+    defer allocator.free(encode_buf);
+
+    // Encode UTF-8 to legacy encoding with NCR fallback
+    const result = h5e.encoding_encode_with_ncr(
+        enc_info.handle.?,
+        query.ptr,
+        query.len,
+        encode_buf.ptr,
+        encode_buf.len,
+    );
+
+    if (!result.isSuccess()) {
+        // Encoding failed, fall back to UTF-8
+        return percentEncodeSegment(allocator, query, .query);
+    }
+
+    // Now percent-encode the result using query_legacy to preserve NCRs
+    const encoded_bytes = encode_buf[0..result.bytes_written];
+    return percentEncodeSegment(allocator, encoded_bytes, .query_legacy);
+}
+
 fn shouldPercentEncode(c: u8, comptime encode_set: EncodeSet) bool {
     return switch (c) {
         // Unreserved characters (RFC 3986)
         'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => false,
-        // sub-delims allowed in path/query but some must be encoded in userinfo
-        '!', '$', '&', '\'', '(', ')', '*', '+', ',' => false,
-        ';', '=' => encode_set == .userinfo,
+        // sub-delims allowed in path/query but some must be encoded in userinfo/query_legacy
+        '!', '$', '\'', '(', ')', '*', '+', ',' => false,
+        // '&' and ';' must be encoded for legacy encoding (to preserve NCRs like &#nnnnn;)
+        '&', ';' => encode_set == .userinfo or encode_set == .query_legacy,
+        '=' => encode_set == .userinfo,
         // Separators: userinfo must encode these
         '/', ':', '@' => encode_set == .userinfo,
-        // '?' is allowed in queries but not in paths or userinfo
-        '?' => encode_set != .query,
+        // '?' is allowed in queries only
+        '?' => encode_set != .query and encode_set != .query_legacy,
+        // '#' is allowed in fragments only
+        '#' => encode_set != .fragment,
         // Everything else needs encoding (including space)
         else => true,
     };
@@ -323,14 +438,22 @@ pub fn getPassword(raw: [:0]const u8) []const u8 {
 }
 
 pub fn getPathname(raw: [:0]const u8) []const u8 {
-    const protocol_end = std.mem.indexOf(u8, raw, "://") orelse 0;
-    const path_start = std.mem.indexOfScalarPos(u8, raw, if (protocol_end > 0) protocol_end + 3 else 0, '/') orelse raw.len;
+    const protocol_end = std.mem.indexOf(u8, raw, "://");
+
+    // Handle scheme:path URLs like about:blank (no "://")
+    if (protocol_end == null) {
+        const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return "";
+        const path = raw[colon_pos + 1 ..];
+        const query_or_hash = std.mem.indexOfAny(u8, path, "?#") orelse path.len;
+        return path[0..query_or_hash];
+    }
+
+    const path_start = std.mem.indexOfScalarPos(u8, raw, protocol_end.? + 3, '/') orelse raw.len;
 
     const query_or_hash_start = std.mem.indexOfAnyPos(u8, raw, path_start, "?#") orelse raw.len;
 
     if (path_start >= query_or_hash_start) {
-        if (std.mem.indexOf(u8, raw, "://") != null) return "/";
-        return "";
+        return "/";
     }
 
     return raw[path_start..query_or_hash_start];
@@ -347,25 +470,38 @@ pub fn isHTTPS(raw: [:0]const u8) bool {
 
 pub fn getHostname(raw: [:0]const u8) []const u8 {
     const host = getHost(raw);
-    const pos = std.mem.lastIndexOfScalar(u8, host, ':') orelse return host;
-    return host[0..pos];
+    const port_sep = findPortSeparator(host) orelse return host;
+    return host[0..port_sep];
 }
 
 pub fn getPort(raw: [:0]const u8) []const u8 {
     const host = getHost(raw);
-    const pos = std.mem.lastIndexOfScalar(u8, host, ':') orelse return "";
+    const port_sep = findPortSeparator(host) orelse return "";
+    return host[port_sep + 1 ..];
+}
 
-    if (pos + 1 >= host.len) {
-        return "";
+// Finds the colon separating host from port, handling IPv6 bracket notation.
+// For IPv6 like "[::1]:8080", returns position of ":" after "]".
+// For IPv6 like "[::1]" (no port), returns null.
+// For regular hosts, returns position of last ":" if followed by digits.
+fn findPortSeparator(host: []const u8) ?usize {
+    if (host.len > 0 and host[0] == '[') {
+        // IPv6: find closing bracket, port separator must be after it
+        const bracket_end = std.mem.indexOfScalar(u8, host, ']') orelse return null;
+        if (bracket_end + 1 < host.len and host[bracket_end + 1] == ':') {
+            return bracket_end + 1;
+        }
+        return null;
     }
+
+    // Regular host: find last colon and verify it's followed by digits
+    const pos = std.mem.lastIndexOfScalar(u8, host, ':') orelse return null;
+    if (pos + 1 >= host.len) return null;
 
     for (host[pos + 1 ..]) |c| {
-        if (c < '0' or c > '9') {
-            return "";
-        }
+        if (c < '0' or c > '9') return null;
     }
-
-    return host[pos + 1 ..];
+    return pos;
 }
 
 pub fn getSearch(raw: [:0]const u8) []const u8 {
@@ -393,21 +529,12 @@ pub fn getOrigin(allocator: Allocator, raw: [:0]const u8) !?[]const u8 {
         return null;
     }
 
-    var authority_start = scheme_end + 3;
-    const has_user_info = if (std.mem.indexOf(u8, raw[authority_start..], "@")) |pos| blk: {
-        authority_start += pos + 1;
-        break :blk true;
-    } else false;
-
-    // Find end of authority (start of path/query/fragment or end of string)
-    const authority_end_relative = std.mem.indexOfAny(u8, raw[authority_start..], "/?#");
-    const authority_end = if (authority_end_relative) |end|
-        authority_start + end
-    else
-        raw.len;
+    const auth = parseAuthority(raw) orelse return null;
+    const has_user_info = auth.has_user_info;
+    const authority_end = auth.host_end;
 
     // Check for port in the host:port section
-    const host_part = raw[authority_start..authority_end];
+    const host_part = auth.getHost(raw);
     if (std.mem.lastIndexOfScalar(u8, host_part, ':')) |colon_pos_in_host| {
         const port = host_part[colon_pos_in_host + 1 ..];
 
@@ -448,31 +575,18 @@ pub fn getOrigin(allocator: Allocator, raw: [:0]const u8) !?[]const u8 {
 }
 
 fn getUserInfo(raw: [:0]const u8) ?[]const u8 {
-    const scheme_end = std.mem.indexOf(u8, raw, "://") orelse return null;
+    const auth = parseAuthority(raw) orelse return null;
+    if (!auth.has_user_info) return null;
+
+    // User info is from authority_start to host_start - 1 (excluding the @)
+    const scheme_end = std.mem.indexOf(u8, raw, "://").?;
     const authority_start = scheme_end + 3;
-
-    const pos = std.mem.indexOfScalar(u8, raw[authority_start..], '@') orelse return null;
-    const path_start = std.mem.indexOfScalarPos(u8, raw, authority_start, '/') orelse raw.len;
-
-    const full_pos = authority_start + pos;
-    if (full_pos < path_start) {
-        return raw[authority_start..full_pos];
-    }
-
-    return null;
+    return raw[authority_start .. auth.host_start - 1];
 }
 
-pub fn getHost(raw: [:0]const u8) []const u8 {
-    const scheme_end = std.mem.indexOf(u8, raw, "://") orelse return "";
-
-    var authority_start = scheme_end + 3;
-    if (std.mem.indexOf(u8, raw[authority_start..], "@")) |pos| {
-        authority_start += pos + 1;
-    }
-
-    const authority = raw[authority_start..];
-    const path_start = std.mem.indexOfAny(u8, authority, "/?#") orelse return authority;
-    return authority[0..path_start];
+pub fn getHost(raw: []const u8) []const u8 {
+    const auth = parseAuthority(raw) orelse return "";
+    return auth.getHost(raw);
 }
 
 // Returns true if these two URLs point to the same document.
@@ -587,11 +701,13 @@ pub fn setPathname(current: [:0]const u8, value: []const u8, allocator: Allocato
     const search = getSearch(current);
     const hash = getHash(current);
 
+    const encoded = try percentEncodeSegment(allocator, value, .path);
+
     // Add / prefix if not present and value is not empty
-    const pathname = if (value.len > 0 and value[0] != '/')
-        try std.fmt.allocPrint(allocator, "/{s}", .{value})
+    const pathname = if (encoded.len > 0 and encoded[0] != '/')
+        try std.fmt.allocPrint(allocator, "/{s}", .{encoded})
     else
-        value;
+        encoded;
 
     return buildUrl(allocator, protocol, host, pathname, search, hash);
 }
@@ -602,11 +718,13 @@ pub fn setSearch(current: [:0]const u8, value: []const u8, allocator: Allocator)
     const pathname = getPathname(current);
     const hash = getHash(current);
 
+    const encoded = try percentEncodeSegment(allocator, value, .query);
+
     // Add ? prefix if not present and value is not empty
-    const search = if (value.len > 0 and value[0] != '?')
-        try std.fmt.allocPrint(allocator, "?{s}", .{value})
+    const search = if (encoded.len > 0 and value[0] != '?')
+        try std.fmt.allocPrint(allocator, "?{s}", .{encoded})
     else
-        value;
+        encoded;
 
     return buildUrl(allocator, protocol, host, pathname, search, hash);
 }
@@ -617,11 +735,13 @@ pub fn setHash(current: [:0]const u8, value: []const u8, allocator: Allocator) !
     const pathname = getPathname(current);
     const search = getSearch(current);
 
+    const encoded = try percentEncodeSegment(allocator, value, .fragment);
+
     // Add # prefix if not present and value is not empty
-    const hash = if (value.len > 0 and value[0] != '#')
-        try std.fmt.allocPrint(allocator, "#{s}", .{value})
+    const hash = if (encoded.len > 0 and encoded[0] != '#')
+        try std.fmt.allocPrint(allocator, "#{s}", .{encoded})
     else
-        value;
+        encoded;
 
     return buildUrl(allocator, protocol, host, pathname, search, hash);
 }
@@ -743,6 +863,47 @@ pub fn unescape(arena: Allocator, input: []const u8) ![]const u8 {
     }
 
     return result.items;
+}
+
+const AuthorityInfo = struct {
+    host_start: usize,
+    host_end: usize,
+    has_user_info: bool,
+
+    fn getHost(self: AuthorityInfo, raw: []const u8) []const u8 {
+        return raw[self.host_start..self.host_end];
+    }
+};
+
+// Parses the authority component of a URL, correctly handling userinfo.
+// Returns null if the URL doesn't have a valid scheme (no "://").
+// SECURITY: Only looks for @ within the authority portion (before /?#)
+// to prevent path-based @ injection attacks.
+fn parseAuthority(raw: []const u8) ?AuthorityInfo {
+    const scheme_end = std.mem.indexOf(u8, raw, "://") orelse return null;
+    const authority_start = scheme_end + 3;
+
+    // Find end of authority FIRST (start of path/query/fragment or end of string)
+    const authority_end = if (std.mem.indexOfAny(u8, raw[authority_start..], "/?#")) |end|
+        authority_start + end
+    else
+        raw.len;
+
+    // Only look for @ within the authority portion, not in path/query/fragment
+    const authority_portion = raw[authority_start..authority_end];
+    if (std.mem.indexOf(u8, authority_portion, "@")) |pos| {
+        return .{
+            .host_start = authority_start + pos + 1,
+            .host_end = authority_end,
+            .has_user_info = true,
+        };
+    }
+
+    return .{
+        .host_start = authority_start,
+        .host_end = authority_end,
+        .has_user_info = false,
+    };
 }
 
 const testing = @import("../testing.zig");
@@ -1044,7 +1205,7 @@ test "URL: ensureEncoded" {
     };
 
     for (cases) |case| {
-        const result = try ensureEncoded(testing.arena_allocator, case.url);
+        const result = try ensureEncoded(testing.arena_allocator, case.url, "UTF-8");
         try testing.expectString(case.expected, result);
     }
 }
@@ -1174,7 +1335,7 @@ test "URL: resolve with encoding" {
         },
         // Relative paths with encoding
         .{
-            .base = "https://example.com/dir/page.html",
+            .base = "https://example.com/dir/frame.html",
             .path = "../other dir/file.html",
             .expected = "https://example.com/other%20dir/file.html",
         },
@@ -1210,7 +1371,7 @@ test "URL: resolve with encoding" {
     };
 
     for (cases) |case| {
-        const result = try resolve(testing.arena_allocator, case.base, case.path, .{ .encode = true });
+        const result = try resolve(testing.arena_allocator, case.base, case.path, .{ .encoding = "UTF-8" });
         try testing.expectString(case.expected, result);
     }
 }
@@ -1413,4 +1574,291 @@ test "URL: getHost" {
     try testing.expectEqualSlices(u8, "example.com", getHost("https://user:pass@example.com/page"));
     try testing.expectEqualSlices(u8, "example.com:8080", getHost("https://user:pass@example.com:8080/page"));
     try testing.expectEqualSlices(u8, "", getHost("not-a-url"));
+
+    // SECURITY: @ in path must NOT be treated as userinfo separator
+    try testing.expectEqualSlices(u8, "evil.example.com", getHost("http://evil.example.com/@victim.example.com/"));
+    try testing.expectEqualSlices(u8, "evil.example.com", getHost("https://evil.example.com/path/@victim.example.com"));
+
+    // IPv6 addresses
+    try testing.expectEqualSlices(u8, "[::1]:8080", getHost("http://[::1]:8080/path"));
+    try testing.expectEqualSlices(u8, "[::1]", getHost("http://[::1]/path"));
+    try testing.expectEqualSlices(u8, "[2001:db8::1]", getHost("https://[2001:db8::1]/"));
+}
+
+test "URL: getHostname" {
+    // Regular hosts
+    try testing.expectEqualSlices(u8, "example.com", getHostname("https://example.com:8080/path"));
+    try testing.expectEqualSlices(u8, "example.com", getHostname("https://example.com/path"));
+
+    // IPv6 with port
+    try testing.expectEqualSlices(u8, "[::1]", getHostname("http://[::1]:8080/path"));
+
+    // IPv6 without port - must return full bracket notation
+    try testing.expectEqualSlices(u8, "[::1]", getHostname("http://[::1]/path"));
+    try testing.expectEqualSlices(u8, "[2001:db8::1]", getHostname("https://[2001:db8::1]/"));
+}
+
+test "URL: getPort" {
+    // Regular hosts
+    try testing.expectEqualSlices(u8, "8080", getPort("https://example.com:8080/path"));
+    try testing.expectEqualSlices(u8, "", getPort("https://example.com/path"));
+
+    // IPv6 with port
+    try testing.expectEqualSlices(u8, "8080", getPort("http://[::1]:8080/path"));
+    try testing.expectEqualSlices(u8, "3000", getPort("http://[2001:db8::1]:3000/"));
+
+    // IPv6 without port - colons inside brackets must not be treated as port separator
+    try testing.expectEqualSlices(u8, "", getPort("http://[::1]/path"));
+    try testing.expectEqualSlices(u8, "", getPort("https://[2001:db8::1]/"));
+}
+
+test "URL: setPathname percent-encodes" {
+    // Use arena allocator to match production usage (setPathname makes intermediate allocations)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Spaces must be encoded as %20
+    const result1 = try setPathname("http://a/", "c d", allocator);
+    try testing.expectEqualSlices(u8, "http://a/c%20d", result1);
+
+    // Already-encoded sequences must not be double-encoded
+    const result2 = try setPathname("https://example.com/path", "/already%20encoded", allocator);
+    try testing.expectEqualSlices(u8, "https://example.com/already%20encoded", result2);
+
+    // Query and hash must be preserved
+    const result3 = try setPathname("https://example.com/path?a=b#hash", "/new path", allocator);
+    try testing.expectEqualSlices(u8, "https://example.com/new%20path?a=b#hash", result3);
+}
+
+test "URL: getOrigin" {
+    defer testing.reset();
+
+    const Case = struct {
+        url: [:0]const u8,
+        expected: ?[]const u8,
+    };
+
+    const cases = [_]Case{
+        // Basic HTTP/HTTPS origins
+        .{ .url = "http://example.com/path", .expected = "http://example.com" },
+        .{ .url = "https://example.com/path", .expected = "https://example.com" },
+        .{ .url = "https://example.com:8080/path", .expected = "https://example.com:8080" },
+
+        // Default ports should be stripped
+        .{ .url = "http://example.com:80/path", .expected = "http://example.com" },
+        .{ .url = "https://example.com:443/path", .expected = "https://example.com" },
+
+        // User info should be stripped from origin
+        .{ .url = "http://user:pass@example.com/path", .expected = "http://example.com" },
+        .{ .url = "https://user@example.com:8080/path", .expected = "https://example.com:8080" },
+
+        // Non-HTTP schemes return null
+        .{ .url = "ftp://example.com/path", .expected = null },
+        .{ .url = "file:///path/to/file", .expected = null },
+        .{ .url = "about:blank", .expected = null },
+
+        // Query and fragment should not affect origin
+        .{ .url = "https://example.com?query=1", .expected = "https://example.com" },
+        .{ .url = "https://example.com#fragment", .expected = "https://example.com" },
+        .{ .url = "https://example.com/path?q=1#frag", .expected = "https://example.com" },
+
+        // SECURITY: @ in path must NOT be treated as userinfo separator
+        // This would be a Same-Origin Policy bypass if mishandled
+        .{ .url = "http://evil.example.com/@victim.example.com/", .expected = "http://evil.example.com" },
+        .{ .url = "https://evil.example.com/path/@victim.example.com/steal", .expected = "https://evil.example.com" },
+        .{ .url = "http://evil.example.com/@victim.example.com:443/", .expected = "http://evil.example.com" },
+
+        // @ in query/fragment must also not affect origin
+        .{ .url = "https://example.com/path?user=foo@bar.com", .expected = "https://example.com" },
+        .{ .url = "https://example.com/path#user@host", .expected = "https://example.com" },
+    };
+
+    for (cases) |case| {
+        const result = try getOrigin(testing.arena_allocator, case.url);
+        if (case.expected) |expected| {
+            try testing.expectString(expected, result.?);
+        } else {
+            try testing.expectEqual(null, result);
+        }
+    }
+}
+
+test "URL: resolve path scheme" {
+    const Case = struct {
+        base: [:0]const u8,
+        path: [:0]const u8,
+        expected: [:0]const u8,
+        expected_error: bool = false,
+    };
+
+    const cases = [_]Case{
+        //same schemes and path as relative path (one slash)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "https:/about",
+            .expected = "https://www.example.com/about",
+        },
+        //same schemes and path as relative path (without slash)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "https:about",
+            .expected = "https://www.example.com/about",
+        },
+        //same schemes and path as absolute path (two slashes)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "https://about",
+            .expected = "https://about",
+        },
+        //different schemes and path as absolute (without slash)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "http:about",
+            .expected = "http://about",
+        },
+        //different schemes and path as absolute (with one slash)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "http:/about",
+            .expected = "http://about",
+        },
+        //different schemes and path as absolute (with two slashes)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "http://about",
+            .expected = "http://about",
+        },
+        //same schemes and path as absolute (with more slashes)
+        .{
+            .base = "https://site/",
+            .path = "https://path",
+            .expected = "https://path",
+        },
+        //path scheme is not special and path as absolute (without additional slashes)
+        .{
+            .base = "http://localhost/",
+            .path = "data:test",
+            .expected = "data:test",
+        },
+        //different schemes and path as absolute (pathscheme=ws)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "ws://about",
+            .expected = "ws://about",
+        },
+        //different schemes and path as absolute (path scheme=wss)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "wss://about",
+            .expected = "wss://about",
+        },
+        //different schemes and path as absolute (path scheme=ftp)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "ftp://about",
+            .expected = "ftp://about",
+        },
+        //different schemes and path as absolute (path scheme=file)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "file://path/to/file",
+            .expected = "file://path/to/file",
+        },
+        //different schemes and path as absolute (path scheme=file, host is empty)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "file:/path/to/file",
+            .expected = "file:///path/to/file",
+        },
+        //different schemes and path as absolute (path scheme=file, host is empty)
+        .{
+            .base = "https://www.example.com/example",
+            .path = "file:/",
+            .expected = "file:///",
+        },
+        //different schemes without :// and normalize "file" scheme, absolute path
+        .{
+            .base = "https://www.example.com/example",
+            .path = "file:path/to/file",
+            .expected = "file:///path/to/file",
+        },
+        //same schemes without :// in path and rest starts with scheme:/, relative path
+        .{
+            .base = "https://www.example.com/example",
+            .path = "https:/file:/relative/path/",
+            .expected = "https://www.example.com/file:/relative/path/",
+        },
+        //same schemes without :// in path and rest starts with scheme://, relative path
+        .{
+            .base = "https://www.example.com/example",
+            .path = "https:/http://relative/path/",
+            .expected = "https://www.example.com/http://relative/path/",
+        },
+        //same schemes without :// in path , relative state
+        .{
+            .base = "http://www.example.com/example",
+            .path = "http:relative:path",
+            .expected = "http://www.example.com/relative:path",
+        },
+        //repeat different schemes in path
+        .{
+            .base = "http://www.example.com/example",
+            .path = "http:http:/relative/path/",
+            .expected = "http://www.example.com/http:/relative/path/",
+        },
+        //repeat different schemes in path
+        .{
+            .base = "http://www.example.com/example",
+            .path = "http:https://relative:path",
+            .expected = "http://www.example.com/https://relative:path",
+        },
+        //NOT required :// for blob scheme
+        .{
+            .base = "http://www.example.com/example",
+            .path = "blob:other",
+            .expected = "blob:other",
+        },
+        //NOT required :// for NON-special schemes and can contains "+" or "-" or "." in scheme
+        .{
+            .base = "http://www.example.com/example",
+            .path = "custom+foo:other",
+            .expected = "custom+foo:other",
+        },
+        //NOT required :// for NON-special schemes
+        .{
+            .base = "http://www.example.com/example",
+            .path = "blob:",
+            .expected = "blob:",
+        },
+        //NOT required :// for special scheme equal base scheme
+        .{
+            .base = "http://www.example.com/example",
+            .path = "http:",
+            .expected = "http://www.example.com/example",
+        },
+        //required :// for special scheme, so throw error.InvalidURL
+        .{
+            .base = "http://www.example.com/example",
+            .path = "https:",
+            .expected = "",
+            .expected_error = true,
+        },
+        //incorrect symbols in path scheme
+        .{
+            .base = "https://site",
+            .path = "http?://host/some",
+            .expected = "https://site/http?://host/some",
+        },
+    };
+
+    for (cases) |case| {
+        if (case.expected_error) {
+            const result = resolve(testing.arena_allocator, case.base, case.path, .{});
+            try testing.expectError(error.TypeError, result);
+        } else {
+            const result = try resolve(testing.arena_allocator, case.base, case.path, .{});
+            try testing.expectString(case.expected, result);
+        }
+    }
 }

@@ -17,22 +17,25 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
-const Allocator = std.mem.Allocator;
-
-const log = @import("log.zig");
 const Config = @import("Config.zig");
 const Snapshot = @import("browser/js/Snapshot.zig");
 const Platform = @import("browser/js/Platform.zig");
 const Telemetry = @import("telemetry/telemetry.zig").Telemetry;
 
-const Network = @import("network/Runtime.zig");
+const Storage = @import("storage/Storage.zig");
+const Network = @import("network/Network.zig");
 pub const ArenaPool = @import("ArenaPool.zig");
+
+const log = lp.log;
+const Allocator = std.mem.Allocator;
 
 const App = @This();
 
 network: Network,
 config: *const Config,
+storage: Storage,
 platform: Platform,
 snapshot: Snapshot,
 telemetry: Telemetry,
@@ -41,35 +44,38 @@ arena_pool: ArenaPool,
 app_dir_path: ?[]const u8,
 
 pub fn init(allocator: Allocator, config: *const Config) !*App {
+    const platform = try Platform.init();
+    errdefer platform.deinit();
+
+    const snapshot = try Snapshot.load();
+    errdefer snapshot.deinit();
+
+    var storage = try Storage.init(allocator, config);
+    errdefer storage.deinit(allocator);
+
     const app = try allocator.create(App);
     errdefer allocator.destroy(app);
 
     app.* = .{
         .config = config,
         .allocator = allocator,
+        .platform = platform,
+        .snapshot = snapshot,
+        .storage = storage,
         .network = undefined,
-        .platform = undefined,
-        .snapshot = undefined,
         .app_dir_path = undefined,
         .telemetry = undefined,
         .arena_pool = undefined,
     };
-
-    app.network = try Network.init(allocator, config);
+    app.network = try Network.init(allocator, app, config);
     errdefer app.network.deinit();
-
-    app.platform = try Platform.init();
-    errdefer app.platform.deinit();
-
-    app.snapshot = try Snapshot.load();
-    errdefer app.snapshot.deinit();
 
     app.app_dir_path = getAndMakeAppDir(allocator);
 
     app.telemetry = try Telemetry.init(app, config.mode);
-    errdefer app.telemetry.deinit();
+    errdefer app.telemetry.deinit(allocator);
 
-    app.arena_pool = ArenaPool.init(allocator, 512, 1024 * 16);
+    app.arena_pool = ArenaPool.init(allocator, .{});
     errdefer app.arena_pool.deinit();
 
     return app;
@@ -85,11 +91,12 @@ pub fn deinit(self: *App) void {
         allocator.free(app_dir_path);
         self.app_dir_path = null;
     }
-    self.telemetry.deinit();
+    self.telemetry.deinit(allocator);
     self.network.deinit();
     self.snapshot.deinit();
     self.platform.deinit();
     self.arena_pool.deinit();
+    self.storage.deinit(allocator);
 
     allocator.destroy(self);
 }

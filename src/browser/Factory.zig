@@ -17,15 +17,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
-const reflect = @import("reflect.zig");
 
-const log = @import("../log.zig");
-const String = @import("../string.zig").String;
+const reflect = @import("reflect.zig");
 
 const SlabAllocator = @import("../slab.zig").SlabAllocator;
 
-const Page = @import("Page.zig");
+const Frame = @import("Frame.zig");
 const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
 const UIEvent = @import("webapi/event/UIEvent.zig");
@@ -37,10 +36,11 @@ const XMLHttpRequestEventTarget = @import("webapi/net/XMLHttpRequestEventTarget.
 const Blob = @import("webapi/Blob.zig");
 const AbstractRange = @import("webapi/AbstractRange.zig");
 
-const Allocator = std.mem.Allocator;
-
-const IS_DEBUG = builtin.mode == .Debug;
+const log = lp.log;
+const String = lp.String;
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const IS_DEBUG = builtin.mode == .Debug;
 
 // Shared across all frames of a Page.
 const Factory = @This();
@@ -239,7 +239,7 @@ fn eventInit(arena: Allocator, typ: String, value: anytype) !Event {
     const time_stamp = (raw_timestamp / 2) * 2;
 
     return .{
-        ._rc = 0,
+        ._rc = .{},
         ._arena = arena,
         ._type = unionInit(Event.Type, value),
         ._type_string = typ,
@@ -255,6 +255,7 @@ pub fn blob(_: *const Factory, arena: Allocator, child: anytype) !*@TypeOf(child
 
     const blob_ptr = chain.get(0);
     blob_ptr.* = .{
+        ._rc = .{},
         ._arena = arena,
         ._type = unionInit(Blob.Type, chain.get(1)),
         ._slice = "",
@@ -265,23 +266,23 @@ pub fn blob(_: *const Factory, arena: Allocator, child: anytype) !*@TypeOf(child
     return chain.get(1);
 }
 
-pub fn abstractRange(_: *const Factory, arena: Allocator, child: anytype, page: *Page) !*@TypeOf(child) {
+pub fn abstractRange(_: *const Factory, arena: Allocator, child: anytype, frame: *Frame) !*@TypeOf(child) {
     const chain = try PrototypeChain(&.{ AbstractRange, @TypeOf(child) }).allocate(arena);
 
-    const doc = page.document.asNode();
+    const doc = frame.document.asNode();
     const abstract_range = chain.get(0);
     abstract_range.* = AbstractRange{
-        ._rc = 0,
+        ._rc = .{},
         ._arena = arena,
-        ._page_id = page.id,
-        ._type = unionInit(AbstractRange.Type, chain.get(1)),
         ._end_offset = 0,
         ._start_offset = 0,
         ._end_container = doc,
         ._start_container = doc,
+        ._frame_loader_id = frame._loader_id,
+        ._type = unionInit(AbstractRange.Type, chain.get(1)),
     };
     chain.setLeaf(1, child);
-    page._live_ranges.append(&abstract_range._range_link);
+    frame._live_ranges.append(&abstract_range._range_link);
     return chain.get(1);
 }
 
@@ -379,7 +380,7 @@ pub fn destroy(self: *Factory, value: anytype) void {
         // We should always destroy from the leaf down.
         if (@hasDecl(S, "_prototype_root")) {
             // A Event{._type == .generic} (or any other similar types)
-            // _should_ be destoyed directly. The _type = .generic is a pseudo
+            // _should_ be destroyed directly. The _type = .generic is a pseudo
             // child
             if (S != Event or value._type != .generic) {
                 log.fatal(.bug, "factory.destroy.event", .{ .type = @typeName(S) });

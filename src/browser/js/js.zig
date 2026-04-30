@@ -25,7 +25,9 @@ pub const Env = @import("Env.zig");
 pub const bridge = @import("bridge.zig");
 pub const Caller = @import("Caller.zig");
 pub const Origin = @import("Origin.zig");
+pub const Identity = @import("Identity.zig");
 pub const Context = @import("Context.zig");
+pub const Execution = @import("Execution.zig");
 pub const Local = @import("Local.zig");
 pub const Inspector = @import("Inspector.zig");
 pub const Snapshot = @import("Snapshot.zig");
@@ -316,6 +318,9 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
     }
     return null;
 }
+
+// marker interface
+pub const Undefined = struct {};
 
 // These are here, and not in Inspector.zig, because Inspector.zig isn't always
 // included (e.g. in the wpt build).

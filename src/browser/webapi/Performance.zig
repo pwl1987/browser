@@ -1,12 +1,15 @@
+const std = @import("std");
 const js = @import("../js/js.zig");
-const Page = @import("../Page.zig");
+const Frame = @import("../Frame.zig");
 const datetime = @import("../../datetime.zig");
+
+const EventCounts = @import("EventCounts.zig");
+
+const Allocator = std.mem.Allocator;
 
 pub fn registerTypes() []const type {
     return &.{ Performance, Entry, Mark, Measure, PerformanceTiming, PerformanceNavigation };
 }
-
-const std = @import("std");
 
 const Performance = @This();
 
@@ -14,6 +17,7 @@ _time_origin: u64,
 _entries: std.ArrayList(*Entry) = .{},
 _timing: PerformanceTiming = .{},
 _navigation: PerformanceNavigation = .{},
+_event_counts: EventCounts = .{},
 
 /// Get high-resolution timestamp in microseconds, rounded to 5μs increments
 /// to match browser behavior (prevents fingerprinting)
@@ -54,16 +58,20 @@ pub fn getNavigation(self: *Performance) *PerformanceNavigation {
     return &self._navigation;
 }
 
+pub fn getEventCounts(self: *Performance) *EventCounts {
+    return &self._event_counts;
+}
+
 pub fn mark(
     self: *Performance,
     name: []const u8,
     _options: ?Mark.Options,
-    page: *Page,
+    frame: *Frame,
 ) !*Mark {
-    const m = try Mark.init(name, _options, page);
-    try self._entries.append(page.arena, m._proto);
+    const m = try Mark.init(name, _options, frame);
+    try self._entries.append(frame.arena, m._proto);
     // Notify about the change.
-    try page.notifyPerformanceObservers(m._proto);
+    try frame.notifyPerformanceObservers(m._proto);
     return m;
 }
 
@@ -77,7 +85,7 @@ pub fn measure(
     name: []const u8,
     maybe_options_or_start: ?MeasureOptionsOrStartMark,
     maybe_end_mark: ?[]const u8,
-    page: *Page,
+    frame: *Frame,
 ) !*Measure {
     if (maybe_options_or_start) |options_or_start| switch (options_or_start) {
         .measure_options => |options| {
@@ -111,11 +119,11 @@ pub fn measure(
                 start_timestamp,
                 end_timestamp,
                 options.duration,
-                page,
+                frame,
             );
-            try self._entries.append(page.arena, m._proto);
+            try self._entries.append(frame.arena, m._proto);
             // Notify about the change.
-            try page.notifyPerformanceObservers(m._proto);
+            try frame.notifyPerformanceObservers(m._proto);
             return m;
         },
         .start_mark => |start_mark| {
@@ -136,19 +144,19 @@ pub fn measure(
                 start_timestamp,
                 end_timestamp,
                 null,
-                page,
+                frame,
             );
-            try self._entries.append(page.arena, m._proto);
+            try self._entries.append(frame.arena, m._proto);
             // Notify about the change.
-            try page.notifyPerformanceObservers(m._proto);
+            try frame.notifyPerformanceObservers(m._proto);
             return m;
         },
     };
 
-    const m = try Measure.init(name, null, 0.0, self.now(), null, page);
-    try self._entries.append(page.arena, m._proto);
+    const m = try Measure.init(name, null, 0.0, self.now(), null, frame);
+    try self._entries.append(frame.arena, m._proto);
     // Notify about the change.
-    try page.notifyPerformanceObservers(m._proto);
+    try frame.notifyPerformanceObservers(m._proto);
     return m;
 }
 
@@ -180,33 +188,35 @@ pub fn getEntries(self: *const Performance) []*Entry {
     return self._entries.items;
 }
 
-pub fn getEntriesByType(self: *const Performance, entry_type: []const u8, page: *Page) ![]const *Entry {
-    var result: std.ArrayList(*Entry) = .empty;
+pub fn getEntriesByType(self: *const Performance, entry_type: []const u8, frame: *Frame) ![]const *Entry {
+    return filterEntriesByType(frame.call_arena, self._entries.items, entry_type);
+}
 
-    for (self._entries.items) |entry| {
+pub fn getEntriesByName(self: *const Performance, name: []const u8, entry_type: ?[]const u8, frame: *Frame) ![]const *Entry {
+    return filterEntriesByName(frame.call_arena, self._entries.items, name, entry_type);
+}
+
+// Also used by PerformanceObserver
+pub fn filterEntriesByType(arena: Allocator, list: []*Entry, entry_type: []const u8) ![]const *Entry {
+    var result: std.ArrayList(*Entry) = .empty;
+    for (list) |entry| {
         if (std.mem.eql(u8, entry.getEntryType(), entry_type)) {
-            try result.append(page.call_arena, entry);
+            try result.append(arena, entry);
         }
     }
-
     return result.items;
 }
 
-pub fn getEntriesByName(self: *const Performance, name: []const u8, entry_type: ?[]const u8, page: *Page) ![]const *Entry {
+// Also used by PerformanceObserver
+pub fn filterEntriesByName(arena: Allocator, list: []*Entry, name: []const u8, entry_type: ?[]const u8) ![]const *Entry {
     var result: std.ArrayList(*Entry) = .empty;
 
-    for (self._entries.items) |entry| {
+    for (list) |entry| {
         if (!std.mem.eql(u8, entry._name, name)) {
             continue;
         }
-
-        const et = entry_type orelse {
-            try result.append(page.call_arena, entry);
-            continue;
-        };
-
-        if (std.mem.eql(u8, entry.getEntryType(), et)) {
-            try result.append(page.call_arena, entry);
+        if (entry_type == null or std.mem.eql(u8, entry.getEntryType(), entry_type.?)) {
+            try result.append(arena, entry);
         }
     }
 
@@ -277,6 +287,7 @@ pub const JsApi = struct {
     pub const timeOrigin = bridge.accessor(Performance.getTimeOrigin, null, .{});
     pub const timing = bridge.accessor(Performance.getTiming, null, .{});
     pub const navigation = bridge.accessor(Performance.getNavigation, null, .{});
+    pub const eventCounts = bridge.accessor(Performance.getEventCounts, null, .{});
 };
 
 pub const Entry = struct {
@@ -363,23 +374,23 @@ pub const Mark = struct {
         startTime: ?f64 = null,
     };
 
-    pub fn init(name: []const u8, _opts: ?Options, page: *Page) !*Mark {
+    pub fn init(name: []const u8, _opts: ?Options, frame: *Frame) !*Mark {
         const opts = _opts orelse Options{};
-        const start_time = opts.startTime orelse page.window._performance.now();
+        const start_time = opts.startTime orelse frame.window._performance.now();
 
         if (start_time < 0.0) {
             return error.TypeError;
         }
 
         const detail = if (opts.detail) |d| try d.persist() else null;
-        const m = try page._factory.create(Mark{
+        const m = try frame._factory.create(Mark{
             ._proto = undefined,
             ._detail = detail,
         });
 
-        const entry = try page._factory.create(Entry{
+        const entry = try frame._factory.create(Entry{
             ._start_time = start_time,
-            ._name = try page.dupeString(name),
+            ._name = try frame.dupeString(name),
             ._type = .{ .mark = m },
         });
         m._proto = entry;
@@ -424,7 +435,7 @@ pub const Measure = struct {
         start_timestamp: f64,
         end_timestamp: f64,
         maybe_duration: ?f64,
-        page: *Page,
+        frame: *Frame,
     ) !*Measure {
         const duration = maybe_duration orelse (end_timestamp - start_timestamp);
         if (duration < 0.0) {
@@ -432,15 +443,15 @@ pub const Measure = struct {
         }
 
         const detail = if (maybe_detail) |d| try d.persist() else null;
-        const m = try page._factory.create(Measure{
+        const m = try frame._factory.create(Measure{
             ._proto = undefined,
             ._detail = detail,
         });
 
-        const entry = try page._factory.create(Entry{
+        const entry = try frame._factory.create(Entry{
             ._start_time = start_timestamp,
             ._duration = duration,
-            ._name = try page.dupeString(name),
+            ._name = try frame.dupeString(name),
             ._type = .{ .measure = m },
         });
         m._proto = entry;

@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../../log.zig");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
 const Element = @import("../Element.zig");
 const GenericIterator = @import("iterator.zig").Entry;
+
+const log = lp.log;
+const String = lp.String;
 
 pub const DOMTokenList = @This();
 
@@ -42,16 +44,16 @@ const Lookup = std.StringArrayHashMapUnmanaged(void);
 
 const WHITESPACE = " \t\n\r\x0C";
 
-pub fn length(self: *const DOMTokenList, page: *Page) !u32 {
-    const tokens = try self.getTokens(page);
+pub fn length(self: *const DOMTokenList, frame: *Frame) !u32 {
+    const tokens = try self.getTokens(frame.call_arena);
     return @intCast(tokens.count());
 }
 
 // TODO: soooo..inefficient
-pub fn item(self: *const DOMTokenList, index: usize, page: *Page) !?[]const u8 {
+pub fn item(self: *const DOMTokenList, index: usize, frame: *Frame) !?[]const u8 {
     var i: usize = 0;
 
-    const allocator = page.call_arena;
+    const allocator = frame.call_arena;
     var seen: std.StringArrayHashMapUnmanaged(void) = .empty;
 
     var it = std.mem.tokenizeAny(u8, self.getValue(), WHITESPACE);
@@ -77,35 +79,35 @@ pub fn contains(self: *const DOMTokenList, search: []const u8) !bool {
     return false;
 }
 
-pub fn add(self: *DOMTokenList, tokens: []const []const u8, page: *Page) !void {
+pub fn add(self: *DOMTokenList, tokens: []const []const u8, frame: *Frame) !void {
     for (tokens) |token| {
         try validateToken(token);
     }
 
-    var lookup = try self.getTokens(page);
-    const allocator = page.call_arena;
+    const allocator = frame.call_arena;
+    var lookup = try self.getTokens(allocator);
     try lookup.ensureUnusedCapacity(allocator, tokens.len);
 
     for (tokens) |token| {
         try lookup.put(allocator, token, {});
     }
 
-    try self.updateAttribute(lookup, page);
+    try self.updateAttribute(lookup, frame);
 }
 
-pub fn remove(self: *DOMTokenList, tokens: []const []const u8, page: *Page) !void {
+pub fn remove(self: *DOMTokenList, tokens: []const []const u8, frame: *Frame) !void {
     for (tokens) |token| {
         try validateToken(token);
     }
 
-    var lookup = try self.getTokens(page);
+    var lookup = try self.getTokens(frame.call_arena);
     for (tokens) |token| {
         _ = lookup.orderedRemove(token);
     }
-    try self.updateAttribute(lookup, page);
+    try self.updateAttribute(lookup, frame);
 }
 
-pub fn toggle(self: *DOMTokenList, token: []const u8, force: ?bool, page: *Page) !bool {
+pub fn toggle(self: *DOMTokenList, token: []const u8, force: ?bool, frame: *Frame) !bool {
     try validateToken(token);
 
     const has_token = try self.contains(token);
@@ -114,30 +116,30 @@ pub fn toggle(self: *DOMTokenList, token: []const u8, force: ?bool, page: *Page)
         if (f) {
             if (!has_token) {
                 const tokens_to_add = [_][]const u8{token};
-                try self.add(&tokens_to_add, page);
+                try self.add(&tokens_to_add, frame);
             }
             return true;
         } else {
             if (has_token) {
                 const tokens_to_remove = [_][]const u8{token};
-                try self.remove(&tokens_to_remove, page);
+                try self.remove(&tokens_to_remove, frame);
             }
             return false;
         }
     } else {
         if (has_token) {
             const tokens_to_remove = [_][]const u8{token};
-            try self.remove(tokens_to_remove[0..], page);
+            try self.remove(tokens_to_remove[0..], frame);
             return false;
         } else {
             const tokens_to_add = [_][]const u8{token};
-            try self.add(tokens_to_add[0..], page);
+            try self.add(tokens_to_add[0..], frame);
             return true;
         }
     }
 }
 
-pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8, page: *Page) !bool {
+pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8, frame: *Frame) !bool {
     // Validate in spec order: both empty first, then both whitespace
     if (old_token.len == 0 or new_token.len == 0) {
         return error.SyntaxError;
@@ -149,7 +151,8 @@ pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8
         return error.InvalidCharacterError;
     }
 
-    var lookup = try self.getTokens(page);
+    const allocator = frame.call_arena;
+    var lookup = try self.getTokens(frame.call_arena);
 
     // Check if old_token exists
     if (!lookup.contains(old_token)) {
@@ -158,11 +161,10 @@ pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8
 
     // If replacing with the same token, still need to trigger mutation
     if (std.mem.eql(u8, new_token, old_token)) {
-        try self.updateAttribute(lookup, page);
+        try self.updateAttribute(lookup, frame);
         return true;
     }
 
-    const allocator = page.call_arena;
     // Build new token list preserving order but replacing old with new
     var new_tokens = try std.ArrayList([]const u8).initCapacity(allocator, lookup.count());
     var replaced_old = false;
@@ -190,7 +192,7 @@ pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8
         try new_lookup.put(allocator, token, {});
     }
 
-    try self.updateAttribute(new_lookup, page);
+    try self.updateAttribute(new_lookup, frame);
     return true;
 }
 
@@ -198,26 +200,26 @@ pub fn getValue(self: *const DOMTokenList) []const u8 {
     return self._element.getAttributeSafe(self._attribute_name) orelse "";
 }
 
-pub fn setValue(self: *DOMTokenList, value: String, page: *Page) !void {
-    try self._element.setAttribute(self._attribute_name, value, page);
+pub fn setValue(self: *DOMTokenList, value: String, frame: *Frame) !void {
+    try self._element.setAttribute(self._attribute_name, value, frame);
 }
 
-pub fn keys(self: *DOMTokenList, page: *Page) !*KeyIterator {
-    return .init(.{ .list = self }, page);
+pub fn keys(self: *DOMTokenList, frame: *Frame) !*KeyIterator {
+    return .init(.{ .list = self }, frame);
 }
 
-pub fn values(self: *DOMTokenList, page: *Page) !*ValueIterator {
-    return .init(.{ .list = self }, page);
+pub fn values(self: *DOMTokenList, frame: *Frame) !*ValueIterator {
+    return .init(.{ .list = self }, frame);
 }
 
-pub fn entries(self: *DOMTokenList, page: *Page) !*EntryIterator {
-    return .init(.{ .list = self }, page);
+pub fn entries(self: *DOMTokenList, frame: *Frame) !*EntryIterator {
+    return .init(.{ .list = self }, frame);
 }
 
-pub fn forEach(self: *DOMTokenList, cb_: js.Function, js_this_: ?js.Object, page: *Page) !void {
+pub fn forEach(self: *DOMTokenList, cb_: js.Function, js_this_: ?js.Object, frame: *Frame) !void {
     const cb = if (js_this_) |js_this| try cb_.withThis(js_this) else cb_;
 
-    const allocator = page.call_arena;
+    const allocator = frame.call_arena;
 
     var i: i32 = 0;
     var seen: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -237,14 +239,13 @@ pub fn forEach(self: *DOMTokenList, cb_: js.Function, js_this_: ?js.Object, page
     }
 }
 
-fn getTokens(self: *const DOMTokenList, page: *Page) !Lookup {
+fn getTokens(self: *const DOMTokenList, allocator: std.mem.Allocator) !Lookup {
     const value = self.getValue();
     if (value.len == 0) {
         return .empty;
     }
 
     var list: Lookup = .empty;
-    const allocator = page.call_arena;
     try list.ensureTotalCapacity(allocator, 4);
 
     var it = std.mem.tokenizeAny(u8, value, WHITESPACE);
@@ -263,16 +264,16 @@ fn validateToken(token: []const u8) !void {
     }
 }
 
-fn updateAttribute(self: *DOMTokenList, tokens: Lookup, page: *Page) !void {
+fn updateAttribute(self: *DOMTokenList, tokens: Lookup, frame: *Frame) !void {
     if (tokens.count() > 0) {
-        const joined = try std.mem.join(page.call_arena, " ", tokens.keys());
-        return self._element.setAttribute(self._attribute_name, .wrap(joined), page);
+        const joined = try std.mem.join(frame.call_arena, " ", tokens.keys());
+        return self._element.setAttribute(self._attribute_name, .wrap(joined), frame);
     }
 
     // Only remove attribute if it didn't exist before (was null)
     // If it existed (even as ""), set it to "" to preserve its existence
     if (self._element.hasAttributeSafe(self._attribute_name)) {
-        try self._element.setAttribute(self._attribute_name, .wrap(""), page);
+        try self._element.setAttribute(self._attribute_name, .wrap(""), frame);
     }
 }
 
@@ -282,9 +283,9 @@ const Iterator = struct {
 
     const Entry = struct { u32, []const u8 };
 
-    pub fn next(self: *Iterator, page: *Page) !?Entry {
+    pub fn next(self: *Iterator, frame: *Frame) !?Entry {
         const index = self.index;
-        const node = try self.list.item(index, page) orelse return null;
+        const node = try self.list.item(index, frame) orelse return null;
         self.index = index + 1;
         return .{ index, node };
     }
@@ -302,11 +303,11 @@ pub const JsApi = struct {
 
     pub const length = bridge.accessor(DOMTokenList.length, null, .{});
     pub const item = bridge.function(_item, .{});
-    fn _item(self: *const DOMTokenList, index: i32, page: *Page) !?[]const u8 {
+    fn _item(self: *const DOMTokenList, index: i32, frame: *Frame) !?[]const u8 {
         if (index < 0) {
             return null;
         }
-        return self.item(@intCast(index), page);
+        return self.item(@intCast(index), frame);
     }
 
     pub const contains = bridge.function(DOMTokenList.contains, .{ .dom_exception = true });

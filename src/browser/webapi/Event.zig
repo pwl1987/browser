@@ -17,16 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../js/js.zig");
-
 const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
-const EventTarget = @import("EventTarget.zig");
-const Node = @import("Node.zig");
-const String = @import("../../string.zig").String;
+const Frame = @import("../Frame.zig");
 
+const Node = @import("Node.zig");
+const EventTarget = @import("EventTarget.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 pub const Event = @This();
 
@@ -55,7 +56,7 @@ _is_trusted: bool = false,
 // - 0: no reference, always a transient state going to either 1 or about to be deinit'd
 // - 1: either zig or v8 have a reference
 // - 2: both zig and v8 have a reference
-_rc: u8 = 0,
+_rc: lp.RC(u8) = .{},
 
 pub const EventPhase = enum(u8) {
     none = 0,
@@ -70,12 +71,14 @@ pub const Type = union(enum) {
     custom_event: *@import("event/CustomEvent.zig"),
     message_event: *@import("event/MessageEvent.zig"),
     progress_event: *@import("event/ProgressEvent.zig"),
-    composition_event: *@import("event/CompositionEvent.zig"),
     navigation_current_entry_change_event: *@import("event/NavigationCurrentEntryChangeEvent.zig"),
     page_transition_event: *@import("event/PageTransitionEvent.zig"),
     pop_state_event: *@import("event/PopStateEvent.zig"),
     ui_event: *@import("event/UIEvent.zig"),
     promise_rejection_event: *@import("event/PromiseRejectionEvent.zig"),
+    submit_event: *@import("event/SubmitEvent.zig"),
+    form_data_event: *@import("event/FormDataEvent.zig"),
+    close_event: *@import("event/CloseEvent.zig"),
 };
 
 pub const Options = struct {
@@ -85,14 +88,14 @@ pub const Options = struct {
 };
 
 pub fn init(typ: []const u8, opts_: ?Options, page: *Page) !*Event {
-    const arena = try page.getArena(.{ .debug = "Event" });
+    const arena = try page.getArena(.tiny, "Event");
     errdefer page.releaseArena(arena);
     const str = try String.init(arena, typ, .{});
     return initWithTrusted(arena, str, opts_, false);
 }
 
 pub fn initTrusted(typ: String, opts_: ?Options, page: *Page) !*Event {
-    const arena = try page.getArena(.{ .debug = "Event.trusted" });
+    const arena = try page.getArena(.tiny, "Event.trusted");
     errdefer page.releaseArena(arena);
     return initWithTrusted(arena, typ, opts_, true);
 }
@@ -137,25 +140,15 @@ pub fn initEvent(
 }
 
 pub fn acquireRef(self: *Event) void {
-    self._rc += 1;
+    self._rc.acquire();
 }
 
-pub fn deinit(self: *Event, shutdown: bool, session: *Session) void {
-    if (shutdown) {
-        session.releaseArena(self._arena);
-        return;
-    }
+pub fn deinit(self: *Event, page: *Page) void {
+    page.releaseArena(self._arena);
+}
 
-    const rc = self._rc;
-    if (comptime IS_DEBUG) {
-        std.debug.assert(rc != 0);
-    }
-
-    if (rc == 1) {
-        session.releaseArena(self._arena);
-    } else {
-        self._rc = rc - 1;
-    }
+pub fn releaseRef(self: *Event, page: *Page) void {
+    self._rc.release(self, page);
 }
 
 pub fn as(self: *Event, comptime T: type) *T {
@@ -169,11 +162,13 @@ pub fn is(self: *Event, comptime T: type) ?*T {
         .custom_event => |e| return if (T == @import("event/CustomEvent.zig")) e else null,
         .message_event => |e| return if (T == @import("event/MessageEvent.zig")) e else null,
         .progress_event => |e| return if (T == @import("event/ProgressEvent.zig")) e else null,
-        .composition_event => |e| return if (T == @import("event/CompositionEvent.zig")) e else null,
         .navigation_current_entry_change_event => |e| return if (T == @import("event/NavigationCurrentEntryChangeEvent.zig")) e else null,
         .page_transition_event => |e| return if (T == @import("event/PageTransitionEvent.zig")) e else null,
         .pop_state_event => |e| return if (T == @import("event/PopStateEvent.zig")) e else null,
         .promise_rejection_event => |e| return if (T == @import("event/PromiseRejectionEvent.zig")) e else null,
+        .submit_event => |e| return if (T == @import("event/SubmitEvent.zig")) e else null,
+        .form_data_event => |e| return if (T == @import("event/FormDataEvent.zig")) e else null,
+        .close_event => |e| return if (T == @import("event/CloseEvent.zig")) e else null,
         .ui_event => |e| {
             if (T == @import("event/UIEvent.zig")) {
                 return e;
@@ -268,7 +263,7 @@ pub fn getIsTrusted(self: *const Event) bool {
     return self._is_trusted;
 }
 
-pub fn composedPath(self: *Event, page: *Page) ![]const *EventTarget {
+pub fn composedPath(self: *Event, frame: *Frame) ![]const *EventTarget {
     // Return empty array if event is not being dispatched
     if (self._event_phase == .none) {
         return &.{};
@@ -333,7 +328,7 @@ pub fn composedPath(self: *Event, page: *Page) ![]const *EventTarget {
     // Add window at the end (unless we stopped at shadow boundary)
     if (!stopped_at_shadow_boundary) {
         if (path_len < path_buffer.len) {
-            path_buffer[path_len] = page.window.asEventTarget();
+            path_buffer[path_len] = frame.window.asEventTarget();
             path_len += 1;
         }
     }
@@ -370,7 +365,7 @@ pub fn composedPath(self: *Event, page: *Page) ![]const *EventTarget {
     const visible_path_len = if (path_len > visible_start_index) path_len - visible_start_index else 0;
 
     // Allocate and return the visible path using call_arena (short-lived)
-    const path = try page.call_arena.alloc(*EventTarget, visible_path_len);
+    const path = try frame.call_arena.alloc(*EventTarget, visible_path_len);
     @memcpy(path, path_buffer[visible_start_index..path_len]);
     return path;
 }
@@ -436,8 +431,6 @@ pub const JsApi = struct {
 
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(Event.deinit);
         pub const enumerable = false;
     };
 

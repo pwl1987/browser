@@ -55,11 +55,12 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
 
     switch (args.mode) {
         .help => {
-            args.printUsageAndExit(args.mode.help);
+            args.printUsageAndExit(true);
             return std.process.cleanExit();
         },
         .version => {
-            std.debug.print("{s}\n", .{lp.build_config.git_commit});
+            var stdout = std.fs.File.stdout().writer(&.{});
+            try stdout.interface.print("{s}\n", .{lp.build_config.version});
             return std.process.cleanExit();
         },
         else => {},
@@ -71,22 +72,25 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
     if (args.logFormat()) |lf| {
         log.opts.format = lf;
     }
-    if (args.logFilterScopes()) |lfs| {
-        log.opts.filter_scopes = lfs;
-    }
+
+    // Set log filter scopes.
+    log.opts.filter_scopes = args.logFilterScopes().items;
+
+    // must be installed before any other threads
+    const sighandler = try main_arena.create(SigHandler);
+    sighandler.* = .{ .arena = main_arena };
+    try sighandler.install();
 
     // _app is global to handle graceful shutdown.
     var app = try App.init(allocator, &args);
-
     defer app.deinit();
+
+    try sighandler.on(lp.Network.stop, .{&app.network});
+
     app.telemetry.record(.{ .run = {} });
 
     switch (args.mode) {
         .serve => |opts| {
-            const sighandler = try main_arena.create(SigHandler);
-            sighandler.* = .{ .arena = main_arena };
-            try sighandler.install();
-
             log.debug(.app, "startup", .{ .mode = "serve", .snapshot = app.snapshot.fromEmbedded() });
             const address = std.net.Address.parseIp(opts.host, opts.port) catch |err| {
                 log.fatal(.app, "invalid server address", .{ .err = err, .host = opts.host, .port = opts.port });
@@ -94,23 +98,36 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
             };
 
             var server = lp.Server.init(app, address) catch |err| {
-                log.fatal(.app, "server run error", .{ .err = err });
+                if (err == error.AddressInUse) {
+                    log.fatal(.app, "address already in use", .{
+                        .host = opts.host,
+                        .port = opts.port,
+                        .hint = "Another process is already listening on this address. " ++
+                            "Stop the other process or use --port to choose a different port.",
+                    });
+                } else {
+                    log.fatal(.app, "server run error", .{ .err = err });
+                }
                 return err;
             };
             defer server.deinit();
 
-            try sighandler.on(lp.Network.stop, .{&app.network});
+            try sighandler.on(lp.Server.shutdown, .{server});
+
             app.network.run();
         },
         .fetch => |opts| {
             const url = opts.url;
-            log.debug(.app, "startup", .{ .mode = "fetch", .dump_mode = opts.dump_mode, .url = url, .snapshot = app.snapshot.fromEmbedded() });
+            log.debug(.app, "startup", .{ .mode = "fetch", .dump_mode = opts.dump, .url = url, .snapshot = app.snapshot.fromEmbedded() });
 
             var fetch_opts = lp.FetchOpts{
-                .wait_ms = 5000,
-                .dump_mode = opts.dump_mode,
+                .wait_ms = opts.wait_ms,
+                .wait_until = opts.wait_until,
+                .wait_script = opts.wait_script,
+                .wait_selector = opts.wait_selector,
+                .dump_mode = opts.dump,
                 .dump = .{
-                    .strip = opts.strip,
+                    .strip = opts.strip_mode,
                     .with_base = opts.with_base,
                     .with_frames = opts.with_frames,
                 },
@@ -118,30 +135,117 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
 
             var stdout = std.fs.File.stdout();
             var writer = stdout.writer(&.{});
-            if (opts.dump_mode != null) {
+            if (opts.dump != null) {
                 fetch_opts.writer = &writer.interface;
             }
 
-            lp.fetch(app, url, fetch_opts) catch |err| {
-                log.fatal(.app, "fetch error", .{ .err = err, .url = url });
-                return err;
-            };
+            // Browser owns a V8 isolate, which has thread affinity — it must
+            // be init/used/deinit on the same thread (fetchThread, below). So
+            // we can't treat Browser like the above serve path treats Server.
+            // We need Browser to be createdin fetchThread and to get a reference
+            // to it here.
+            var ft: FetchTerminator = .{};
+            try sighandler.on(FetchTerminator.terminate, .{&ft});
+            if (opts.terminate_ms) |ms| {
+                try sighandler.deadline(ms);
+            }
+
+            var worker_thread = try std.Thread.spawn(.{}, fetchThread, .{ app, &ft, url.?, fetch_opts });
+            defer worker_thread.join();
+
+            app.network.run();
         },
-        .mcp => {
+        .mcp => |opts| {
             log.info(.mcp, "starting server", .{});
 
             log.opts.format = .logfmt;
 
-            var stdout = std.fs.File.stdout().writer(&.{});
+            var cdp_server: ?*lp.Server = null;
+            if (opts.cdp_port) |port| {
+                const address = std.net.Address.parseIp("127.0.0.1", port) catch |err| {
+                    log.fatal(.mcp, "invalid cdp address", .{ .err = err, .port = port });
+                    return;
+                };
+                cdp_server = try lp.Server.init(app, address);
+                try sighandler.on(lp.Server.shutdown, .{cdp_server.?});
+            }
+            defer if (cdp_server) |s| s.deinit();
 
-            var mcp_server: *lp.mcp.Server = try .init(allocator, app, &stdout.interface);
-            defer mcp_server.deinit();
+            var worker_thread = try std.Thread.spawn(.{}, mcpThread, .{ allocator, app });
+            defer worker_thread.join();
 
-            var stdin_buf: [64 * 1024]u8 = undefined;
-            var stdin = std.fs.File.stdin().reader(&stdin_buf);
-
-            try lp.mcp.router.processRequests(mcp_server, &stdin.interface);
+            app.network.run();
         },
         else => unreachable,
     }
+}
+
+const FetchTerminator = struct {
+    mutex: std.Thread.Mutex = .{},
+    browser: ?*lp.Browser = null,
+
+    fn storeBrowser(self: *FetchTerminator, browser: *lp.Browser) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.browser = browser;
+    }
+
+    fn releaseBrowser(self: *FetchTerminator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const b = self.browser orelse return;
+        b.env.cancelTerminate();
+        self.browser = null;
+    }
+
+    fn terminate(self: *FetchTerminator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const b = self.browser orelse return;
+        b.env.terminate();
+        self.browser = null;
+    }
+};
+
+fn fetchThread(app: *App, ft: *FetchTerminator, url: [:0]const u8, fetch_opts: lp.FetchOpts) void {
+    defer app.network.stop();
+
+    const http_client = lp.HttpClient.init(app.allocator, &app.network) catch |err| {
+        log.fatal(.app, "http client init error", .{ .err = err });
+        return;
+    };
+    defer http_client.deinit();
+
+    var browser = lp.Browser.init(app, .{ .http_client = http_client }) catch |err| {
+        log.fatal(.app, "browser init error", .{ .err = err });
+        return;
+    };
+    defer browser.deinit();
+
+    ft.storeBrowser(&browser);
+    // if this exits normally, we want to disarm the FetchTerminator so that
+    // any subsequent sighandlers don't try to shutdown an already (or in-the-
+    // process-of) shutting down browser/env
+    defer ft.releaseBrowser();
+
+    lp.fetch(app, &browser, url, fetch_opts) catch |err| {
+        log.fatal(.app, "fetch error", .{ .err = err, .url = url });
+    };
+}
+
+fn mcpThread(allocator: std.mem.Allocator, app: *App) void {
+    defer app.network.stop();
+
+    var stdout = std.fs.File.stdout().writer(&.{});
+    var mcp_server: *lp.mcp.Server = lp.mcp.Server.init(allocator, app, &stdout.interface) catch |err| {
+        log.fatal(.mcp, "mcp init error", .{ .err = err });
+        return;
+    };
+    defer mcp_server.deinit();
+
+    var stdin_buf: [64 * 1024]u8 = undefined;
+    var stdin = std.fs.File.stdin().reader(&stdin_buf);
+    lp.mcp.router.processRequests(mcp_server, &stdin.interface) catch |err| {
+        log.fatal(.mcp, "mcp error", .{ .err = err });
+    };
 }

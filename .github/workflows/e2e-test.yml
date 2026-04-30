@@ -9,15 +9,13 @@ env:
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "build.zig"
-      - "src/**/*.zig"
-      - "src/*.zig"
-      - "vendor/zig-js-runtime"
       - ".github/**"
-      - "vendor/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+
   pull_request:
 
     # By default GH trigger on types opened, synchronize and reopened.
@@ -29,12 +27,10 @@ on:
 
     paths:
       - ".github/**"
+      - "src/**"
       - "build.zig"
-      - "src/**/*.zig"
-      - "src/*.zig"
-      - "vendor/**"
-      - ".github/**"
-      - "vendor/**"
+      - "build.zig.zon"
+
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -43,7 +39,7 @@ jobs:
     name: zig build release
 
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     # Don't run the CI with draft PR.
     if: github.event.pull_request.draft == false
@@ -52,31 +48,38 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
-          submodules: recursive
 
       - uses: ./.github/actions/install
+      - uses: ./.github/actions/v8-snapshot
 
       - name: zig build release
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64 -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
+        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lightpanda-build-release
           path: |
             zig-out/bin/lightpanda
           retention-days: 1
 
-  demo-scripts:
-    name: demo-scripts
+  demo-runner:
+    strategy:
+      fail-fast: false
+      matrix:
+        proxy: [true, false]
+        wba: [true, false]
+        cache: [true, false]
+        robotstxt: [true, false]
+
+    name: demo-runner
     needs: zig-build-release
 
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
@@ -84,49 +87,67 @@ jobs:
       - run: npm install
 
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 
       - run: chmod a+x ./lightpanda
 
-      - name: run end to end tests
-        run: |
-          ./lightpanda serve & echo $! > LPD.pid
-          go run runner/main.go
-          kill `cat LPD.pid`
-
-      - name: build proxy
+      - if: matrix.proxy == true
+        name: build and start proxy
         run: |
           cd proxy
           go build
+          ./proxy & echo $! > PROXY.id
 
-      - name: run end to end tests through proxy
+      - if: matrix.cache == true
+        run: mkdir /tmp/lp-cache
+
+      - if: matrix.wba == true
+        run: echo "${{ secrets.WBA_PRIVATE_KEY_PEM }}" > private_key.pem
+
+      - id: args
+        name: build LP args
         run: |
-          ./proxy/proxy & echo $! > PROXY.id
-          ./lightpanda serve --http_proxy 'http://127.0.0.1:3000' & echo $! > LPD.pid
+          args=""
+          [ "${{ matrix.proxy }}" = "true" ] && args="$args --http-proxy http://127.0.0.1:3000"
+          [ "${{ matrix.cache }}" = "true" ] && args="$args --http-cache-dir /tmp/lp-cache"
+          [ "${{ matrix.robotstxt }}" = "true" ] && args="$args --obey-robots"
+          [ "${{ matrix.wba }}" = "true" ] && args="$args --web-bot-auth-key-file private_key.pem"
+          [ "${{ matrix.wba }}" = "true" ] && args="$args --web-bot-auth-domain ${{ vars.WBA_DOMAIN }}"
+          [ "${{ matrix.wba }}" = "true" ] && args="$args --web-bot-auth-keyid ${{ vars.WBA_KEY_ID }}"
+          echo $args
+          echo "value=$args" >> "$GITHUB_OUTPUT"
+
+      - run: |
+          ./lightpanda serve ${{ steps.args.outputs.value }} & echo $! > LPD.pid
+
+      - run: |
           go run runner/main.go
-          kill `cat LPD.pid` `cat PROXY.id`
 
-      - name: run request interception through proxy
+      - run: |
+          kill `cat LPD.pid`
+
+      - if: matrix.proxy == true
         run: |
-          export PROXY_USERNAME=username PROXY_PASSWORD=password
-          ./proxy/proxy & echo $! > PROXY.id
-          ./lightpanda serve & echo $! > LPD.pid
-          URL=https://demo-browser.lightpanda.io/campfire-commerce/ node puppeteer/proxy_auth.js
-          BASE_URL=https://demo-browser.lightpanda.io/ node playwright/proxy_auth.js
-          kill `cat LPD.pid` `cat PROXY.id`
+          pkill proxy
 
-  # e2e tests w/ web-bot-auth configuration on.
-  wba-demo-scripts:
-    name: wba-demo-scripts
+  proxy-auth:
+    strategy:
+      fail-fast: false
+      matrix:
+        wba: [true, false]
+        cache: [true, false]
+        robotstxt: [true, false]
+
+    name: demo-runner
     needs: zig-build-release
 
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
@@ -134,87 +155,95 @@ jobs:
       - run: npm install
 
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 
       - run: chmod a+x ./lightpanda
 
-      - run: echo "${{ secrets.WBA_PRIVATE_KEY_PEM }}" > private_key.pem
-
-      - name: run end to end tests
-        run: |
-          ./lightpanda serve \
-            --web_bot_auth_key_file private_key.pem \
-            --web_bot_auth_keyid ${{ vars.WBA_KEY_ID }} \
-            --web_bot_auth_domain ${{ vars.WBA_DOMAIN }} \
-            & echo $! > LPD.pid
-          go run runner/main.go
-          kill `cat LPD.pid`
-
-      - name: build proxy
+      - name: build and start proxy
         run: |
           cd proxy
           go build
+          ./proxy & echo $! > PROXY.id
+
+      - if: matrix.cache == true
+        run: mkdir /tmp/lp-cache
+
+      - if: matrix.wba == true
+        run: echo "${{ secrets.WBA_PRIVATE_KEY_PEM }}" > private_key.pem
+
+      - id: args
+        name: build LP args
+        run: |
+          args=""
+          [ "${{ matrix.cache }}" = "true" ] && args="$args --http-cache-dir /tmp/lp-cache"
+          [ "${{ matrix.robotstxt }}" = "true" ] && args="$args --obey-robots"
+          [ "${{ matrix.wba }}" = "true" ] && args="$args --web-bot-auth-key-file private_key.pem"
+          [ "${{ matrix.wba }}" = "true" ] && args="$args --web-bot-auth-domain ${{ vars.WBA_DOMAIN }}"
+          [ "${{ matrix.wba }}" = "true" ] && args="$args --web-bot-auth-keyid ${{ vars.WBA_KEY_ID }}"
+          echo $args
+          echo "value=$args" >> "$GITHUB_OUTPUT"
 
       - name: run end to end tests through proxy
         run: |
-          ./proxy/proxy & echo $! > PROXY.id
-          ./lightpanda serve \
-            --web_bot_auth_key_file private_key.pem \
-            --web_bot_auth_keyid ${{ vars.WBA_KEY_ID }} \
-            --web_bot_auth_domain ${{ vars.WBA_DOMAIN }} \
-            --http_proxy 'http://127.0.0.1:3000' \
-            & echo $! > LPD.pid
+          export PROXY_USERNAME=username PROXY_PASSWORD=password
+          ./lightpanda serve --http-proxy http://127.0.0.1:3000 ${{ steps.args.outputs.value }} & echo $! > LPD.pid
           go run runner/main.go
-          kill `cat LPD.pid` `cat PROXY.id`
+          URL=https://demo-browser.lightpanda.io/campfire-commerce/ node puppeteer/proxy_auth.js
+          kill `cat LPD.pid`
 
-      - name: run request interception through proxy
+      - name: run request interception through proxy and playwright
         run: |
           export PROXY_USERNAME=username PROXY_PASSWORD=password
-          ./proxy/proxy & echo $! > PROXY.id
-          ./lightpanda serve & echo $! > LPD.pid
-          URL=https://demo-browser.lightpanda.io/campfire-commerce/ node puppeteer/proxy_auth.js
+          ./lightpanda serve ${{ steps.args.outputs.value }} & echo $! > LPD.pid
           BASE_URL=https://demo-browser.lightpanda.io/ node playwright/proxy_auth.js
-          kill `cat LPD.pid` `cat PROXY.id`
+          kill `cat LPD.pid`
+
+      - run: pkill proxy
 
   wba-test:
     name: wba-test
     needs: zig-build-release
 
-    env:
-      LIGHTPANDA_DISABLE_TELEMETRY: true
-
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
+    # Don't execute on PR
+    if: github.event_name != 'pull_request'
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
 
-      - run: echo "${{ secrets.WBA_PRIVATE_KEY_PEM }}" > private_key.pem
-
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 
       - run: chmod a+x ./lightpanda
 
+      # force a wakup of the auth server before requesting it w/ the test itself
+      - run: curl https://${{ vars.WBA_DOMAIN }}
+
       - name: run wba test
+        shell: bash
         run: |
           node webbotauth/validator.js &
           VALIDATOR_PID=$!
-          sleep 2
+          sleep 5
 
-          ./lightpanda fetch http://127.0.0.1:8989/ \
-            --web_bot_auth_key_file private_key.pem \
-            --web_bot_auth_keyid ${{ vars.WBA_KEY_ID }} \
-            --web_bot_auth_domain ${{ vars.WBA_DOMAIN }}
+          exec 3<<< "${{ secrets.WBA_PRIVATE_KEY_PEM }}"
+
+          ./lightpanda fetch --dump http://127.0.0.1:8989/ \
+            --web-bot-auth-key-file /proc/self/fd/3 \
+            --web-bot-auth-keyid ${{ vars.WBA_KEY_ID }} \
+            --web-bot-auth-domain ${{ vars.WBA_DOMAIN }}
 
           wait $VALIDATOR_PID
+          exec 3>&-
 
   cdp-and-hyperfine-bench:
     name: cdp-and-hyperfine-bench
@@ -224,7 +253,6 @@ jobs:
       MAX_VmHWM: 28000 # 28MB (KB)
       MAX_CG_PEAK: 8000 # 8MB (KB)
       MAX_AVG_DURATION: 17
-      LIGHTPANDA_DISABLE_TELEMETRY: true
 
       # How to give cgroups access to the user actions-runner on the host:
       # $ sudo apt install cgroup-tools
@@ -239,7 +267,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
@@ -247,7 +275,7 @@ jobs:
       - run: npm install
 
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 
@@ -255,7 +283,7 @@ jobs:
 
       - name: start http
         run: |
-          go run ws/main.go & echo $! > WS.pid
+          go run runner/main.go -serve & echo $! > WS.pid
           sleep 2
 
       - name: run lightpanda in cgroup
@@ -333,7 +361,7 @@ jobs:
           echo "${{github.sha}}" > commit.txt
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-results
           path: |
@@ -356,12 +384,12 @@ jobs:
     container:
       image: ghcr.io/lightpanda-io/perf-fmt:latest
       credentials:
-       username: ${{ github.actor }}
-       password: ${{ secrets.GITHUB_TOKEN }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bench-results
 
@@ -379,7 +407,7 @@ jobs:
 
     steps:
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 

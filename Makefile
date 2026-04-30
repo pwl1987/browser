@@ -47,7 +47,7 @@ help:
 
 # $(ZIG) commands
 # ------------
-.PHONY: build build-v8-snapshot build-dev run run-release shell test bench data end2end
+.PHONY: build build-v8-snapshot build-dev run run-release test bench data end2end
 
 ## Build v8 snapshot
 build-v8-snapshot:
@@ -58,13 +58,13 @@ build-v8-snapshot:
 ## Build in release-fast mode
 build: build-v8-snapshot
 	@printf "\033[36mBuilding (release fast)...\033[0m\n"
-	@$(ZIG) build -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin -Dgit_commit=$$(git rev-parse --short HEAD) || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in debug mode
 build-dev:
 	@printf "\033[36mBuilding (debug)...\033[0m\n"
-	@$(ZIG) build -Dgit_commit=$$(git rev-parse --short HEAD) || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Run the server in release mode
@@ -76,11 +76,6 @@ run: build
 run-debug: build-dev
 	@printf "\033[36mRunning...\033[0m\n"
 	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
-
-## Run a JS shell in debug mode
-shell:
-	@printf "\033[36mBuilding shell...\033[0m\n"
-	@$(ZIG) build shell || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 
 ## Test - `grep` is used to filter out the huge compile command on build
 ifeq ($(OS), macos)
@@ -106,4 +101,3 @@ install: build
 
 data:
 	cd src/data && go run public_suffix_list_gen.go > public_suffix_list.zig
-

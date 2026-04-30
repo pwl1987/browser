@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const js = @import("../js/js.zig");
-const Page = @import("../Page.zig");
 
 const DOMException = @This();
 
@@ -59,12 +58,18 @@ pub fn fromError(err: anyerror) ?DOMException {
         error.TimeoutError => .{ ._code = .timeout_error },
         error.InvalidNodeType => .{ ._code = .invalid_node_type_error },
         error.DataClone => .{ ._code = .data_clone_error },
+        error.InvalidAccessError => .{ ._code = .invalid_access_error },
+        error.OperationError => .{ ._code = .operation_error },
         else => null,
     };
 }
 
 pub fn getCode(self: *const DOMException) u8 {
-    return @intFromEnum(self._code);
+    return switch (self._code) {
+        // WebCrypto-only error: no legacy numeric code.
+        .operation_error => 0,
+        else => @intFromEnum(self._code),
+    };
 }
 
 pub fn getName(self: *const DOMException) []const u8 {
@@ -95,6 +100,7 @@ pub fn getName(self: *const DOMException) []const u8 {
         .timeout_error => "TimeoutError",
         .invalid_node_type_error => "InvalidNodeTypeError",
         .data_clone_error => "DataCloneError",
+        .operation_error => "OperationError",
     };
 }
 
@@ -104,17 +110,32 @@ pub fn getMessage(self: *const DOMException) []const u8 {
     }
     return switch (self._code) {
         .none => "",
-        .invalid_character_error => "Invalid Character",
         .index_size_error => "Index or size is negative or greater than the allowed amount",
-        .syntax_error => "Syntax Error",
-        .not_supported => "Not Supported",
-        .not_found => "Not Found",
-        .hierarchy_error => "Hierarchy Error",
-        else => @tagName(self._code),
+        .hierarchy_error => "The operation would yield an incorrect node tree",
+        .wrong_document_error => "The object is in the wrong document",
+        .invalid_character_error => "The string contains invalid characters",
+        .no_modification_allowed_error => "The object can not be modified",
+        .not_found => "The object can not be found here",
+        .not_supported => "The operation is not supported",
+        .inuse_attribute_error => "The attribute already in use",
+        .invalid_state_error => "The object is in an invalid state",
+        .syntax_error => "The string did not match the expected pattern",
+        .invalid_modification_error => "The object can not be modified in this way",
+        .namespace_error => "The operation is not allowed by Namespaces in XML",
+        .invalid_access_error => "The object does not support the operation or argument",
+        .security_error => "The operation is insecure",
+        .network_error => "A network error occurred",
+        .abort_error => "The operation was aborted",
+        .url_mismatch_error => "The given URL does not match another URL",
+        .quota_exceeded_error => "The quota has been exceeded",
+        .timeout_error => "The operation timed out",
+        .invalid_node_type_error => "The supplied node is incorrect or has an incorrect ancestor for this operation",
+        .data_clone_error => "The object can not be cloned",
+        .operation_error => "The operation failed for an operation-specific reason",
     };
 }
 
-pub fn toString(self: *const DOMException, page: *Page) ![]const u8 {
+pub fn toString(self: *const DOMException, exec: *js.Execution) ![]const u8 {
     const msg = blk: {
         if (self._custom_message) |msg| {
             break :blk msg;
@@ -124,7 +145,7 @@ pub fn toString(self: *const DOMException, page: *Page) ![]const u8 {
             else => break :blk self.getMessage(),
         }
     };
-    return std.fmt.bufPrint(&page.buf, "{s}: {s}", .{ self.getName(), msg }) catch return msg;
+    return std.fmt.bufPrint(exec.buf, "{s}: {s}", .{ self.getName(), msg }) catch return msg;
 }
 
 const Code = enum(u8) {
@@ -150,6 +171,8 @@ const Code = enum(u8) {
     timeout_error = 23,
     invalid_node_type_error = 24,
     data_clone_error = 25,
+    /// Defined by WebCrypto; no legacy code, exposed via name only.
+    operation_error = 0xFF,
 
     /// Maps a standard error name to its legacy code
     /// Returns .none (code 0) for non-legacy error names
@@ -176,6 +199,7 @@ const Code = enum(u8) {
             .{ "TimeoutError", .timeout_error },
             .{ "InvalidNodeTypeError", .invalid_node_type_error },
             .{ "DataCloneError", .data_clone_error },
+            .{ "OperationError", .operation_error },
         });
         return lookup.get(name) orelse .none;
     }

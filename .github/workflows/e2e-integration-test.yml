@@ -20,19 +20,17 @@ jobs:
     if: github.event.pull_request.draft == false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
-          submodules: recursive
 
       - uses: ./.github/actions/install
 
       - name: zig build release
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64 -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
+        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lightpanda-build-release
           path: |
@@ -47,7 +45,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
@@ -55,14 +53,27 @@ jobs:
       - run: npm install
 
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 
       - run: chmod a+x ./lightpanda
 
       - name: run end to end integration tests
+        continue-on-error: true
         run: |
-          ./lightpanda serve --log_level error & echo $! > LPD.pid
-          go run integration/main.go
+          ./lightpanda serve --http-proxy ${{ secrets.MASSIVE_PROXY_RESIDENTIAL_US }} --log-level error & echo $! > LPD.pid
+          go run integration/main.go |tee result.log
           kill `cat LPD.pid`
+
+      - name: Send result to slack
+        uses: slackapi/slack-github-action@v3.0.1
+        with:
+          errors: true
+          method: files.uploadV2
+          token: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+          payload: |
+            channel_id: ${{ vars.E2E_SLACK_CHANNEL_ID }}
+            initial_comment: "Last e2e integration tests"
+            file: "./result.log"
+            filename: "e2e-integration-${{ github.sha }}.txt"

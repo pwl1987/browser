@@ -17,42 +17,43 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
-pub fn toPageId(comptime id_type: enum { frame_id, loader_id }, input: []const u8) !u32 {
-    const err = switch (comptime id_type) {
-        .frame_id => error.InvalidFrameId,
-        .loader_id => error.InvalidLoaderId,
-    };
-
+pub fn parseFrameId(input: []const u8) !u32 {
     if (input.len < 4) {
-        return err;
+        return error.InvalidFrameId;
     }
 
-    return std.fmt.parseInt(u32, input[4..], 10) catch err;
+    return std.fmt.parseInt(u32, input[4..], 10) catch error.InvalidFrameId;
 }
 
-pub fn toFrameId(page_id: u32) [14]u8 {
+pub fn toFrameId(id: u32) [14]u8 {
     var buf: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "FID-{d:0>10}", .{page_id}) catch unreachable;
+    _ = std.fmt.bufPrint(&buf, "FID-{d:0>10}", .{id}) catch unreachable;
     return buf;
 }
 
-pub fn toLoaderId(page_id: u32) [14]u8 {
+pub fn toLoaderId(id: u32) [14]u8 {
     var buf: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "LID-{d:0>10}", .{page_id}) catch unreachable;
+    _ = std.fmt.bufPrint(&buf, "LID-{d:0>10}", .{id}) catch unreachable;
     return buf;
 }
 
-pub fn toRequestId(page_id: u32) [14]u8 {
+// requestId has special requirements. If it's the main document navigation,
+// then it should match the loader id.
+const Request = @import("../browser/HttpClient.zig").Request;
+pub fn toRequestId(req: *const Request) [14]u8 {
+    if (req.params.resource_type == .document) {
+        return toLoaderId(req.params.loader_id);
+    }
+
     var buf: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "REQ-{d:0>10}", .{page_id}) catch unreachable;
+    _ = std.fmt.bufPrint(&buf, "REQ-{d:0>10}", .{req.params.request_id}) catch unreachable;
     return buf;
 }
 
-pub fn toInterceptId(page_id: u32) [14]u8 {
+pub fn toInterceptId(id: u32) [14]u8 {
     var buf: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "INT-{d:0>10}", .{page_id}) catch unreachable;
+    _ = std.fmt.bufPrint(&buf, "INT-{d:0>10}", .{id}) catch unreachable;
     return buf;
 }
 
@@ -153,14 +154,11 @@ test "id: Incrementing.parse" {
     try testing.expectEqual(4294967295, try ReqId.parse("REQ-4294967295"));
 }
 
-test "id: toPageId" {
-    try testing.expectEqual(0, toPageId(.frame_id, "FID-0"));
-    try testing.expectEqual(0, toPageId(.loader_id, "LID-0"));
-
-    try testing.expectEqual(4294967295, toPageId(.frame_id, "FID-4294967295"));
-    try testing.expectEqual(4294967295, toPageId(.loader_id, "LID-4294967295"));
-    try testing.expectError(error.InvalidFrameId, toPageId(.frame_id, ""));
-    try testing.expectError(error.InvalidLoaderId, toPageId(.loader_id, "LID-NOPE"));
+test "id: parseFrameId" {
+    try testing.expectEqual(0, parseFrameId("FID-0"));
+    try testing.expectEqual(4294967295, parseFrameId("FID-4294967295"));
+    try testing.expectError(error.InvalidFrameId, parseFrameId(""));
+    try testing.expectError(error.InvalidFrameId, parseFrameId("FID-"));
 }
 
 test "id: toFrameId" {
@@ -171,11 +169,6 @@ test "id: toFrameId" {
 test "id: toLoaderId" {
     try testing.expectEqual("LID-0000000000", toLoaderId(0));
     try testing.expectEqual("LID-4294967295", toLoaderId(4294967295));
-}
-
-test "id: toRequestId" {
-    try testing.expectEqual("REQ-0000000000", toRequestId(0));
-    try testing.expectEqual("REQ-4294967295", toRequestId(4294967295));
 }
 
 test "id: toInterceptId" {

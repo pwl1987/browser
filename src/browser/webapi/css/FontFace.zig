@@ -17,22 +17,25 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
 
 const Allocator = std.mem.Allocator;
 
 const FontFace = @This();
 
+_rc: lp.RC(u8) = .{},
 _arena: Allocator,
 _family: []const u8,
 
-pub fn init(family: []const u8, source: []const u8, page: *Page) !*FontFace {
+pub fn init(family: []const u8, source: []const u8, frame: *Frame) !*FontFace {
     _ = source;
 
-    const arena = try page.getArena(.{ .debug = "FontFace" });
-    errdefer page.releaseArena(arena);
+    const arena = try frame.getArena(.tiny, "FontFace");
+    errdefer frame.releaseArena(arena);
 
     const self = try arena.create(FontFace);
     self.* = .{
@@ -42,8 +45,16 @@ pub fn init(family: []const u8, source: []const u8, page: *Page) !*FontFace {
     return self;
 }
 
-pub fn deinit(self: *FontFace, _: bool, session: *Session) void {
-    session.releaseArena(self._arena);
+pub fn deinit(self: *FontFace, page: *Page) void {
+    page.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *FontFace, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *FontFace) void {
+    self._rc.acquire();
 }
 
 pub fn getFamily(self: *const FontFace) []const u8 {
@@ -51,13 +62,13 @@ pub fn getFamily(self: *const FontFace) []const u8 {
 }
 
 // load() - resolves immediately; headless browser has no real font loading.
-pub fn load(_: *FontFace, page: *Page) !js.Promise {
-    return page.js.local.?.resolvePromise({});
+pub fn load(_: *FontFace, frame: *Frame) !js.Promise {
+    return frame.js.local.?.resolvePromise({});
 }
 
 // loaded - returns an already-resolved Promise.
-pub fn getLoaded(_: *FontFace, page: *Page) !js.Promise {
-    return page.js.local.?.resolvePromise({});
+pub fn getLoaded(_: *FontFace, frame: *Frame) !js.Promise {
+    return frame.js.local.?.resolvePromise({});
 }
 
 pub const JsApi = struct {
@@ -67,8 +78,6 @@ pub const JsApi = struct {
         pub const name = "FontFace";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(FontFace.deinit);
     };
 
     pub const constructor = bridge.constructor(FontFace.init, .{});

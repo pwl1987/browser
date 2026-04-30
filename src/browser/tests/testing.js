@@ -4,6 +4,7 @@
   let eventuallies = [];
   let async_capture = null;
   let current_script_id = null;
+  let async_pending = new Set();
 
   function expectTrue(actual) {
      expectEqual(true, actual);
@@ -36,7 +37,13 @@
 
   function expectError(expected, fn) {
     withError((err) => {
-      expectEqual(true, err.toString().includes(expected));
+      if (!err.toString().includes(expected)) {
+        console.error(`Expecte error to contains: ${expected}, was: ${err.toString()}`);
+        expectEqual(true, false);
+      } else {
+        // to record a successful case
+        expectTrue(true);
+      }
     }, fn);
   }
 
@@ -52,10 +59,10 @@
     throw new Error('no error');
   }
 
-  function eventually(cb) {
+  function onload(cb) {
     const script_id = _currentScriptId();
     if (!script_id) {
-      throw new Error('testing.eventually called outside of a script');
+      throw new Error('testing.onload called outside of a script');
     }
     eventuallies.push({
       callback: cb,
@@ -64,7 +71,29 @@
   }
 
   async function async(cb) {
-    let capture = {script_id: document.currentScript.id, stack: new Error().stack};
+    const script_id = (IS_TEST_RUNNER) ? document.currentScript.id : 'cannot track module id in FF/Chrome';
+
+    if (cb == undefined) {
+      let resolve = null
+      const promise = new Promise((r) => { resolve = r});
+      async_pending.add(script_id);
+
+
+      return {
+        promise: promise,
+        resolve: resolve,
+        capture: {script_id: script_id, stack: new Error().stack},
+        done: async function(cb) {
+          const res = await this.promise;
+          async_pending.delete(script_id);
+          async_capture = this.capture;
+          cb(res);
+          async_capture = false;
+        }
+      };
+    }
+
+    let capture = {script_id: script_id, stack: new Error().stack};
     await cb(() => { async_capture = capture; });
     async_capture = null;
   }
@@ -72,6 +101,10 @@
   function assertOk() {
     if (failed) {
       throw new Error('Failed');
+    }
+
+    if (async_pending.size > 0) {
+      return false;
     }
 
     for (let e of eventuallies) {
@@ -97,10 +130,15 @@
          throw new Error(`script id: '${script_id}' failed: ${status || 'no assertions'}`);
       }
     }
+
+    return true;
   }
 
-  // our test runner sets this to true
-  const IS_TEST_RUNNER = window._lightpanda_skip_auto_assert === true;
+  function printTimeoutState() {
+  	console.warn('Pending count:', Array.from(async_pending));
+  }
+
+  const IS_TEST_RUNNER = window.navigator.userAgent.startsWith("Lightpanda/");
 
   window.testing = {
     fail: fail,
@@ -111,20 +149,21 @@
     expectEqual: expectEqual,
     expectError: expectError,
     withError: withError,
-    eventually: eventually,
+    printTimeoutState: printTimeoutState,
+    onload: onload,
     IS_TEST_RUNNER: IS_TEST_RUNNER,
     HOST: '127.0.0.1',
-    ORIGIN: 'http://127.0.0.1:9582/',
+    ORIGIN: 'http://127.0.0.1:9582',
     BASE_URL: 'http://127.0.0.1:9582/src/browser/tests/',
   };
 
-  if (window.navigator.userAgent.startsWith("Lightpanda/") == false) {
+  if (IS_TEST_RUNNER === false) {
     // The page is running in a different browser. Probably a developer making sure
     // a test is correct. There are a few tweaks we need to do to make this a
-    // seemless, namely around adapting paths/urls.
+    // seamless, namely around adapting paths/urls.
     console.warn(`The page is not being executed in the test runner, certain behavior has been adjusted`);
     window.testing.HOST = location.hostname;
-    window.testing.ORIGIN = location.origin + '/';
+    window.testing.ORIGIN = location.origin;
     window.testing.BASE_URL = location.origin + '/src/browser/tests/';
     window.addEventListener('load', testing.assertOk);
   }

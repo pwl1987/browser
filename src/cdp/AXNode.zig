@@ -17,24 +17,34 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const jsonStringify = std.json.Stringify;
+const lp = @import("lightpanda");
 
-const log = @import("../log.zig");
-const Page = @import("../browser/Page.zig");
+const Frame = @import("../browser/Frame.zig");
 const DOMNode = @import("../browser/webapi/Node.zig");
+const Label = @import("../browser/webapi/element/html/Label.zig");
 
 const Node = @import("Node.zig");
 
+const log = lp.log;
+const jsonStringify = std.json.Stringify;
+
 const AXNode = @This();
 
+// Max bytes retained in the name-resolution scratch arena across resets.
+// Anything beyond is freed back to the backing allocator.
+const scratch_retain_limit = 64 * 1024;
+
 // Need a custom writer, because we can't just serialize the node as-is.
-// Sometimes we want to serializ the node without chidren, sometimes with just
+// Sometimes we want to serializ the node without children, sometimes with just
 // its direct children, and sometimes the entire tree.
 // (For now, we only support direct children)
 pub const Writer = struct {
     root: *const Node,
     registry: *Node.Registry,
-    page: *Page,
+    frame: *Frame,
+    visibility_cache: *DOMNode.Element.VisibilityCache,
+    label_index: *Label.LabelByForIndex,
+    temp_arena: std.mem.Allocator,
 
     pub const Opts = struct {};
 
@@ -51,19 +61,32 @@ pub const Writer = struct {
     fn toJSON(self: *const Writer, node: *const Node, w: anytype) !void {
         try w.beginArray();
         const root = AXNode.fromNode(node.dom);
-        if (try self.writeNode(node.id, root, w)) {
-            try self.writeNodeChildren(root, w);
+        if (try self.writeNode(node.id, root, false, w)) {
+            try self.writeNodeChildren(root, false, w);
         }
         return w.endArray();
     }
 
-    fn writeNodeChildren(self: *const Writer, parent: AXNode, w: anytype) !void {
+    // CDP spec defines AXNodeId as a string, so nodeId/parentId/childIds must
+    // be serialized as JSON strings even though we track them internally as u32.
+    fn writeIdString(id: u32, w: anytype) !void {
+        var buf: [10]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "{d}", .{id});
+        try w.write(s);
+    }
+
+    fn writeNodeChildren(self: *const Writer, parent: AXNode, in_aria_hidden: bool, w: anytype) !void {
         // Add ListMarker for listitem elements
         if (parent.dom.is(DOMNode.Element)) |parent_el| {
             if (parent_el.getTag() == .li) {
                 try self.writeListMarker(parent.dom, w);
             }
         }
+
+        const child_in_aria_hidden = in_aria_hidden or blk: {
+            const parent_el = parent.dom.is(DOMNode.Element) orelse break :blk false;
+            break :blk hasAriaHiddenTrue(parent_el);
+        };
 
         var it = parent.dom.childrenIterator();
         const ignore_text = ignoreText(parent.dom);
@@ -77,14 +100,22 @@ pub const Writer = struct {
                         continue;
                     }
                 },
-                .element => {},
+                .element => {
+                    // Prune hidden subtrees entirely (display:none,
+                    // visibility:hidden, aria-hidden, hidden, inert). Matches
+                    // Chromium: these elements aren't exposed to the AX tree.
+                    const child_el = dom_node.as(DOMNode.Element);
+                    if (child_in_aria_hidden or isHidden(child_el, self.frame, self.visibility_cache)) {
+                        continue;
+                    }
+                },
                 else => continue,
             }
 
             const node = try self.registry.register(dom_node);
             const axn = AXNode.fromNode(node.dom);
-            if (try self.writeNode(node.id, axn, w)) {
-                try self.writeNodeChildren(axn, w);
+            if (try self.writeNode(node.id, axn, child_in_aria_hidden, w)) {
+                try self.writeNodeChildren(axn, child_in_aria_hidden, w);
             }
         }
     }
@@ -108,7 +139,7 @@ pub const Writer = struct {
         try w.objectField("nodeId");
         const marker_id = self.registry.node_id;
         self.registry.node_id += 1;
-        try w.write(marker_id);
+        try writeIdString(marker_id, w);
 
         try w.objectField("backendDOMNodeId");
         try w.write(marker_id);
@@ -166,7 +197,7 @@ pub const Writer = struct {
         // Get the parent node ID for the parentId field
         const li_registered = try self.registry.register(li_node);
         try w.objectField("parentId");
-        try w.write(li_registered.id);
+        try writeIdString(li_registered.id, w);
 
         try w.objectField("childIds");
         try w.beginArray();
@@ -201,7 +232,7 @@ pub const Writer = struct {
                 break :blk "relatedElement";
             },
             .aria_label, .alt, .title, .placeholder, .value => blk: {
-                // No sure if it's correct for .value case.
+                // Not sure if it's correct for .value case.
                 try w.objectField("attribute");
                 try w.write(@tagName(source));
                 break :blk "attribute";
@@ -212,7 +243,12 @@ pub const Writer = struct {
             // w.objectField("value");
             // self.writeAXValue(.{ .type = .computedString, .value = value.value }, w);
             .contents => "contents",
-            .label_element, .label_wrap => "TODO", // TODO
+            .label_element => blk: {
+                try w.objectField("attribute");
+                try w.write("for");
+                break :blk "relatedElement";
+            },
+            .label_wrap => "relatedElement",
         };
         try w.objectField("type");
         try w.write(source_type);
@@ -262,11 +298,12 @@ pub const Writer = struct {
     };
 
     fn writeAXProperties(self: *const Writer, axnode: AXNode, w: anytype) !void {
+        const frame = self.frame;
         const dom_node = axnode.dom;
-        const page = self.page;
+
         switch (dom_node._type) {
             .document => |document| {
-                const uri = document.getURL(page);
+                const uri = document.getURL(frame);
                 try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
                 try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
                 try self.writeAXProperty(.{ .name = .focused, .value = .{ .booleanOrUndefined = true } }, w);
@@ -282,20 +319,20 @@ pub const Writer = struct {
                 .h6 => try self.writeAXProperty(.{ .name = .level, .value = .{ .integer = 6 } }, w),
                 .img => {
                     const img = el.as(DOMNode.Element.Html.Image);
-                    const uri = try img.getSrc(self.page);
+                    const uri = try img.getSrc(self.frame);
                     if (uri.len == 0) return;
                     try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
                 },
                 .anchor => {
                     const a = el.as(DOMNode.Element.Html.Anchor);
-                    const uri = try a.getHref(self.page);
+                    const uri = try a.getHref(self.frame);
                     if (uri.len == 0) return;
                     try self.writeAXProperty(.{ .name = .url, .value = .{ .string = uri } }, w);
                     try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
                 },
                 .input => {
                     const input = el.as(DOMNode.Element.Html.Input);
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
 
                     switch (input._input_type) {
                         .text, .email, .tel, .url, .search, .password, .number => {
@@ -332,7 +369,7 @@ pub const Writer = struct {
                     }
                 },
                 .textarea => {
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
 
                     try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
                     if (!is_disabled) {
@@ -347,7 +384,7 @@ pub const Writer = struct {
                     try self.writeAXProperty(.{ .name = .required, .value = .{ .boolean = el.hasAttributeSafe(comptime .wrap("required")) } }, w);
                 },
                 .select => {
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
 
                     try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
                     if (!is_disabled) {
@@ -391,7 +428,7 @@ pub const Writer = struct {
                     }
                 },
                 .button => {
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
                     try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
                     if (!is_disabled) {
                         try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
@@ -438,20 +475,30 @@ pub const Writer = struct {
     }
 
     // write a node. returns true if children must be written.
-    fn writeNode(self: *const Writer, id: u32, axn: AXNode, w: anytype) !bool {
+    fn writeNode(self: *const Writer, id: u32, axn: AXNode, in_aria_hidden: bool, w: anytype) !bool {
         // ignore empty texts
         try w.beginObject();
 
         try w.objectField("nodeId");
-        try w.write(id);
+        try writeIdString(id, w);
 
         try w.objectField("backendDOMNodeId");
         try w.write(id);
 
-        try w.objectField("role");
-        try self.writeAXValue(.{ .role = try axn.getRole() }, w);
+        const promoted_input = labelPromotionTarget(axn, self.frame, self.visibility_cache);
 
-        const ignore = axn.isIgnore(self.page);
+        try w.objectField("role");
+        if (promoted_input) |input| {
+            try self.writeAXValue(.{ .role = switch (input._input_type) {
+                .checkbox => "checkbox",
+                .radio => "radio",
+                else => unreachable,
+            } }, w);
+        } else {
+            try self.writeAXValue(.{ .role = try axn.getRole() }, w);
+        }
+
+        const ignore = axn.isIgnore(self.frame, self.visibility_cache, in_aria_hidden);
         try w.objectField("ignored");
         try w.write(ignore);
 
@@ -473,7 +520,7 @@ pub const Writer = struct {
             try w.objectField("type");
             try w.write(@tagName(.computedString));
             try w.objectField("value");
-            const source = try axn.writeName(w, self.page);
+            const source = try axn.writeName(self.temp_arena, w, self.frame, self.label_index);
             if (source) |s| {
                 try self.writeAXSource(s, w);
             }
@@ -486,6 +533,18 @@ pub const Writer = struct {
             try w.objectField("properties");
             try w.beginArray();
             try self.writeAXProperties(axn, w);
+            if (promoted_input) |input| {
+                const input_el = input.asElement();
+                const is_disabled = input_el.isDisabled();
+                if (is_disabled) {
+                    try self.writeAXProperty(.{ .name = .disabled, .value = .{ .boolean = true } }, w);
+                }
+                try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
+                if (!is_disabled) {
+                    try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
+                }
+                try self.writeAXProperty(.{ .name = .checked, .value = .{ .token = if (input._checked) "true" else "false" } }, w);
+            }
             try w.endArray();
         }
 
@@ -495,12 +554,17 @@ pub const Writer = struct {
         if (n._parent) |p| {
             const parent_node = try self.registry.register(p);
             try w.objectField("parentId");
-            try w.write(parent_node.id);
+            try writeIdString(parent_node.id, w);
         }
 
         // Children
         const write_children = axn.ignoreChildren() == false;
         const skip_text = ignoreText(axn.dom);
+
+        const child_in_aria_hidden = in_aria_hidden or blk: {
+            const self_el = n.is(DOMNode.Element) orelse break :blk false;
+            break :blk hasAriaHiddenTrue(self_el);
+        };
 
         try w.objectField("childIds");
         try w.beginArray();
@@ -513,8 +577,16 @@ pub const Writer = struct {
                     continue;
                 }
 
+                // Skip hidden element children so childIds matches the
+                // subtree-pruning done in writeNodeChildren.
+                if (child.is(DOMNode.Element)) |child_el| {
+                    if (child_in_aria_hidden or isHidden(child_el, self.frame, self.visibility_cache)) {
+                        continue;
+                    }
+                }
+
                 const child_node = try registry.register(child);
-                try w.write(child_node.id);
+                try writeIdString(child_node.id, w);
             }
         }
         try w.endArray();
@@ -548,7 +620,7 @@ pub const Writer = struct {
             },
             .select => blk: {
                 const select = el.as(DOMNode.Element.Html.Select);
-                const val = select.getValue(self.page);
+                const val = select.getValue(self.frame);
                 if (val.len == 0) break :blk null;
                 break :blk val;
             },
@@ -749,7 +821,7 @@ const AXSource = enum(u8) {
     value, // input value
 };
 
-pub fn getName(self: AXNode, page: *Page, allocator: std.mem.Allocator) !?[]const u8 {
+pub fn getName(self: AXNode, frame: *Frame, allocator: std.mem.Allocator) !?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
@@ -776,7 +848,7 @@ pub fn getName(self: AXNode, page: *Page, allocator: std.mem.Allocator) !?[]cons
 
     const w: TextCaptureWriter = .{ .aw = &aw, .writer = &aw.writer };
 
-    const source = try self.writeName(w, page);
+    const source = try self.writeName(null, w, frame, null);
     if (source != null) {
         // Remove literal quotes inserted by writeString.
         var raw_text = std.mem.trim(u8, aw.written(), "\"");
@@ -787,13 +859,21 @@ pub fn getName(self: AXNode, page: *Page, allocator: std.mem.Allocator) !?[]cons
     return null;
 }
 
-fn writeName(axnode: AXNode, w: anytype, page: *Page) !?AXSource {
+fn writeName(
+    axnode: AXNode,
+    temp_arena: ?std.mem.Allocator,
+    w: anytype,
+    frame: *Frame,
+    label_index: ?*Label.LabelByForIndex,
+) !?AXSource {
+    defer if (temp_arena) |a| frame._session.arena_pool.reset(a, scratch_retain_limit);
+
     const node = axnode.dom;
 
     return switch (node._type) {
         .document => |doc| switch (doc._type) {
             .html => |doc_html| {
-                try w.write(try doc_html.getTitle(page));
+                try w.write(try doc_html.getTitle(frame));
                 return .title;
             },
             else => null,
@@ -809,18 +889,18 @@ fn writeName(axnode: AXNode, w: anytype, page: *Page) !?AXSource {
             // Handle aria-labelledby attribute (highest priority)
             if (el.getAttributeSafe(.wrap("aria-labelledby"))) |labelledby| {
                 // Get the document to look up elements by ID
-                const doc = node.ownerDocument(page) orelse return null;
+                const doc = node.ownerDocument(frame) orelse return null;
 
                 // Parse space-separated list of IDs and concatenate their text content
                 var it = std.mem.splitScalar(u8, labelledby, ' ');
                 var has_content = false;
 
-                var buf = std.Io.Writer.Allocating.init(page.call_arena);
+                var buf = std.Io.Writer.Allocating.init(scratchAllocator(temp_arena, frame));
                 while (it.next()) |id| {
                     const trimmed_id = std.mem.trim(u8, id, &std.ascii.whitespace);
                     if (trimmed_id.len == 0) continue;
 
-                    if (doc.getElementById(trimmed_id, page)) |referenced_el| {
+                    if (doc.getElementById(trimmed_id, frame)) |referenced_el| {
                         // Get the text content of the referenced element
                         try referenced_el.getInnerText(&buf.writer);
                         try buf.writer.writeByte(' ');
@@ -837,6 +917,12 @@ fn writeName(axnode: AXNode, w: anytype, page: *Page) !?AXSource {
             if (el.getAttributeSafe(comptime .wrap("aria-label"))) |aria_label| {
                 try w.write(aria_label);
                 return .aria_label;
+            }
+
+            if (isLabellableTag(el.getTag())) {
+                if (try writeLabelName(temp_arena, node, el, frame, label_index, w)) |source| {
+                    return source;
+                }
             }
 
             if (el.getAttributeSafe(comptime .wrap("alt"))) |alt| {
@@ -877,8 +963,8 @@ fn writeName(axnode: AXNode, w: anytype, page: *Page) !?AXSource {
                 => {},
                 else => {
                     // write text content if exists.
-                    var buf: std.Io.Writer.Allocating = .init(page.call_arena);
-                    try writeAccessibleNameFallback(node, &buf.writer, page);
+                    var buf: std.Io.Writer.Allocating = .init(scratchAllocator(temp_arena, frame));
+                    try writeAccessibleNameFallback(node, &buf.writer, frame);
                     if (buf.written().len > 0) {
                         try writeString(buf.written(), w);
                         return .contents;
@@ -906,7 +992,7 @@ fn writeName(axnode: AXNode, w: anytype, page: *Page) !?AXSource {
     };
 }
 
-fn writeAccessibleNameFallback(node: *DOMNode, writer: *std.Io.Writer, page: *Page) !void {
+fn writeAccessibleNameFallback(node: *DOMNode, writer: *std.Io.Writer, frame: *Frame) !void {
     var it = node.childrenIterator();
     while (it.next()) |child| {
         switch (child._type) {
@@ -932,14 +1018,14 @@ fn writeAccessibleNameFallback(node: *DOMNode, writer: *std.Io.Writer, page: *Pa
                     while (sit.next()) |s_child| {
                         if (s_child.is(DOMNode.Element)) |s_el| {
                             if (std.mem.eql(u8, s_el.getTagNameLower(), "title")) {
-                                try writeAccessibleNameFallback(s_child, writer, page);
+                                try writeAccessibleNameFallback(s_child, writer, frame);
                                 try writer.writeByte(' ');
                             }
                         }
                     }
                 } else {
                     if (!el.getTag().isMetadata()) {
-                        try writeAccessibleNameFallback(child, writer, page);
+                        try writeAccessibleNameFallback(child, writer, frame);
                     }
                 }
             },
@@ -948,7 +1034,108 @@ fn writeAccessibleNameFallback(node: *DOMNode, writer: *std.Io.Writer, page: *Pa
     }
 }
 
-fn isHidden(elt: *DOMNode.Element) bool {
+fn hasAriaHiddenTrue(elt: *DOMNode.Element) bool {
+    if (elt.getAttributeSafe(comptime .wrap("aria-hidden"))) |value| {
+        return std.mem.eql(u8, value, "true");
+    }
+    return false;
+}
+
+fn isLabellableTag(tag: DOMNode.Element.Tag) bool {
+    return switch (tag) {
+        .button, .meter, .output, .progress, .select, .textarea, .input => true,
+        else => false,
+    };
+}
+
+// CSS-only toggle switches and custom radios commonly visually-style a
+// `<label>` while `display:none`-ing the real `<input>`. Chromium matches
+// this by pruning the input from the AX tree, which leaves the label as a
+// generic role=none element and an agent walking the tree has nothing
+// interactive to click.
+//
+// When a `<label>` targets a hidden checkbox or radio, promote it: emit
+// the label with the input's role and state. Browsers already forward
+// label clicks to the associated input, so the label's backendDOMNodeId
+// is a valid click target.
+fn labelPromotionTarget(
+    axn: AXNode,
+    frame: *Frame,
+    cache: *DOMNode.Element.VisibilityCache,
+) ?*DOMNode.Element.Html.Input {
+    // Respect an explicit role= on the label.
+    if (axn.role_attr != null) return null;
+
+    const node = axn.dom;
+    const el = node.is(DOMNode.Element) orelse return null;
+    if (el.getTag() != .label) return null;
+
+    const label = el.as(DOMNode.Element.Html.Label);
+    const control = label.getControl(frame) orelse return null;
+
+    // Only promote when the control is hidden; otherwise it appears
+    // normally and the label stays as-is.
+    if (!isHidden(control, frame, cache)) return null;
+
+    if (control.getTag() != .input) return null;
+    const input = control.as(DOMNode.Element.Html.Input);
+    return switch (input._input_type) {
+        .checkbox, .radio => input,
+        else => null,
+    };
+}
+
+fn writeLabelName(
+    temp_arena: ?std.mem.Allocator,
+    node: *DOMNode,
+    el: *DOMNode.Element,
+    frame: *Frame,
+    label_index: ?*Label.LabelByForIndex,
+    w: anytype,
+) !?AXSource {
+    if (el.getAttributeSafe(comptime .wrap("id"))) |id_value| {
+        if (id_value.len > 0) {
+            if (node.ownerDocument(frame)) |doc| {
+                const match: ?*DOMNode.Element = if (label_index) |idx|
+                    try idx.lookup(doc.asNode(), id_value, frame.call_arena)
+                else
+                    Label.findLabelByFor(doc.asNode(), id_value);
+                if (match) |label_el| {
+                    if (try writeLabelInnerText(temp_arena, label_el, frame, w)) return .label_element;
+                }
+            }
+        }
+    }
+
+    if (Label.findWrappingLabel(el)) |wrap_label| {
+        if (try writeLabelInnerText(temp_arena, wrap_label, frame, w)) return .label_wrap;
+    }
+
+    return null;
+}
+
+fn writeLabelInnerText(
+    temp_arena: ?std.mem.Allocator,
+    label_el: *DOMNode.Element,
+    frame: *Frame,
+    w: anytype,
+) !bool {
+    var buf: std.Io.Writer.Allocating = .init(scratchAllocator(temp_arena, frame));
+    try label_el.getInnerText(&buf.writer);
+    const text = std.mem.trim(u8, buf.written(), &std.ascii.whitespace);
+    if (text.len == 0) return false;
+    try writeString(text, w);
+    return true;
+}
+
+/// Allocator for throwaway name-resolution buffers: prefers the writer's
+/// temp arena so multiple calls reuse its retained page; falls back to
+/// `frame.call_arena` on the non-Writer `getName` path.
+fn scratchAllocator(temp_arena: ?std.mem.Allocator, frame: *Frame) std.mem.Allocator {
+    return temp_arena orelse frame.call_arena;
+}
+
+fn isHidden(elt: *DOMNode.Element, frame: *Frame, cache: *DOMNode.Element.VisibilityCache) bool {
     if (elt.getAttributeSafe(comptime .wrap("aria-hidden"))) |value| {
         if (std.mem.eql(u8, value, "true")) {
             return true;
@@ -963,8 +1150,11 @@ fn isHidden(elt: *DOMNode.Element) bool {
         return true;
     }
 
-    // TODO Check if aria-hidden ancestor exists
-    // TODO Check CSS visibility (if you have access to computed styles)
+    // CSS display:none and visibility:hidden (both inherited from ancestors via
+    // style computation). Matches Chromium's AX tree which prunes both.
+    if (frame._style_manager.isHidden(elt, cache, .{ .check_visibility = true })) {
+        return true;
+    }
 
     return false;
 }
@@ -1011,12 +1201,12 @@ fn ignoreChildren(self: AXNode) bool {
     };
 }
 
-fn isIgnore(self: AXNode, page: *Page) bool {
+fn isIgnore(self: AXNode, frame: *Frame, cache: *DOMNode.Element.VisibilityCache, in_aria_hidden: bool) bool {
     const node = self.dom;
     const role_attr = self.role_attr;
 
     // Don't ignore non-Element node: CData, Document...
-    const elt = node.is(DOMNode.Element) orelse return false;
+    const elt = node.is(DOMNode.Element) orelse return in_aria_hidden;
     // Ignore non-HTML elements: svg...
     if (elt._type != .html) {
         return true;
@@ -1053,7 +1243,11 @@ fn isIgnore(self: AXNode, page: *Page) bool {
         }
     }
 
-    if (isHidden(elt)) {
+    if (in_aria_hidden) {
+        return true;
+    }
+
+    if (isHidden(elt, frame, cache)) {
         return true;
     }
 
@@ -1064,11 +1258,11 @@ fn isIgnore(self: AXNode, page: *Page) bool {
         const has_aria_labelledby = elt.hasAttributeSafe(.wrap("aria-labelledby"));
 
         if (!has_role and !has_aria_label and !has_aria_labelledby) {
-            // Check if it has any non-ignored children
+            // Check if it has any non-ignored children.
             var it = node.childrenIterator();
             while (it.next()) |child| {
                 const axn = AXNode.fromNode(child);
-                if (!axn.isIgnore(page)) {
+                if (!axn.isIgnore(frame, cache, in_aria_hidden)) {
                     return false;
                 }
             }
@@ -1091,7 +1285,7 @@ pub fn getRole(self: AXNode) ![]const u8 {
     return @tagName(role_implicit);
 }
 
-// Replace successives whitespaces with one withespace.
+// Replace successives whitespaces with one whitespace.
 // Trims left and right according to the options.
 // Returns true if the string ends with a trimmed whitespace.
 fn writeString(s: []const u8, w: anytype) !void {
@@ -1106,7 +1300,7 @@ fn writeString(s: []const u8, w: anytype) !void {
 fn stripWhitespaces(s: []const u8, writer: anytype) !void {
     var start: usize = 0;
     var prev_w: ?bool = null;
-    var is_w: bool = undefined;
+    var is_w: bool = false;
 
     for (s, 0..) |c, i| {
         is_w = std.ascii.isWhitespace(c);
@@ -1179,15 +1373,22 @@ test "AXNode: writer" {
     var registry = Node.Registry.init(testing.allocator);
     defer registry.deinit();
 
-    var page = try testing.pageTest("cdp/dom3.html");
-    defer page._session.removePage();
-    var doc = page.window._document;
+    var frame = try testing.pageTest("cdp/dom3.html", .{});
+    defer frame._session.removePage();
+    var doc = frame.window._document;
 
     const node = try registry.register(doc.asNode());
+    var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
+    var label_index: Label.LabelByForIndex = .{};
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer frame.releaseArena(temp_arena);
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
         .registry = &registry,
-        .page = page,
+        .frame = frame,
+        .visibility_cache = &visibility_cache,
+        .label_index = &label_index,
+        .temp_arena = temp_arena,
     }, .{});
     defer testing.allocator.free(json);
 
@@ -1200,7 +1401,8 @@ test "AXNode: writer" {
 
     // First node should be the document
     const doc_node = nodes[0].object;
-    try testing.expectEqual(1, doc_node.get("nodeId").?.integer);
+    // CDP spec: AXNodeId is a string; backendDOMNodeId (DOM.BackendNodeId) is an integer.
+    try testing.expectEqual("1", doc_node.get("nodeId").?.string);
     try testing.expectEqual(1, doc_node.get("backendDOMNodeId").?.integer);
     try testing.expectEqual(false, doc_node.get("ignored").?.bool);
 
@@ -1219,6 +1421,21 @@ test "AXNode: writer" {
     // Check childIds array exists
     const child_ids = doc_node.get("childIds").?.array.items;
     try testing.expect(child_ids.len > 0);
+    // CDP spec: childIds entries are AXNodeId (strings).
+    for (child_ids) |cid| {
+        try testing.expect(cid == .string);
+    }
+
+    // A non-root node must have parentId serialized as a string.
+    var saw_parent_id = false;
+    for (nodes[1..]) |node_val| {
+        if (node_val.object.get("parentId")) |pid| {
+            try testing.expect(pid == .string);
+            saw_parent_id = true;
+            break;
+        }
+    }
+    try testing.expect(saw_parent_id);
 
     // Find the h1 node and verify its level property is serialized as a string
     for (nodes) |node_val| {
@@ -1240,4 +1457,137 @@ test "AXNode: writer" {
         }
     }
     return error.HeadingNodeNotFound;
+}
+
+test "AXNode: writer prunes hidden and resolves labels" {
+    var registry = Node.Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    var frame = try testing.pageTest("cdp/ax_tree.html", .{});
+    defer frame._session.removePage();
+    var doc = frame.window._document;
+
+    const node = try registry.register(doc.asNode());
+    var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
+    var label_index: Label.LabelByForIndex = .{};
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer frame.releaseArena(temp_arena);
+    const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
+        .root = node,
+        .registry = &registry,
+        .frame = frame,
+        .visibility_cache = &visibility_cache,
+        .label_index = &label_index,
+        .temp_arena = temp_arena,
+    }, .{});
+    defer testing.allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.array.items;
+
+    // No hidden-subtree text should have leaked into the tree.
+    const hidden_texts = [_][]const u8{
+        "under-display-none",
+        "under-visibility-hidden",
+        "under-hidden-attr",
+        "under-aria-hidden",
+    };
+    for (nodes) |node_val| {
+        const obj = node_val.object;
+        const name_obj = obj.get("name") orelse continue;
+        const value = name_obj.object.get("value") orelse continue;
+        if (value != .string) continue;
+        for (hidden_texts) |bad| {
+            try testing.expect(std.mem.indexOf(u8, value.string, bad) == null);
+        }
+    }
+
+    // The visible paragraph's text leaks into the tree as a StaticText child.
+    var found_visible = false;
+    for (nodes) |node_val| {
+        const obj = node_val.object;
+        const name_obj = obj.get("name") orelse continue;
+        const value = name_obj.object.get("value") orelse continue;
+        if (value == .string and std.mem.indexOf(u8, value.string, "visible-para") != null) {
+            found_visible = true;
+            break;
+        }
+    }
+    try testing.expect(found_visible);
+
+    // The search input gets its name from <label for=search-input>.
+    var search_named = false;
+    for (nodes) |node_val| {
+        const obj = node_val.object;
+        const role_obj = obj.get("role") orelse continue;
+        const role_val = role_obj.object.get("value") orelse continue;
+        if (!std.mem.eql(u8, role_val.string, "searchbox")) continue;
+        const name_val = obj.get("name").?.object.get("value").?;
+        if (name_val == .string and std.mem.indexOf(u8, name_val.string, "Search") != null) {
+            search_named = true;
+        }
+    }
+    try testing.expect(search_named);
+
+    // The wrapped input gets its name from its ancestor <label>.
+    var wrapped_named = false;
+    for (nodes) |node_val| {
+        const obj = node_val.object;
+        const role_obj = obj.get("role") orelse continue;
+        const role_val = role_obj.object.get("value") orelse continue;
+        if (!std.mem.eql(u8, role_val.string, "textbox")) continue;
+        const name_val = obj.get("name").?.object.get("value").?;
+        if (name_val == .string and std.mem.indexOf(u8, name_val.string, "Wrap") != null) {
+            wrapped_named = true;
+        }
+    }
+    try testing.expect(wrapped_named);
+
+    // Labels associated with CSS-hidden checkboxes/radios are promoted:
+    // the label appears with the control's role + state so agents can
+    // interact with CSS-only toggle switches.
+    const Expected = struct {
+        name_needle: []const u8,
+        role: []const u8,
+        checked: []const u8,
+    };
+    const expected = [_]Expected{
+        // `for=`-associated: CSS display:none checkbox with `checked`.
+        .{ .name_needle = "Enable feature", .role = "checkbox", .checked = "true" },
+        // `for=`-associated: display:none radio with `checked`.
+        .{ .name_needle = "Option A", .role = "radio", .checked = "true" },
+        // `for=`-associated: visibility:hidden radio, unchecked.
+        .{ .name_needle = "Option B", .role = "radio", .checked = "false" },
+        // Wrapping label pattern, checkbox hidden, unchecked.
+        .{ .name_needle = "Accept terms", .role = "checkbox", .checked = "false" },
+    };
+    for (expected) |exp| {
+        var found = false;
+        for (nodes) |node_val| {
+            const obj = node_val.object;
+            const role_obj = obj.get("role") orelse continue;
+            const role_val = role_obj.object.get("value") orelse continue;
+            if (!std.mem.eql(u8, role_val.string, exp.role)) continue;
+            const name_obj = obj.get("name") orelse continue;
+            const name_value = name_obj.object.get("value") orelse continue;
+            if (name_value != .string) continue;
+            if (std.mem.indexOf(u8, name_value.string, exp.name_needle) == null) continue;
+
+            // Verify the `checked` property was emitted with the right value.
+            const props = obj.get("properties").?.array.items;
+            var checked_matches = false;
+            for (props) |prop| {
+                const prop_obj = prop.object;
+                if (!std.mem.eql(u8, prop_obj.get("name").?.string, "checked")) continue;
+                const val = prop_obj.get("value").?.object.get("value").?.string;
+                if (std.mem.eql(u8, val, exp.checked)) checked_matches = true;
+                break;
+            }
+            try testing.expect(checked_matches);
+            found = true;
+            break;
+        }
+        try testing.expect(found);
+    }
 }

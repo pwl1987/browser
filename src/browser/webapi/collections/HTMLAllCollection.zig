@@ -20,10 +20,11 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
 const Node = @import("../Node.zig");
 const Element = @import("../Element.zig");
 const TreeWalker = @import("../TreeWalker.zig");
+const Execution = js.Execution;
 
 const HTMLAllCollection = @This();
 
@@ -32,18 +33,18 @@ _last_index: usize,
 _last_length: ?u32,
 _cached_version: usize,
 
-pub fn init(root: *Node, page: *Page) HTMLAllCollection {
+pub fn init(root: *Node, frame: *Frame) HTMLAllCollection {
     return .{
         ._last_index = 0,
         ._last_length = null,
         ._tw = TreeWalker.FullExcludeSelf.init(root, .{}),
-        ._cached_version = page.version,
+        ._cached_version = frame.version,
     };
 }
 
-fn versionCheck(self: *HTMLAllCollection, page: *const Page) bool {
-    if (self._cached_version != page.version) {
-        self._cached_version = page.version;
+fn versionCheck(self: *HTMLAllCollection, frame: *const Frame) bool {
+    if (self._cached_version != frame.version) {
+        self._cached_version = frame.version;
         self._last_index = 0;
         self._last_length = null;
         self._tw.reset();
@@ -52,8 +53,8 @@ fn versionCheck(self: *HTMLAllCollection, page: *const Page) bool {
     return true;
 }
 
-pub fn length(self: *HTMLAllCollection, page: *const Page) u32 {
-    if (self.versionCheck(page)) {
+pub fn length(self: *HTMLAllCollection, frame: *const Frame) u32 {
+    if (self.versionCheck(frame)) {
         if (self._last_length) |cached_length| {
             return cached_length;
         }
@@ -75,8 +76,8 @@ pub fn length(self: *HTMLAllCollection, page: *const Page) u32 {
     return l;
 }
 
-pub fn getAtIndex(self: *HTMLAllCollection, index: usize, page: *const Page) ?*Element {
-    _ = self.versionCheck(page);
+pub fn getAtIndex(self: *HTMLAllCollection, index: usize, frame: *const Frame) ?*Element {
+    _ = self.versionCheck(frame);
     var current = self._last_index;
     if (index <= current) {
         current = 0;
@@ -97,15 +98,15 @@ pub fn getAtIndex(self: *HTMLAllCollection, index: usize, page: *const Page) ?*E
     return null;
 }
 
-pub fn getByName(self: *HTMLAllCollection, name: []const u8, page: *Page) ?*Element {
+pub fn getByName(self: *HTMLAllCollection, name: []const u8, frame: *Frame) ?*Element {
     // First, try fast ID lookup using the document's element map
-    if (page.document._elements_by_id.get(name)) |el| {
+    if (frame.document._elements_by_id.get(name)) |el| {
         return el;
     }
 
     // Fall back to searching by name attribute
     // Clone the tree walker to preserve _last_index optimization
-    _ = self.versionCheck(page);
+    _ = self.versionCheck(frame);
     var tw = self._tw.clone();
     tw.reset();
 
@@ -126,18 +127,18 @@ const CAllAsFunctionArg = union(enum) {
     index: u32,
     id: []const u8,
 };
-pub fn callable(self: *HTMLAllCollection, arg: CAllAsFunctionArg, page: *Page) ?*Element {
+pub fn callable(self: *HTMLAllCollection, arg: CAllAsFunctionArg, frame: *Frame) ?*Element {
     return switch (arg) {
-        .index => |i| self.getAtIndex(i, page),
-        .id => |id| self.getByName(id, page),
+        .index => |i| self.getAtIndex(i, frame),
+        .id => |id| self.getByName(id, frame),
     };
 }
 
-pub fn iterator(self: *HTMLAllCollection, page: *Page) !*Iterator {
+pub fn iterator(self: *HTMLAllCollection, exec: *const Execution) !*Iterator {
     return Iterator.init(.{
         .list = self,
         .tw = self._tw.clone(),
-    }, page);
+    }, exec);
 }
 
 const GenericIterator = @import("iterator.zig").Entry;
@@ -145,7 +146,7 @@ pub const Iterator = GenericIterator(struct {
     list: *HTMLAllCollection,
     tw: TreeWalker.FullExcludeSelf,
 
-    pub fn next(self: *@This(), _: *Page) ?*Element {
+    pub fn next(self: *@This(), _: *const Execution) ?*Element {
         while (self.tw.next()) |node| {
             if (node.is(Element)) |el| {
                 return el;
@@ -174,11 +175,11 @@ pub const JsApi = struct {
     pub const @"[str]" = bridge.namedIndexed(HTMLAllCollection.getByName, null, null, .{ .null_as_undefined = true });
 
     pub const item = bridge.function(_item, .{});
-    fn _item(self: *HTMLAllCollection, index: i32, page: *Page) ?*Element {
+    fn _item(self: *HTMLAllCollection, index: i32, frame: *Frame) ?*Element {
         if (index < 0) {
             return null;
         }
-        return self.getAtIndex(@intCast(index), page);
+        return self.getAtIndex(@intCast(index), frame);
     }
 
     pub const namedItem = bridge.function(HTMLAllCollection.getByName, .{});

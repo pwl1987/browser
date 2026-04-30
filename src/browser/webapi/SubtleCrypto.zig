@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026 Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -18,17 +18,22 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const log = @import("../../log.zig");
+const crypto = @import("../../sys/libcrypto.zig");
 
-const crypto = @import("../../crypto.zig");
-const DOMException = @import("DOMException.zig");
-
-const Page = @import("../Page.zig");
+const Frame = @import("../Frame.zig");
 const js = @import("../js/js.zig");
 
-pub fn registerTypes() []const type {
-    return &.{ SubtleCrypto, CryptoKey };
-}
+const CryptoKey = @import("CryptoKey.zig");
+
+const algorithm = @import("crypto/algorithm.zig");
+const AES = @import("crypto/AES.zig");
+const EC = @import("crypto/EC.zig");
+const HMAC = @import("crypto/HMAC.zig");
+const RSA = @import("crypto/RSA.zig");
+const X25519 = @import("crypto/X25519.zig");
+
+const log = lp.log;
+const String = lp.String;
 
 /// The SubtleCrypto interface of the Web Crypto API provides a number of low-level
 /// cryptographic functions.
@@ -38,69 +43,100 @@ const SubtleCrypto = @This();
 /// Don't optimize away the type.
 _pad: bool = false,
 
-const Algorithm = union(enum) {
-    /// For RSASSA-PKCS1-v1_5, RSA-PSS, or RSA-OAEP: pass an RsaHashedKeyGenParams object.
-    rsa_hashed_key_gen: RsaHashedKeyGen,
-    /// For HMAC: pass an HmacKeyGenParams object.
-    hmac_key_gen: HmacKeyGen,
-    /// Can be Ed25519 or X25519.
-    name: []const u8,
-    /// Can be Ed25519 or X25519.
-    object: struct { name: []const u8 },
-
-    /// https://developer.mozilla.org/en-US/docs/Web/API/RsaHashedKeyGenParams
-    const RsaHashedKeyGen = struct {
-        name: []const u8,
-        /// This should be at least 2048.
-        /// Some organizations are now recommending that it should be 4096.
-        modulusLength: u32,
-        publicExponent: js.TypedArray(u8),
-        hash: union(enum) {
-            string: []const u8,
-            object: struct { name: []const u8 },
-        },
-    };
-
-    /// https://developer.mozilla.org/en-US/docs/Web/API/HmacKeyGenParams
-    const HmacKeyGen = struct {
-        /// Always HMAC.
-        name: []const u8,
-        /// Its also possible to pass this in an object.
-        hash: union(enum) {
-            string: []const u8,
-            object: struct { name: []const u8 },
-        },
-        /// If omitted, default is the block size of the chosen hash function.
-        length: ?usize,
-    };
-    /// Alias.
-    const HmacImport = HmacKeyGen;
-
-    const EcdhKeyDeriveParams = struct {
-        /// Can be Ed25519 or X25519.
-        name: []const u8,
-        public: *const CryptoKey,
-    };
-
-    /// Algorithm for deriveBits() and deriveKey().
-    const DeriveBits = union(enum) {
-        ecdh_or_x25519: EcdhKeyDeriveParams,
-    };
-};
-
 /// Generate a new key (for symmetric algorithms) or key pair (for public-key algorithms).
 pub fn generateKey(
     _: *const SubtleCrypto,
-    algorithm: Algorithm,
+    algo: algorithm.Init,
     extractable: bool,
     key_usages: []const []const u8,
-    page: *Page,
+    frame: *Frame,
 ) !js.Promise {
-    const key_or_pair = CryptoKey.init(algorithm, extractable, key_usages, page) catch |err| {
-        return page.js.local.?.rejectPromise(@errorName(err));
-    };
+    const local = frame.js.local.?;
+    switch (algo) {
+        .hmac_key_gen => |params| return HMAC.init(params, extractable, key_usages, frame),
+        .aes_key_gen => |params| {
+            AES.validate(params, key_usages) catch |err| {
+                return local.rejectPromise(.{ .dom_exception = .{ .err = err } });
+            };
+            log.warn(.not_implemented, "generateKey", .{ .name = params.name });
+        },
+        .ec_key_gen => |params| {
+            EC.validate(params, key_usages) catch |err| {
+                return local.rejectPromise(.{ .dom_exception = .{ .err = err } });
+            };
+            log.warn(.not_implemented, "generateKey", .{ .name = params.name });
+        },
+        .rsa_hashed_key_gen => |params| {
+            RSA.validate(params, key_usages) catch |err| {
+                return local.rejectPromise(.{ .dom_exception = .{ .err = err } });
+            };
+            log.warn(.not_implemented, "generateKey", .{ .name = params.name });
+        },
+        .name => |js_name| return generateKeyFromName(try js_name.toSSO(false), extractable, key_usages, frame),
+        .object => |object| return generateKeyFromName(try object.name.toSSO(false), extractable, key_usages, frame),
+        .invalid => return local.rejectPromise(.{ .type_error = "invalid algorithm" }),
+    }
 
-    return page.js.local.?.resolvePromise(key_or_pair);
+    return local.rejectPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
+}
+
+fn generateKeyFromName(
+    name: String,
+    extractable: bool,
+    key_usages: []const []const u8,
+    frame: *Frame,
+) !js.Promise {
+    return _generateKeyFromName(name, extractable, key_usages, frame) catch |err| {
+        return frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = err } });
+    };
+}
+
+fn _generateKeyFromName(
+    name: String,
+    extractable: bool,
+    key_usages: []const []const u8,
+    frame: *Frame,
+) !js.Promise {
+    if (name.eql(comptime .wrap("X25519"))) {
+        return X25519.init(extractable, key_usages, frame);
+    }
+
+    {
+        // Algorithms whose `generateKey` parameters are just `{name}` — Ed25519,
+        // Ed448, X448. Validates usages so failure-path tests get the spec-mandated
+        // error name; leaves real key generation to a future change.
+
+        const allowed: []const []const u8 = blk: {
+            const str = name.str();
+            if (std.ascii.eqlIgnoreCase(str, "Ed25519") or std.ascii.eqlIgnoreCase(str, "Ed448")) {
+                break :blk &.{ "sign", "verify" };
+            }
+            if (std.ascii.eqlIgnoreCase(str, "X448")) {
+                break :blk &.{ "deriveKey", "deriveBits" };
+            }
+            return error.NotSupported;
+        };
+
+        for (key_usages) |usage| {
+            var ok = false;
+            for (allowed) |a| {
+                if (std.mem.eql(u8, a, usage)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                return error.SyntaxError;
+            }
+        }
+
+        if (key_usages.len == 0) {
+            return error.SyntaxError;
+        }
+    }
+
+    log.warn(.not_implemented, "generateKey", .{ .name = name });
+    return error.NotSupported;
 }
 
 /// Exports a key: that is, it takes as input a CryptoKey object and gives you
@@ -109,14 +145,14 @@ pub fn exportKey(
     _: *const SubtleCrypto,
     format: []const u8,
     key: *CryptoKey,
-    page: *Page,
+    frame: *Frame,
 ) !js.Promise {
     if (!key.canExportKey()) {
-        return error.InvalidAccessError;
+        return frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = error.InvalidAccessError } });
     }
 
     if (std.mem.eql(u8, format, "raw")) {
-        return page.js.local.?.resolvePromise(js.ArrayBuffer{ .values = key._key });
+        return frame.js.local.?.resolvePromise(js.ArrayBuffer{ .values = key._key });
     }
 
     const is_unsupported = std.mem.eql(u8, format, "pkcs8") or
@@ -124,80 +160,58 @@ pub fn exportKey(
 
     if (is_unsupported) {
         log.warn(.not_implemented, "SubtleCrypto.exportKey", .{ .format = format });
+        return frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
     }
 
-    return page.js.local.?.rejectPromise(@errorName(error.NotSupported));
+    return frame.js.local.?.rejectPromise(.{ .type_error = "invalid format" });
 }
 
 /// Derive a secret key from a master key.
 pub fn deriveBits(
     _: *const SubtleCrypto,
-    algorithm: Algorithm.DeriveBits,
+    algo: algorithm.Derive,
     base_key: *const CryptoKey, // Private key.
     length: usize,
-    page: *Page,
+    frame: *Frame,
 ) !js.Promise {
-    return switch (algorithm) {
-        .ecdh_or_x25519 => |p| {
-            const name = p.name;
+    return switch (algo) {
+        .ecdh_or_x25519 => |params| {
+            const name = params.name;
             if (std.mem.eql(u8, name, "X25519")) {
-                return page.js.local.?.resolvePromise(base_key.deriveBitsX25519(p.public, length, page));
+                const result = X25519.deriveBits(base_key, params.public, length, frame) catch |err| switch (err) {
+                    error.InvalidAccessError => return frame.js.local.?.rejectPromise(.{
+                        .dom_exception = .{ .err = error.InvalidAccessError },
+                    }),
+                    else => return err,
+                };
+
+                return frame.js.local.?.resolvePromise(result);
             }
 
             if (std.mem.eql(u8, name, "ECDH")) {
                 log.warn(.not_implemented, "SubtleCrypto.deriveBits", .{ .name = name });
             }
 
-            return page.js.local.?.rejectPromise(@errorName(error.NotSupported));
+            return frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
         },
     };
 }
 
-const SignatureAlgorithm = union(enum) {
-    string: []const u8,
-    object: struct { name: []const u8 },
-
-    pub fn isHMAC(self: SignatureAlgorithm) bool {
-        const name = switch (self) {
-            .string => |string| string,
-            .object => |object| object.name,
-        };
-
-        if (name.len < 4) return false;
-        const hmac: u32 = @bitCast([4]u8{ 'H', 'M', 'A', 'C' });
-        return @as(u32, @bitCast(name[0..4].*)) == hmac;
-    }
-};
-
 /// Generate a digital signature.
 pub fn sign(
     _: *const SubtleCrypto,
-    /// This can either be provided as string or object.
-    /// We can't use the `Algorithm` type defined before though since there
-    /// are couple of changes between the two.
     /// https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/sign#algorithm
-    algorithm: SignatureAlgorithm,
+    algo: algorithm.Sign,
     key: *CryptoKey,
     data: []const u8, // ArrayBuffer.
-    page: *Page,
+    frame: *Frame,
 ) !js.Promise {
     return switch (key._type) {
-        .hmac => {
-            // Verify algorithm.
-            if (!algorithm.isHMAC()) {
-                return page.js.local.?.rejectPromise(@errorName(error.InvalidAccessError));
-            }
-
-            // Call sign for HMAC.
-            const result = key.signHMAC(data, page) catch |err| {
-                return page.js.local.?.rejectPromise(@errorName(err));
-            };
-
-            return page.js.local.?.resolvePromise(result);
-        },
+        // Call sign for HMAC.
+        .hmac => return HMAC.sign(algo, key, data, frame),
         else => {
             log.warn(.not_implemented, "SubtleCrypto.sign", .{ .key_type = key._type });
-            return page.js.local.?.rejectPromise(@errorName(error.InvalidAccessError));
+            return frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = error.InvalidAccessError } });
         },
     };
 }
@@ -205,450 +219,43 @@ pub fn sign(
 /// Verify a digital signature.
 pub fn verify(
     _: *const SubtleCrypto,
-    algorithm: SignatureAlgorithm,
+    algo: algorithm.Sign,
     key: *const CryptoKey,
     signature: []const u8, // ArrayBuffer.
     data: []const u8, // ArrayBuffer.
-    page: *Page,
+    frame: *Frame,
 ) !js.Promise {
-    if (!algorithm.isHMAC()) return error.InvalidAccessError;
+    if (!algo.isHMAC()) {
+        return frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = error.InvalidAccessError } });
+    }
 
     return switch (key._type) {
-        .hmac => key.verifyHMAC(signature, data, page),
-        else => return error.InvalidAccessError,
+        .hmac => HMAC.verify(key, signature, data, frame),
+        else => frame.js.local.?.rejectPromise(.{ .dom_exception = .{ .err = error.InvalidAccessError } }),
     };
 }
 
-pub fn digest(_: *const SubtleCrypto, algorithm: []const u8, data: js.TypedArray(u8), page: *Page) !js.Promise {
-    const local = page.js.local.?;
-    if (algorithm.len > 10) {
-        return local.rejectPromise(DOMException.fromError(error.NotSupported));
-    }
-    const normalized = std.ascii.lowerString(&page.buf, algorithm);
-    if (std.mem.eql(u8, normalized, "sha-1")) {
-        const Sha1 = std.crypto.hash.Sha1;
-        Sha1.hash(data.values, page.buf[0..Sha1.digest_length], .{});
-        return local.resolvePromise(js.ArrayBuffer{ .values = page.buf[0..Sha1.digest_length] });
-    }
-    if (std.mem.eql(u8, normalized, "sha-256")) {
-        const Sha256 = std.crypto.hash.sha2.Sha256;
-        Sha256.hash(data.values, page.buf[0..Sha256.digest_length], .{});
-        return local.resolvePromise(js.ArrayBuffer{ .values = page.buf[0..Sha256.digest_length] });
-    }
-    if (std.mem.eql(u8, normalized, "sha-384")) {
-        const Sha384 = std.crypto.hash.sha2.Sha384;
-        Sha384.hash(data.values, page.buf[0..Sha384.digest_length], .{});
-        return local.resolvePromise(js.ArrayBuffer{ .values = page.buf[0..Sha384.digest_length] });
-    }
-    if (std.mem.eql(u8, normalized, "sha-512")) {
-        const Sha512 = std.crypto.hash.sha2.Sha512;
-        Sha512.hash(data.values, page.buf[0..Sha512.digest_length], .{});
-        return local.resolvePromise(js.ArrayBuffer{ .values = page.buf[0..Sha512.digest_length] });
-    }
-    return local.rejectPromise(DOMException.fromError(error.NotSupported));
-}
+/// Generates a digest of the given data, using the specified hash function.
+pub fn digest(_: *const SubtleCrypto, algo: []const u8, data: js.TypedArray(u8), frame: *Frame) !js.Promise {
+    const local = frame.js.local.?;
 
-/// Returns the desired digest by its name.
-fn findDigest(name: []const u8) error{Invalid}!*const crypto.EVP_MD {
-    if (std.mem.eql(u8, "SHA-256", name)) {
-        return crypto.EVP_sha256();
+    if (algo.len > 10) {
+        return local.rejectPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
     }
 
-    if (std.mem.eql(u8, "SHA-384", name)) {
-        return crypto.EVP_sha384();
-    }
-
-    if (std.mem.eql(u8, "SHA-512", name)) {
-        return crypto.EVP_sha512();
-    }
-
-    if (std.mem.eql(u8, "SHA-1", name)) {
-        return crypto.EVP_sha1();
-    }
-
-    return error.Invalid;
-}
-
-const KeyOrPair = union(enum) { key: *CryptoKey, pair: CryptoKeyPair };
-
-/// https://developer.mozilla.org/en-US/docs/Web/API/CryptoKeyPair
-const CryptoKeyPair = struct {
-    privateKey: *CryptoKey,
-    publicKey: *CryptoKey,
-};
-
-/// Represents a cryptographic key obtained from one of the SubtleCrypto methods
-/// generateKey(), deriveKey(), importKey(), or unwrapKey().
-pub const CryptoKey = struct {
-    /// Algorithm being used.
-    _type: Type,
-    /// Whether the key is extractable.
-    _extractable: bool,
-    /// Bit flags of `usages`; see `Usages` type.
-    _usages: u8,
-    /// Raw bytes of key.
-    _key: []const u8,
-    /// Different algorithms may use different data structures;
-    /// this union can be used for such situations. Active field is understood
-    /// from `_type`.
-    _vary: extern union {
-        /// Used by HMAC.
-        digest: *const crypto.EVP_MD,
-        /// Used by asymmetric algorithms (X25519, Ed25519).
-        pkey: *crypto.EVP_PKEY,
-    },
-
-    pub const Type = enum(u8) { hmac, rsa, x25519 };
-
-    /// Changing the names of fields would affect bitmask creation.
-    pub const Usages = struct {
-        // zig fmt: off
-        pub const encrypt    = 0x001;
-        pub const decrypt    = 0x002;
-        pub const sign       = 0x004;
-        pub const verify     = 0x008;
-        pub const deriveKey  = 0x010;
-        pub const deriveBits = 0x020;
-        pub const wrapKey    = 0x040;
-        pub const unwrapKey  = 0x080;
-        // zig fmt: on
+    const normalized = std.ascii.upperString(&frame.buf, algo);
+    const digest_type = crypto.findDigest(normalized) catch {
+        return local.rejectPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
     };
 
-    pub fn init(
-        algorithm: Algorithm,
-        extractable: bool,
-        key_usages: []const []const u8,
-        page: *Page,
-    ) !KeyOrPair {
-        return switch (algorithm) {
-            .hmac_key_gen => |hmac| initHMAC(hmac, extractable, key_usages, page),
-            .name => |name| {
-                if (std.mem.eql(u8, "X25519", name)) {
-                    return initX25519(extractable, key_usages, page);
-                }
-                log.warn(.not_implemented, "CryptoKey.init", .{ .name = name });
-                return error.NotSupported;
-            },
-            .object => |object| {
-                // Ditto.
-                const name = object.name;
-                if (std.mem.eql(u8, "X25519", name)) {
-                    return initX25519(extractable, key_usages, page);
-                }
-                log.warn(.not_implemented, "CryptoKey.init", .{ .name = name });
-                return error.NotSupported;
-            },
-            else => {
-                log.warn(.not_implemented, "CryptoKey.init", .{ .algorithm = algorithm });
-                return error.NotSupported;
-            },
-        };
-    }
+    const bytes = data.values;
+    const out = frame.buf[0..crypto.EVP_MAX_MD_SIZE];
+    var out_size: c_uint = 0;
+    const result = crypto.EVP_Digest(bytes.ptr, bytes.len, out, &out_size, digest_type, null);
+    lp.assert(result == 1, "SubtleCrypto.digest", .{ .algo = algo });
 
-    inline fn canSign(self: *const CryptoKey) bool {
-        return self._usages & Usages.sign != 0;
-    }
-
-    inline fn canVerify(self: *const CryptoKey) bool {
-        return self._usages & Usages.verify != 0;
-    }
-
-    inline fn canDeriveBits(self: *const CryptoKey) bool {
-        return self._usages & Usages.deriveBits != 0;
-    }
-
-    inline fn canExportKey(self: *const CryptoKey) bool {
-        return self._extractable;
-    }
-
-    /// Only valid for HMAC.
-    inline fn getDigest(self: *const CryptoKey) *const crypto.EVP_MD {
-        return self._vary.digest;
-    }
-
-    /// Only valid for asymmetric algorithms (X25519, Ed25519).
-    inline fn getKeyObject(self: *const CryptoKey) *crypto.EVP_PKEY {
-        return self._vary.pkey;
-    }
-
-    // HMAC.
-
-    fn initHMAC(
-        algorithm: Algorithm.HmacKeyGen,
-        extractable: bool,
-        key_usages: []const []const u8,
-        page: *Page,
-    ) !KeyOrPair {
-        const hash = switch (algorithm.hash) {
-            .string => |str| str,
-            .object => |obj| obj.name,
-        };
-        // Find digest.
-        const d = try findDigest(hash);
-
-        // We need at least a single usage.
-        if (key_usages.len == 0) {
-            return error.SyntaxError;
-        }
-        // Calculate usages mask.
-        const decls = @typeInfo(Usages).@"struct".decls;
-        var usages_mask: u8 = 0;
-        iter_usages: for (key_usages) |usage| {
-            inline for (decls) |decl| {
-                if (std.mem.eql(u8, decl.name, usage)) {
-                    usages_mask |= @field(Usages, decl.name);
-                    continue :iter_usages;
-                }
-            }
-            // Unknown usage if got here.
-            return error.SyntaxError;
-        }
-
-        const block_size: usize = blk: {
-            // Caller provides this in bits, not bytes.
-            if (algorithm.length) |length| {
-                break :blk length / 8;
-            }
-            // Prefer block size of the hash function instead.
-            break :blk crypto.EVP_MD_block_size(d);
-        };
-
-        const key = try page.arena.alloc(u8, block_size);
-        errdefer page.arena.free(key);
-
-        // HMAC is simply CSPRNG.
-        const res = crypto.RAND_bytes(key.ptr, key.len);
-        lp.assert(res == 1, "SubtleCrypto.initHMAC", .{ .res = res });
-
-        const crypto_key = try page._factory.create(CryptoKey{
-            ._type = .hmac,
-            ._extractable = extractable,
-            ._usages = usages_mask,
-            ._key = key,
-            ._vary = .{ .digest = d },
-        });
-
-        return .{ .key = crypto_key };
-    }
-
-    fn signHMAC(self: *const CryptoKey, data: []const u8, page: *Page) !js.ArrayBuffer {
-        if (!self.canSign()) {
-            return error.InvalidAccessError;
-        }
-
-        const buffer = try page.call_arena.alloc(u8, crypto.EVP_MD_size(self.getDigest()));
-        errdefer page.call_arena.free(buffer);
-        var out_len: u32 = 0;
-        // Try to sign.
-        const signed = crypto.HMAC(
-            self.getDigest(),
-            @ptrCast(self._key.ptr),
-            self._key.len,
-            data.ptr,
-            data.len,
-            buffer.ptr,
-            &out_len,
-        );
-
-        if (signed != null) {
-            return js.ArrayBuffer{ .values = buffer[0..out_len] };
-        }
-
-        // Not DOM exception, failed on our side.
-        return error.Invalid;
-    }
-
-    fn verifyHMAC(
-        self: *const CryptoKey,
-        signature: []const u8,
-        data: []const u8,
-        page: *Page,
-    ) !js.Promise {
-        if (!self.canVerify()) {
-            return error.InvalidAccessError;
-        }
-
-        var buffer: [crypto.EVP_MAX_MD_BLOCK_SIZE]u8 = undefined;
-        var out_len: u32 = 0;
-        // Try to sign.
-        const signed = crypto.HMAC(
-            self.getDigest(),
-            @ptrCast(self._key.ptr),
-            self._key.len,
-            data.ptr,
-            data.len,
-            &buffer,
-            &out_len,
-        );
-
-        if (signed != null) {
-            // CRYPTO_memcmp compare in constant time so prohibits time-based attacks.
-            const res = crypto.CRYPTO_memcmp(signed, @ptrCast(signature.ptr), signature.len);
-            return page.js.local.?.resolvePromise(res == 0);
-        }
-
-        return page.js.local.?.resolvePromise(false);
-    }
-
-    // X25519.
-
-    /// Create a pair of X25519.
-    fn initX25519(
-        extractable: bool,
-        key_usages: []const []const u8,
-        page: *Page,
-    ) !KeyOrPair {
-        // This code has too many allocations here and there, might be nice to
-        // gather them together with a single alloc call. Not sure if factory
-        // pattern is suitable for it though.
-
-        // Calculate usages; only matters for private key.
-        // Only deriveKey() and deriveBits() be used for X25519.
-        if (key_usages.len == 0) {
-            return error.SyntaxError;
-        }
-        var mask: u8 = 0;
-        iter_usages: for (key_usages) |usage| {
-            inline for ([_][]const u8{ "deriveKey", "deriveBits" }) |name| {
-                if (std.mem.eql(u8, name, usage)) {
-                    mask |= @field(Usages, name);
-                    continue :iter_usages;
-                }
-            }
-            // Unknown usage if got here.
-            return error.SyntaxError;
-        }
-
-        const public_value = try page.arena.alloc(u8, crypto.X25519_PUBLIC_VALUE_LEN);
-        errdefer page.arena.free(public_value);
-
-        const private_key = try page.arena.alloc(u8, crypto.X25519_PRIVATE_KEY_LEN);
-        errdefer page.arena.free(private_key);
-
-        // There's no info about whether this can fail; so I assume it cannot.
-        crypto.X25519_keypair(@ptrCast(public_value), @ptrCast(private_key));
-
-        // Create EVP_PKEY for public key.
-        // Seems we can use `EVP_PKEY_from_raw_private_key` for this, Chrome
-        // prefer not to, yet BoringSSL added it and recommends instead of what
-        // we're doing currently.
-        const public_pkey = crypto.EVP_PKEY_new_raw_public_key(
-            crypto.EVP_PKEY_X25519,
-            null,
-            public_value.ptr,
-            public_value.len,
-        );
-        if (public_pkey == null) {
-            return error.OutOfMemory;
-        }
-
-        // Create EVP_PKEY for private key.
-        // Seems we can use `EVP_PKEY_from_raw_private_key` for this, Chrome
-        // prefer not to, yet BoringSSL added it and recommends instead of what
-        // we're doing currently.
-        const private_pkey = crypto.EVP_PKEY_new_raw_private_key(
-            crypto.EVP_PKEY_X25519,
-            null,
-            private_key.ptr,
-            private_key.len,
-        );
-        if (private_pkey == null) {
-            return error.OutOfMemory;
-        }
-
-        const private = try page._factory.create(CryptoKey{
-            ._type = .x25519,
-            ._extractable = extractable,
-            ._usages = mask,
-            ._key = private_key,
-            ._vary = .{ .pkey = private_pkey.? },
-        });
-        errdefer page._factory.destroy(private);
-
-        const public = try page._factory.create(CryptoKey{
-            ._type = .x25519,
-            // Public keys are always extractable.
-            ._extractable = true,
-            // Always empty for public key.
-            ._usages = 0,
-            ._key = public_value,
-            ._vary = .{ .pkey = public_pkey.? },
-        });
-        errdefer page._factory.destroy(public);
-
-        return .{ .pair = .{ .privateKey = private, .publicKey = public } };
-    }
-
-    fn deriveBitsX25519(
-        private: *const CryptoKey,
-        public: *const CryptoKey,
-        length_in_bits: usize,
-        page: *Page,
-    ) !js.ArrayBuffer {
-        if (!private.canDeriveBits()) {
-            return error.InvalidAccessError;
-        }
-
-        const maybe_ctx = crypto.EVP_PKEY_CTX_new(private.getKeyObject(), null);
-        if (maybe_ctx) |ctx| {
-            // Context is valid, free it on failure.
-            errdefer crypto.EVP_PKEY_CTX_free(ctx);
-
-            // Init derive operation and set public key as peer.
-            if (crypto.EVP_PKEY_derive_init(ctx) != 1 or
-                crypto.EVP_PKEY_derive_set_peer(ctx, public.getKeyObject()) != 1)
-            {
-                // Failed on our end.
-                return error.Internal;
-            }
-
-            const derived_key = try page.call_arena.alloc(u8, 32);
-            errdefer page.call_arena.free(derived_key);
-
-            var out_key_len: usize = derived_key.len;
-            const result = crypto.EVP_PKEY_derive(ctx, derived_key.ptr, &out_key_len);
-            if (result != 1) {
-                // Failed on our end.
-                return error.Internal;
-            }
-            // Sanity check.
-            lp.assert(derived_key.len == out_key_len, "SubtleCrypto.deriveBitsX25519", .{});
-
-            // Length is in bits, convert to byte length.
-            const length = (length_in_bits / 8) + (7 + (length_in_bits % 8)) / 8;
-            // Truncate the slice to specified length.
-            // Same as `derived_key`.
-            const tailored = blk: {
-                if (length > derived_key.len) {
-                    return error.LengthTooLong;
-                }
-                break :blk derived_key[0..length];
-            };
-
-            // Zero any "unused bits" in the final byte.
-            const remainder_bits: u3 = @intCast(length_in_bits % 8);
-            if (remainder_bits != 0) {
-                tailored[tailored.len - 1] &= ~(@as(u8, 0xFF) >> remainder_bits);
-            }
-
-            return js.ArrayBuffer{ .values = tailored };
-        }
-
-        // Failed on our end.
-        return error.Internal;
-    }
-
-    pub const JsApi = struct {
-        pub const bridge = js.Bridge(CryptoKey);
-
-        pub const Meta = struct {
-            pub const name = "CryptoKey";
-
-            pub var class_id: bridge.ClassId = undefined;
-            pub const prototype_chain = bridge.prototypeChain();
-        };
-    };
-};
+    return local.resolvePromise(js.ArrayBuffer{ .values = out[0..out_size] });
+}
 
 pub const JsApi = struct {
     pub const bridge = js.Bridge(SubtleCrypto);

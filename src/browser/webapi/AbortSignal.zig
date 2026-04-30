@@ -17,12 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("../js/js.zig");
-const log = @import("../../log.zig");
+const lp = @import("lightpanda");
 
-const Page = @import("../Page.zig");
+const js = @import("../js/js.zig");
+
 const Event = @import("Event.zig");
 const EventTarget = @import("EventTarget.zig");
+
+const log = lp.log;
+const Execution = js.Execution;
 
 const AbortSignal = @This();
 
@@ -31,8 +34,8 @@ _aborted: bool = false,
 _reason: Reason = .undefined,
 _on_abort: ?js.Function.Global = null,
 
-pub fn init(page: *Page) !*AbortSignal {
-    return page._factory.eventTarget(AbortSignal{
+pub fn init(exec: *const Execution) !*AbortSignal {
+    return exec._factory.eventTarget(AbortSignal{
         ._proto = undefined,
     });
 }
@@ -57,7 +60,7 @@ pub fn asEventTarget(self: *AbortSignal) *EventTarget {
     return self._proto;
 }
 
-pub fn abort(self: *AbortSignal, reason_: ?Reason, page: *Page) !void {
+pub fn abort(self: *AbortSignal, reason_: ?Reason, exec: *const Execution) !void {
     if (self._aborted) {
         return;
     }
@@ -68,36 +71,40 @@ pub fn abort(self: *AbortSignal, reason_: ?Reason, page: *Page) !void {
     if (reason_) |reason| {
         switch (reason) {
             .js_val => |js_val| self._reason = .{ .js_val = js_val },
-            .string => |str| self._reason = .{ .string = try page.dupeString(str) },
+            .string => |str| self._reason = .{ .string = try exec.dupeString(str) },
             .undefined => self._reason = reason,
         }
     } else {
         self._reason = .{ .string = "AbortError" };
     }
 
-    // Dispatch abort event
     const target = self.asEventTarget();
-    if (page._event_manager.hasDirectListeners(target, "abort", self._on_abort)) {
-        const event = try Event.initTrusted(comptime .wrap("abort"), .{}, page);
-        try page._event_manager.dispatchDirect(target, event, self._on_abort, .{ .context = "abort signal" });
+    const on_abort = self._on_abort;
+    switch (exec.context.global) {
+        inline else => |g| {
+            if (g._event_manager.hasDirectListeners(target, "abort", on_abort)) {
+                const event = try Event.initTrusted(comptime .wrap("abort"), .{}, g._page);
+                try g.dispatch(target, event, on_abort, .{ .context = "abort signal" });
+            }
+        },
     }
 }
 
 // Static method to create an already-aborted signal
-pub fn createAborted(reason_: ?js.Value.Global, page: *Page) !*AbortSignal {
-    const signal = try init(page);
-    try signal.abort(if (reason_) |r| .{ .js_val = r } else null, page);
+pub fn createAborted(reason_: ?js.Value.Global, exec: *const Execution) !*AbortSignal {
+    const signal = try init(exec);
+    try signal.abort(if (reason_) |r| .{ .js_val = r } else null, exec);
     return signal;
 }
 
-pub fn createTimeout(delay: u32, page: *Page) !*AbortSignal {
-    const callback = try page.arena.create(TimeoutCallback);
+pub fn createTimeout(delay: u32, exec: *const Execution) !*AbortSignal {
+    const callback = try exec.arena.create(TimeoutCallback);
     callback.* = .{
-        .page = page,
-        .signal = try init(page),
+        .exec = exec,
+        .signal = try init(exec),
     };
 
-    try page.js.scheduler.add(callback, TimeoutCallback.run, delay, .{
+    try exec._scheduler.add(callback, TimeoutCallback.run, delay, .{
         .name = "AbortSignal.timeout",
     });
 
@@ -108,8 +115,8 @@ const ThrowIfAborted = union(enum) {
     exception: js.Exception,
     undefined: void,
 };
-pub fn throwIfAborted(self: *const AbortSignal, page: *Page) !ThrowIfAborted {
-    const local = page.js.local.?;
+pub fn throwIfAborted(self: *const AbortSignal, exec: *const Execution) !ThrowIfAborted {
+    const local = exec.context.local.?;
 
     if (self._aborted) {
         const exception = switch (self._reason) {
@@ -129,12 +136,12 @@ const Reason = union(enum) {
 };
 
 const TimeoutCallback = struct {
-    page: *Page,
+    exec: *const Execution,
     signal: *AbortSignal,
 
     fn run(ctx: *anyopaque) !?u32 {
         const self: *TimeoutCallback = @ptrCast(@alignCast(ctx));
-        self.signal.abort(.{ .string = "TimeoutError" }, self.page) catch |err| {
+        self.signal.abort(.{ .string = "TimeoutError" }, self.exec) catch |err| {
             log.warn(.app, "abort signal timeout", .{ .err = err });
         };
         return null;

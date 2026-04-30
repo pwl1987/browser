@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../testing.js"></script>
+<body></body>
 
 <script id=window>
   testing.expectEqual(window, globalThis);
@@ -43,7 +44,7 @@
 
   // noop
   window.removeEventListener('load', fn);
-  testing.eventually(() => {
+  testing.onload(() => {
     testing.expectEqual(1, call1);
     testing.expectEqual(2, call2);
   });
@@ -82,7 +83,7 @@
   testing.expectEqual('ceil', atob('Y2VpbA'));  // 6 chars, len%4==2, needs '=='
 
   // length % 4 == 1 must still throw
-  testing.expectError('InvalidCharacterError: Invalid Character', () => {
+  testing.expectError('InvalidCharacterError', () => {
     atob('Y');
   });
 </script>
@@ -260,6 +261,53 @@
     }
     testing.expectEqual(true, threw);
   }
+
+  // Host objects (DOM elements) cannot be cloned - should throw, not crash
+  {
+    let threw = false;
+    try {
+      structuredClone(document.body);
+    } catch (err) {
+      threw = true;
+    }
+    testing.expectEqual(true, threw);
+  }
+
+  // Objects containing host objects cannot be cloned - should throw, not crash
+  {
+    let threw = false;
+    try {
+      structuredClone({ element: document.body });
+    } catch (err) {
+      threw = true;
+    }
+    testing.expectEqual(true, threw);
+  }
+</script>
+
+<script id=cached_getter_wrong_this>
+  // Test that extracting a cached property getter and calling it with wrong `this`
+  // doesn't crash (V8 internal field out of bounds). V8's Signature validation
+  // should throw "Illegal invocation" for wrong receiver types.
+  const documentGetter = Object.getOwnPropertyDescriptor(Window.prototype, 'document').get;
+
+  // Verify we get an error with wrong this values
+  let errorCount = 0;
+  const testValues = [{}, null, undefined, 42, 'string', [], () => {}];
+  for (const val of testValues) {
+    try {
+      documentGetter.call(val);
+    } catch (e) {
+      if (e.message.includes('Illegal invocation')) {
+        errorCount++;
+      }
+    }
+  }
+  // At least some should throw (null/undefined/primitives get coerced in sloppy mode)
+  testing.expectEqual(true, errorCount > 0);
+
+  // Calling with correct this should still work
+  testing.expectEqual(document, documentGetter.call(window));
 </script>
 
 <script id=unhandled_rejection>
@@ -285,6 +333,6 @@
       unhandledCalled += 1;
     });
     Promise.reject({x: 'Fail'});
-    testing.eventually(() => testing.expectEqual(2, unhandledCalled));
+    testing.onload(() => testing.expectEqual(2, unhandledCalled));
   }
 </script>

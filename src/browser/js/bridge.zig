@@ -17,17 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("js.zig");
 const lp = @import("lightpanda");
-const log = @import("../../log.zig");
-const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
+
+const js = @import("js.zig");
+const Frame = @import("../Frame.zig");
 
 const v8 = js.v8;
 
 const Caller = @import("Caller.zig");
 const Context = @import("Context.zig");
-const Origin = @import("Origin.zig");
 
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
@@ -105,57 +103,40 @@ pub fn Builder(comptime T: type) type {
             }
             return entries;
         }
-
-        pub fn finalizer(comptime func: *const fn (self: *T, shutdown: bool, session: *Session) void) Finalizer {
-            return .{
-                .from_zig = struct {
-                    fn wrap(ptr: *anyopaque, session: *Session) void {
-                        func(@ptrCast(@alignCast(ptr)), true, session);
-                    }
-                }.wrap,
-
-                .from_v8 = struct {
-                    fn wrap(handle: ?*const v8.WeakCallbackInfo) callconv(.c) void {
-                        const ptr = v8.v8__WeakCallbackInfo__GetParameter(handle.?).?;
-                        const fc: *Origin.FinalizerCallback = @ptrCast(@alignCast(ptr));
-
-                        const origin = fc.origin;
-                        const value_ptr = fc.ptr;
-                        if (origin.finalizer_callbacks.contains(@intFromPtr(value_ptr))) {
-                            func(@ptrCast(@alignCast(value_ptr)), false, fc.session);
-                            origin.release(value_ptr);
-                        } else {
-                            // A bit weird, but v8 _requires_ that we release it
-                            // If we don't. We'll 100% crash.
-                            v8.v8__Global__Reset(&fc.global);
-                        }
-                    }
-                }.wrap,
-            };
-        }
     };
 }
 
 pub const Constructor = struct {
+    arity: c_int,
     func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
 
     const Opts = struct {
         dom_exception: bool = false,
+        // When true, the constructor function receives `new.target` (as a
+        // js.Function) as its first parameter. Used by HTMLElement to support
+        // direct instantiation of custom elements via `new MyElement()`.
+        new_target: bool = false,
     };
 
     fn init(comptime T: type, comptime func: anytype, comptime opts: Opts) Constructor {
-        return .{ .func = struct {
-            fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
-                const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
-                var caller: Caller = undefined;
-                caller.init(v8_isolate);
-                defer caller.deinit();
+        return .{
+            .arity = comptime Function.getArity(@TypeOf(func), if (opts.new_target) 1 else 0),
+            .func = struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return;
+                    }
+                    defer caller.deinit();
 
-                caller.constructor(T, func, handle.?, .{
-                    .dom_exception = opts.dom_exception,
-                });
-            }
-        }.wrap };
+                    caller.constructor(T, func, handle.?, .{
+                        .dom_exception = opts.dom_exception,
+                        .new_target = opts.new_target,
+                    });
+                }
+            }.wrap,
+        };
     }
 };
 
@@ -163,6 +144,7 @@ pub const Function = struct {
     static: bool,
     arity: usize,
     noop: bool = false,
+    wpt_only: bool = false,
     cache: ?Caller.Function.Opts.Caching = null,
     func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
 
@@ -170,7 +152,8 @@ pub const Function = struct {
         return .{
             .cache = opts.cache,
             .static = opts.static,
-            .arity = getArity(@TypeOf(func)),
+            .wpt_only = opts.wpt_only,
+            .arity = getArity(@TypeOf(func), 1),
             .func = if (opts.noop) noopFunction else struct {
                 fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
                     Caller.Function.call(T, handle.?, func, opts);
@@ -181,14 +164,32 @@ pub const Function = struct {
 
     pub fn noopFunction(_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {}
 
-    fn getArity(comptime T: type) usize {
+    fn getArity(comptime T: type, comptime start: usize) usize {
+        const Execution = js.Execution;
+
+        const Page = @import("../Page.zig");
+        const Session = @import("../Session.zig");
+
         var count: usize = 0;
         var params = @typeInfo(T).@"fn".params;
-        for (params[1..]) |p| { // start at 1, skip self
+        for (params[start..]) |p| { // start at 1, skip self
             const PT = p.type.?;
+            if (PT == *Frame or PT == *const Frame) {
+                break;
+            }
+
             if (PT == *Page or PT == *const Page) {
                 break;
             }
+
+            if (PT == *Execution or PT == *const Execution) {
+                break;
+            }
+
+            if (PT == *Session or PT == *const Session) {
+                break;
+            }
+
             if (@typeInfo(PT) == .optional) {
                 break;
             }
@@ -200,6 +201,8 @@ pub const Function = struct {
 
 pub const Accessor = struct {
     static: bool = false,
+    deletable: bool = true,
+    wpt_only: bool = false,
     cache: ?Caller.Function.Opts.Caching = null,
     getter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
     setter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
@@ -208,6 +211,8 @@ pub const Accessor = struct {
         var accessor = Accessor{
             .cache = opts.cache,
             .static = opts.static,
+            .wpt_only = opts.wpt_only,
+            .deletable = opts.deletable,
         };
 
         if (@typeInfo(@TypeOf(getter)) != .null) {
@@ -246,7 +251,9 @@ pub const Indexed = struct {
                 fn wrap(idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                     const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                     var caller: Caller = undefined;
-                    caller.init(v8_isolate);
+                    if (!caller.init(v8_isolate)) {
+                        return 0;
+                    }
                     defer caller.deinit();
 
                     return caller.getIndex(T, getter, idx, handle.?, .{
@@ -262,7 +269,9 @@ pub const Indexed = struct {
                 fn wrap(handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                     const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                     var caller: Caller = undefined;
-                    caller.init(v8_isolate);
+                    if (!caller.init(v8_isolate)) {
+                        return 0;
+                    }
                     defer caller.deinit();
                     return caller.getEnumerator(T, enumerator, handle.?, .{});
                 }
@@ -288,7 +297,9 @@ pub const NamedIndexed = struct {
             fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                 const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return 0;
+                }
                 defer caller.deinit();
 
                 return caller.getNamedIndex(T, getter, c_name.?, handle.?, .{
@@ -302,7 +313,9 @@ pub const NamedIndexed = struct {
             fn wrap(c_name: ?*const v8.Name, c_value: ?*const v8.Value, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                 const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return 0;
+                }
                 defer caller.deinit();
 
                 return caller.setNamedIndex(T, setter, c_name.?, c_value.?, handle.?, .{
@@ -316,7 +329,9 @@ pub const NamedIndexed = struct {
             fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                 const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return 0;
+                }
                 defer caller.deinit();
 
                 return caller.deleteNamedIndex(T, deleter, c_name.?, handle.?, .{
@@ -414,21 +429,17 @@ pub const Property = struct {
     }
 };
 
-const Finalizer = struct {
-    // The finalizer wrapper when called from Zig. This is only called on
-    // Origin.deinit
-    from_zig: *const fn (ctx: *anyopaque, session: *Session) void,
-
-    // The finalizer wrapper when called from V8. This may never be called
-    // (hence why we fallback to calling in Origin.deinit). If it is called,
-    // it is only ever called after we SetWeak on the Global.
-    from_v8: *const fn (?*const v8.WeakCallbackInfo) callconv(.c) void,
-};
-
 pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
     const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+
+    // During snapshot creation, there's no Context in embedder data yet.
+    // I hate this check, but there doesn't seem to be a way to add this method
+    // to the global, without triggering it during snapshot creation.
+    const v8_context = v8.v8__Isolate__GetCurrentContext(v8_isolate) orelse return 0;
+    const ctx: *Context = @ptrCast(@alignCast(v8.v8__Context__GetAlignedPointerFromEmbedderData(v8_context, 1) orelse return 0));
+
     var caller: Caller = undefined;
-    caller.init(v8_isolate);
+    caller.initWithContext(ctx, v8_context);
     defer caller.deinit();
 
     const local = &caller.local;
@@ -441,14 +452,18 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
         return 0;
     };
 
-    const page = local.ctx.page;
-    const document = page.document;
-
-    if (document.getElementById(property, page)) |el| {
-        const js_val = local.zigValueToJs(el, .{}) catch return 0;
-        var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
-        pc.getReturnValue().set(js_val);
-        return 1;
+    // Only Page contexts have document.getElementById lookup
+    switch (local.ctx.global) {
+        .frame => |frame| {
+            const document = frame.document;
+            if (document.getElementById(property, frame)) |el| {
+                const js_val = local.zigValueToJs(el, .{}) catch return 0;
+                var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
+                pc.getReturnValue().set(js_val);
+                return 1;
+            }
+        },
+        .worker => {}, // no global lookup in a worker
     }
 
     if (comptime IS_DEBUG) {
@@ -486,7 +501,8 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
             .{ "ApplePaySession", {} },
         });
         if (!ignored.has(property)) {
-            const key = std.fmt.bufPrint(&local.ctx.page.buf, "Window:{s}", .{property}) catch return 0;
+            var buf: [2048]u8 = undefined;
+            const key = std.fmt.bufPrint(&buf, "Window:{s}", .{property}) catch return 0;
             logUnknownProperty(local, key) catch return 0;
         }
     }
@@ -506,7 +522,9 @@ pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8
             const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
 
             var caller: Caller = undefined;
-            caller.init(v8_isolate);
+            if (!caller.init(v8_isolate)) {
+                return 0;
+            }
             defer caller.deinit();
 
             const local = &caller.local;
@@ -549,7 +567,8 @@ pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8
 
             const ignored = std.StaticStringMap(void).initComptime(.{});
             if (!ignored.has(property)) {
-                const key = std.fmt.bufPrint(&local.ctx.page.buf, "{s}:{s}", .{ if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi), property }) catch return 0;
+                var buf: [2048]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "{s}:{s}", .{ if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi), property }) catch return 0;
                 logUnknownProperty(local, key) catch return 0;
             }
             // not intercepted
@@ -714,7 +733,8 @@ pub const SubType = enum {
     webassemblymemory,
 };
 
-pub const JsApis = flattenTypes(&.{
+// APIs for Page/Window contexts. Used by Snapshot.zig for Page snapshot creation.
+pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/AbortController.zig"),
     @import("../webapi/AbortSignal.zig"),
     @import("../webapi/CData.zig"),
@@ -725,6 +745,8 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/collections.zig"),
     @import("../webapi/Console.zig"),
     @import("../webapi/Crypto.zig"),
+    @import("../webapi/Permissions.zig"),
+    @import("../webapi/StorageManager.zig"),
     @import("../webapi/CSS.zig"),
     @import("../webapi/css/CSSRule.zig"),
     @import("../webapi/css/CSSRuleList.zig"),
@@ -778,6 +800,7 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/element/html/Embed.zig"),
     @import("../webapi/element/html/FieldSet.zig"),
     @import("../webapi/element/html/Font.zig"),
+    @import("../webapi/element/html/FrameSet.zig"),
     @import("../webapi/element/html/Form.zig"),
     @import("../webapi/element/html/Generic.zig"),
     @import("../webapi/element/html/Head.zig"),
@@ -848,9 +871,13 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/event/FocusEvent.zig"),
     @import("../webapi/event/WheelEvent.zig"),
     @import("../webapi/event/TextEvent.zig"),
+    @import("../webapi/event/InputEvent.zig"),
     @import("../webapi/event/PromiseRejectionEvent.zig"),
+    @import("../webapi/event/SubmitEvent.zig"),
+    @import("../webapi/event/FormDataEvent.zig"),
     @import("../webapi/MessageChannel.zig"),
     @import("../webapi/MessagePort.zig"),
+    @import("../webapi/Worker.zig"),
     @import("../webapi/media/MediaError.zig"),
     @import("../webapi/media/TextTrackCue.zig"),
     @import("../webapi/media/VTTCue.zig"),
@@ -858,6 +885,7 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/EventTarget.zig"),
     @import("../webapi/Location.zig"),
     @import("../webapi/Navigator.zig"),
+    @import("../webapi/NavigatorUAData.zig"),
     @import("../webapi/net/FormData.zig"),
     @import("../webapi/net/Headers.zig"),
     @import("../webapi/net/Request.zig"),
@@ -865,6 +893,8 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/net/URLSearchParams.zig"),
     @import("../webapi/net/XMLHttpRequest.zig"),
     @import("../webapi/net/XMLHttpRequestEventTarget.zig"),
+    @import("../webapi/net/WebSocket.zig"),
+    @import("../webapi/event/CloseEvent.zig"),
     @import("../webapi/streams/ReadableStream.zig"),
     @import("../webapi/streams/ReadableStreamDefaultReader.zig"),
     @import("../webapi/streams/ReadableStreamDefaultController.zig"),
@@ -877,6 +907,7 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/URL.zig"),
     @import("../webapi/Window.zig"),
     @import("../webapi/Performance.zig"),
+    @import("../webapi/EventCounts.zig"),
     @import("../webapi/PluginArray.zig"),
     @import("../webapi/MutationObserver.zig"),
     @import("../webapi/IntersectionObserver.zig"),
@@ -898,6 +929,53 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/canvas/OffscreenCanvas.zig"),
     @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
     @import("../webapi/SubtleCrypto.zig"),
+    @import("../webapi/CryptoKey.zig"),
     @import("../webapi/Selection.zig"),
     @import("../webapi/ImageData.zig"),
 });
+
+// APIs available on Worker context globals (constructors like URL, Headers, etc.)
+// This is a subset of PageJsApis plus WorkerGlobalScope.
+// TODO: Expand this list to include all worker-appropriate APIs.
+pub const WorkerJsApis = flattenTypes(&.{
+    @import("../webapi/WorkerGlobalScope.zig"),
+    @import("../webapi/EventTarget.zig"),
+    @import("../webapi/DOMException.zig"),
+    @import("../webapi/net/URLSearchParams.zig"),
+    @import("../webapi/encoding/TextEncoder.zig"),
+    @import("../webapi/encoding/TextDecoder.zig"),
+    @import("../webapi/Blob.zig"),
+    @import("../webapi/File.zig"),
+    @import("../webapi/Console.zig"),
+    @import("../webapi/Crypto.zig"),
+    @import("../webapi/net/FormData.zig"),
+    @import("../webapi/net/Headers.zig"),
+    @import("../webapi/net/Request.zig"),
+    @import("../webapi/net/Response.zig"),
+    @import("../webapi/streams/TransformStream.zig"),
+    @import("../webapi/streams/ReadableStream.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultReader.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultController.zig"),
+    @import("../webapi/streams/WritableStream.zig"),
+    @import("../webapi/streams/WritableStreamDefaultWriter.zig"),
+    @import("../webapi/streams/WritableStreamDefaultController.zig"),
+    @import("../webapi/encoding/TextEncoderStream.zig"),
+    @import("../webapi/encoding/TextDecoderStream.zig"),
+    @import("../webapi/AbortSignal.zig"),
+    @import("../webapi/AbortController.zig"),
+    @import("../webapi/URL.zig"),
+    @import("../webapi/canvas/OffscreenCanvas.zig"),
+    // @import("../webapi/Performance.zig"),
+});
+
+// Master list of ALL JS APIs across all contexts.
+// Used by Env (class IDs, templates), JsApiLookup, and anywhere that needs
+// to know about all possible types. Individual snapshots use their own
+// subsets (PageJsApis, WorkerSnapshot.JsApis).
+pub const JsApis = blk: {
+    const base = PageJsApis ++ [_]type{@import("../webapi/WorkerGlobalScope.zig").JsApi};
+    if (lp.build_config.wpt_extensions == false) {
+        break :blk base;
+    }
+    break :blk base ++ [_]type{@import("../webapi/WebDriver.zig").JsApi};
+};

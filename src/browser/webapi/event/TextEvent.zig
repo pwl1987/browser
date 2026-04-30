@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 const UIEvent = @import("UIEvent.zig");
+
+const String = lp.String;
 
 const TextEvent = @This();
 
@@ -39,14 +41,14 @@ pub const Options = Event.inheritOptions(
     TextEventOptions,
 );
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*TextEvent {
-    const arena = try page.getArena(.{ .debug = "TextEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*TextEvent {
+    const arena = try frame.getArena(.tiny, "TextEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
 
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.uiEvent(
+    const event = try frame._factory.uiEvent(
         arena,
         type_string,
         TextEvent{
@@ -57,10 +59,6 @@ pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*TextEvent {
 
     Event.populatePrototypes(event, opts, false);
     return event;
-}
-
-pub fn deinit(self: *TextEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *TextEvent) *Event {
@@ -74,24 +72,23 @@ pub fn getData(self: *const TextEvent) []const u8 {
 pub fn initTextEvent(
     self: *TextEvent,
     typ: []const u8,
-    bubbles: bool,
-    cancelable: bool,
+    bubbles: ?bool,
+    cancelable: ?bool,
     view: ?*@import("../Window.zig"),
-    data: []const u8,
+    data: ?[]const u8,
 ) !void {
-    _ = view; // view parameter is ignored in modern implementations
-
-    const event = self._proto._proto;
+    const ui = self._proto;
+    const event = ui._proto;
     if (event._event_phase != .none) {
-        // Only allow initialization if event hasn't been dispatched
         return;
     }
 
     const arena = event._arena;
     event._type_string = try String.init(arena, typ, .{});
-    event._bubbles = bubbles;
-    event._cancelable = cancelable;
-    self._data = try arena.dupe(u8, data);
+    event._bubbles = bubbles orelse false;
+    event._cancelable = cancelable orelse false;
+    ui._view = view;
+    self._data = if (data) |d| try arena.dupe(u8, d) else "";
 }
 
 pub const JsApi = struct {
@@ -101,8 +98,6 @@ pub const JsApi = struct {
         pub const name = "TextEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(TextEvent.deinit);
     };
 
     // No constructor - TextEvent is created via document.createEvent('TextEvent')

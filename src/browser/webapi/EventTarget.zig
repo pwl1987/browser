@@ -21,9 +21,10 @@ const js = @import("../js/js.zig");
 
 const Page = @import("../Page.zig");
 const EventManager = @import("../EventManager.zig");
-const RegisterOptions = EventManager.RegisterOptions;
 
 const Event = @import("Event.zig");
+
+const RegisterOptions = EventManager.RegisterOptions;
 
 const EventTarget = @This();
 
@@ -34,6 +35,8 @@ pub const Type = union(enum) {
     generic: void,
     node: *@import("Node.zig"),
     window: *@import("Window.zig"),
+    worker: *@import("Worker.zig"),
+    worker_global_scope: *@import("WorkerGlobalScope.zig"),
     xhr: *@import("net/XMLHttpRequestEventTarget.zig"),
     abort_signal: *@import("AbortSignal.zig"),
     media_query_list: *@import("css/MediaQueryList.zig"),
@@ -45,23 +48,29 @@ pub const Type = union(enum) {
     visual_viewport: *@import("VisualViewport.zig"),
     file_reader: *@import("FileReader.zig"),
     font_face_set: *@import("css/FontFaceSet.zig"),
+    websocket: *@import("net/WebSocket.zig"),
 };
 
 pub fn init(page: *Page) !*EventTarget {
-    return page._factory.create(EventTarget{
+    return page.factory.create(EventTarget{
         ._type = .generic,
     });
 }
 
-pub fn dispatchEvent(self: *EventTarget, event: *Event, page: *Page) !bool {
+pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bool {
     if (event._event_phase != .none) {
         return error.InvalidStateError;
     }
     event._is_trusted = false;
 
-    event.acquireRef();
-    defer event.deinit(false, page._session);
-    try page._event_manager.dispatch(self, event);
+    switch (exec.context.global) {
+        .frame => |frame| {
+            event.acquireRef();
+            defer _ = event.releaseRef(frame._page);
+            try frame._event_manager.dispatch(self, event);
+        },
+        .worker => |wgs| try wgs.dispatch(self, event, null, .{}),
+    }
     return !event._cancelable or !event._prevent_default;
 }
 
@@ -74,12 +83,12 @@ pub const EventListenerCallback = union(enum) {
     function: js.Function,
     object: js.Object,
 };
-pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?AddEventListenerOptions, page: *Page) !void {
+pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?AddEventListenerOptions, exec: *js.Execution) !void {
     const callback = callback_ orelse return;
 
-    const em_callback = switch (callback) {
-        .object => |obj| EventManager.Callback{ .object = obj },
-        .function => |func| EventManager.Callback{ .function = func },
+    const em_callback: EventManager.Callback = switch (callback) {
+        .object => |obj| .{ .object = obj },
+        .function => |func| .{ .function = func },
     };
 
     const options = blk: {
@@ -89,7 +98,10 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventLi
             .capture => |capture| RegisterOptions{ .capture = capture },
         };
     };
-    return page._event_manager.register(self, typ, em_callback, options);
+
+    switch (exec.context.global) {
+        inline else => |g| _ = try g._event_manager.register(self, typ, em_callback, options),
+    }
 }
 
 const RemoveEventListenerOptions = union(enum) {
@@ -100,7 +112,7 @@ const RemoveEventListenerOptions = union(enum) {
         capture: bool = false,
     };
 };
-pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?RemoveEventListenerOptions, page: *Page) !void {
+pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?RemoveEventListenerOptions, exec: *js.Execution) !void {
     const callback = callback_ orelse return;
 
     // For object callbacks, check if handleEvent exists
@@ -110,9 +122,9 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: ?Even
         }
     }
 
-    const em_callback = switch (callback) {
-        .function => |func| EventManager.Callback{ .function = func },
-        .object => |obj| EventManager.Callback{ .object = obj },
+    const em_callback: EventManager.Callback = switch (callback) {
+        .function => |func| .{ .function = func },
+        .object => |obj| .{ .object = obj },
     };
 
     const use_capture = blk: {
@@ -122,7 +134,10 @@ pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: ?Even
             .options => |opts| opts.capture,
         };
     };
-    return page._event_manager.remove(self, typ, em_callback, use_capture);
+
+    switch (exec.context.global) {
+        inline else => |g| g._event_manager.remove(self, typ, em_callback, use_capture),
+    }
 }
 
 pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
@@ -130,6 +145,8 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
         .node => |n| n.format(writer),
         .generic => writer.writeAll("<EventTarget>"),
         .window => writer.writeAll("<Window>"),
+        .worker => writer.writeAll("<Worker>"),
+        .worker_global_scope => writer.writeAll("<WorkerGlobalScope>"),
         .xhr => writer.writeAll("<XMLHttpRequestEventTarget>"),
         .abort_signal => writer.writeAll("<AbortSignal>"),
         .media_query_list => writer.writeAll("<MediaQueryList>"),
@@ -141,6 +158,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
         .visual_viewport => writer.writeAll("<VisualViewport>"),
         .file_reader => writer.writeAll("<FileReader>"),
         .font_face_set => writer.writeAll("<FontFaceSet>"),
+        .websocket => writer.writeAll("<WebSocket>"),
     };
 }
 
@@ -149,6 +167,8 @@ pub fn toString(self: *EventTarget) []const u8 {
         .node => return "[object Node]",
         .generic => return "[object EventTarget]",
         .window => return "[object Window]",
+        .worker => return "[object Worker]",
+        .worker_global_scope => return "[object WorkerGlobalScope]",
         .xhr => return "[object XMLHttpRequestEventTarget]",
         .abort_signal => return "[object AbortSignal]",
         .media_query_list => return "[object MediaQueryList]",
@@ -160,6 +180,7 @@ pub fn toString(self: *EventTarget) []const u8 {
         .visual_viewport => return "[object VisualViewport]",
         .file_reader => return "[object FileReader]",
         .font_face_set => return "[object FontFaceSet]",
+        .websocket => return "[object WebSocket]",
     };
 }
 
@@ -182,7 +203,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: EventTarget" {
-    // we create thousands of these per page. Nothing should bloat it.
+    // we create thousands of these per frame. Nothing should bloat it.
     try testing.expectEqual(16, @sizeOf(EventTarget));
     try testing.htmlRunner("events.html", .{});
 }

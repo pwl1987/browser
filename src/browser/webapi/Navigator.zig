@@ -17,23 +17,34 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
+
 const js = @import("../js/js.zig");
-const Page = @import("../Page.zig");
+const Frame = @import("../Frame.zig");
+
 const PluginArray = @import("PluginArray.zig");
+const Permissions = @import("Permissions.zig");
+const StorageManager = @import("StorageManager.zig");
+const NavigatorUAData = @import("NavigatorUAData.zig");
+
+const log = lp.log;
 
 const Navigator = @This();
 _pad: bool = false,
 _plugins: PluginArray = .{},
+_permissions: Permissions = .{},
+_storage: StorageManager = .{},
+_ua_data: NavigatorUAData = .{},
 
 pub const init: Navigator = .{};
 
-pub fn getUserAgent(_: *const Navigator, page: *Page) []const u8 {
-    return page._session.browser.app.config.http_headers.user_agent;
+pub fn getUserAgent(_: *const Navigator, frame: *Frame) []const u8 {
+    return frame._session.browser.http_client.getUserAgent();
 }
 
-pub fn getLanguages(_: *const Navigator) [1][]const u8 {
-    return .{"en-US"};
+pub fn getLanguages(_: *const Navigator) [2][]const u8 {
+    return .{ "en-US", "en" };
 }
 
 pub fn getPlatform(_: *const Navigator) []const u8 {
@@ -55,13 +66,30 @@ pub fn getPlugins(self: *Navigator) *PluginArray {
     return &self._plugins;
 }
 
-pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {
-    try validateProtocolHandlerScheme(scheme);
-    try validateProtocolHandlerURL(url, page);
+pub fn getPermissions(self: *Navigator) *Permissions {
+    return &self._permissions;
 }
-pub fn unregisterProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {
+
+pub fn getStorage(self: *Navigator) *StorageManager {
+    return &self._storage;
+}
+
+pub fn getUserAgentData(self: *Navigator) *NavigatorUAData {
+    return &self._ua_data;
+}
+
+pub fn getBattery(_: *const Navigator, frame: *Frame) !js.Promise {
+    log.info(.not_implemented, "navigator.getBattery", .{});
+    return frame.js.local.?.rejectErrorPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
+}
+
+pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, frame: *const Frame) !void {
     try validateProtocolHandlerScheme(scheme);
-    try validateProtocolHandlerURL(url, page);
+    try validateProtocolHandlerURL(url, frame);
+}
+pub fn unregisterProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, frame: *const Frame) !void {
+    try validateProtocolHandlerScheme(scheme);
+    try validateProtocolHandlerURL(url, frame);
 }
 
 fn validateProtocolHandlerScheme(scheme: []const u8) !void {
@@ -114,11 +142,11 @@ fn validateProtocolHandlerScheme(scheme: []const u8) !void {
     }
 }
 
-fn validateProtocolHandlerURL(url: [:0]const u8, page: *const Page) !void {
+fn validateProtocolHandlerURL(url: [:0]const u8, frame: *const Frame) !void {
     if (std.mem.indexOf(u8, url, "%s") == null) {
         return error.SyntaxError;
     }
-    if (try page.isSameOrigin(url) == false) {
+    if (frame.isSameOrigin(url) == false) {
         return error.SyntaxError;
     }
 }
@@ -144,6 +172,7 @@ pub const JsApi = struct {
     pub const onLine = bridge.property(true, .{ .template = false });
     pub const cookieEnabled = bridge.property(true, .{ .template = false });
     pub const hardwareConcurrency = bridge.property(4, .{ .template = false });
+    pub const deviceMemory = bridge.property(@as(f64, 8.0), .{ .template = false });
     pub const maxTouchPoints = bridge.property(0, .{ .template = false });
     pub const vendor = bridge.property("", .{ .template = false });
     pub const product = bridge.property("Gecko", .{ .template = false });
@@ -156,4 +185,13 @@ pub const JsApi = struct {
 
     // Methods
     pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{});
+    pub const getBattery = bridge.function(Navigator.getBattery, .{});
+    pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
+    pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
+    pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
 };
+
+const testing = @import("../../testing.zig");
+test "WebApi: Navigator" {
+    try testing.htmlRunner("navigator", .{});
+}

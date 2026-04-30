@@ -17,14 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
-const log = @import("../../log.zig");
+const CDP = @import("../CDP.zig");
 const URL = @import("../../browser/URL.zig");
 const Cookie = @import("../../browser/webapi/storage/storage.zig").Cookie;
+
+const log = lp.log;
 const CookieJar = Cookie.Jar;
 pub const PreparedUri = Cookie.PreparedUri;
 
-pub fn processMessage(cmd: anytype) !void {
+pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         clearCookies,
         setCookies,
@@ -40,7 +43,7 @@ pub fn processMessage(cmd: anytype) !void {
 
 const BrowserContextParam = struct { browserContextId: ?[]const u8 = null };
 
-fn clearCookies(cmd: anytype) !void {
+fn clearCookies(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const params = (try cmd.params(BrowserContextParam)) orelse BrowserContextParam{};
 
@@ -55,7 +58,7 @@ fn clearCookies(cmd: anytype) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn getCookies(cmd: anytype) !void {
+fn getCookies(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const params = (try cmd.params(BrowserContextParam)) orelse BrowserContextParam{};
 
@@ -69,7 +72,7 @@ fn getCookies(cmd: anytype) !void {
     try cmd.sendResult(.{ .cookies = writer }, .{});
 }
 
-fn setCookies(cmd: anytype) !void {
+fn setCookies(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const params = (try cmd.params(struct {
         cookies: []const CdpCookie,
@@ -129,7 +132,7 @@ pub const CdpCookie = struct {
 
 pub fn setCdpCookie(cookie_jar: *CookieJar, param: CdpCookie) !void {
     // Silently ignore partitionKey since we don't support partitioned cookies (CHIPS).
-    // This allows Puppeteer's page.setCookie() to work, which may send cookies with
+    // This allows Puppeteer's frame.setCookie() to work, which may send cookies with
     // partitionKey as part of its cookie-setting workflow.
     if (param.partitionKey != null) {
         log.warn(.not_implemented, "partition key", .{ .src = "setCdpCookie" });
@@ -164,7 +167,7 @@ pub fn setCdpCookie(cookie_jar: *CookieJar, param: CdpCookie) !void {
             .None => .none,
         },
     };
-    try cookie_jar.add(cookie, std.time.timestamp());
+    try cookie_jar.add(cookie, std.time.timestamp(), true);
 }
 
 pub const CookieWriter = struct {
@@ -243,7 +246,7 @@ pub fn writeCookie(cookie: *const Cookie, w: anytype) !void {
 const testing = @import("../testing.zig");
 
 test "cdp.Storage: cookies" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
     _ = try ctx.loadBrowserContext(.{ .id = "BID-S" });
 

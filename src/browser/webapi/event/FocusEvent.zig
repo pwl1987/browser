@@ -17,15 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const String = @import("../../../string.zig").String;
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 const EventTarget = @import("../EventTarget.zig");
 const UIEvent = @import("UIEvent.zig");
+
+const String = lp.String;
+const Allocator = std.mem.Allocator;
 
 const FocusEvent = @This();
 
@@ -41,23 +43,23 @@ pub const Options = Event.inheritOptions(
     FocusEventOptions,
 );
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*FocusEvent {
-    const arena = try page.getArena(.{ .debug = "FocusEvent.trusted" });
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*FocusEvent {
+    const arena = try frame.getArena(.tiny, "FocusEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*FocusEvent {
-    const arena = try page.getArena(.{ .debug = "FocusEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*FocusEvent {
+    const arena = try frame.getArena(.tiny, "FocusEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, _opts, false, page);
+    return initWithTrusted(arena, type_string, _opts, false, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*FocusEvent {
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*FocusEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.uiEvent(
+    const event = try frame._factory.uiEvent(
         arena,
         typ,
         FocusEvent{
@@ -68,10 +70,6 @@ fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool
 
     Event.populatePrototypes(event, opts, trusted);
     return event;
-}
-
-pub fn deinit(self: *FocusEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *FocusEvent) *Event {
@@ -89,8 +87,6 @@ pub const JsApi = struct {
         pub const name = "FocusEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(FocusEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(FocusEvent.init, .{});

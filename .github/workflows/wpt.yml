@@ -10,32 +10,37 @@ env:
 
 on:
   schedule:
-    - cron: "23 2 * * *"
+    - cron: "21 2 * * *"
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
   wpt-build-release:
-    name: zig build release
+    name: zig build -Dwpt_extensions release
 
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    env:
+      ARCH: aarch64
+      OS: linux
+
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
-          submodules: recursive
 
       - uses: ./.github/actions/install
+        with:
+          os: ${{env.OS}}
+          arch: ${{env.ARCH}}
 
       - name: zig build release
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64 -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
+        run: zig build -Dwpt_extensions -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=generic
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lightpanda-build-release
           path: |
@@ -45,7 +50,7 @@ jobs:
   wpt-build-runner:
     name: build wpt runner
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
 
     steps:
@@ -59,7 +64,7 @@ jobs:
           CGO_ENABLED=0 go build
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wptrunner
           path: |
@@ -73,8 +78,8 @@ jobs:
       - wpt-build-runner
 
     # use a self host runner.
-    runs-on: lpd-bench-hetzner
-    timeout-minutes: 180
+    runs-on: lpd-wpt-aws
+    timeout-minutes: 600
 
     steps:
       - uses: actions/checkout@v6
@@ -91,14 +96,14 @@ jobs:
         run: ./wpt manifest
 
       - name: download lightpanda release
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lightpanda-build-release
 
       - run: chmod a+x ./lightpanda
 
       - name: download wptrunner
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wptrunner
 
@@ -107,8 +112,8 @@ jobs:
       - name: run test with json output
         run: |
           ./wpt serve 2> /dev/null & echo $! > WPT.pid
-          sleep 10s
-          ./wptrunner -lpd-path ./lightpanda -json -concurrency 10 -pool 3 > wpt.json
+          sleep 20s
+          ./wptrunner -lpd-path ./lightpanda -json -concurrency 5 -pool 5 --mem-limit 400 > wpt.json
           kill `cat WPT.pid`
 
       - name: write commit
@@ -116,7 +121,7 @@ jobs:
           echo "${{github.sha}}" > commit.txt
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wpt-results
           path: |
@@ -139,9 +144,55 @@ jobs:
 
     steps:
       - name: download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wpt-results
 
       - name: format and send json result
         run: /perf-fmt wpt ${{ github.sha }} wpt.json
+
+  wptdiff:
+    name: perf-fmt
+    needs: perf-fmt
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: 'lightpanda-io/demo'
+          fetch-depth: 0
+
+      - run: |
+          cd ./wptdiff
+          CGO_ENABLED=0 go build
+
+      - run: |
+         ./wptdiff/wptdiff --completion |tee completion.log
+
+      - name: Send completion to slack
+        uses: slackapi/slack-github-action@v3.0.1
+        with:
+          errors: true
+          method: files.uploadV2
+          token: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+          payload: |
+            channel_id: ${{ vars.WPT_SLACK_CHANNEL_ID }}
+            initial_comment: "Last WPT completion"
+            file: "./completion.log"
+            filename: "wpt-completion-${{ github.sha }}.txt"
+
+      - run: |
+         ./wptdiff/wptdiff |tee diff.log
+
+      - name: Send regression to slack
+        uses: slackapi/slack-github-action@v3.0.1
+        with:
+          errors: true
+          method: files.uploadV2
+          token: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+          payload: |
+            channel_id: ${{ vars.WPT_SLACK_CHANNEL_ID }}
+            initial_comment: "Last WPT regressions"
+            file: "./diff.log"
+            filename: "wpt-regression-${{ github.sha }}.txt"

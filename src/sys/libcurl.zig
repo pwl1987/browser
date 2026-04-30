@@ -40,6 +40,25 @@ pub const CurlDebugFunction = fn (*Curl, CurlInfoType, [*c]u8, usize, *anyopaque
 pub const CurlHeaderFunction = fn ([*]const u8, usize, usize, *anyopaque) usize;
 pub const CurlWriteFunction = fn ([*]const u8, usize, usize, *anyopaque) usize;
 pub const curl_writefunc_error: usize = c.CURL_WRITEFUNC_ERROR;
+pub const curl_readfunc_pause: usize = c.CURL_READFUNC_PAUSE;
+pub const CurlReadFunction = fn ([*]u8, usize, usize, *anyopaque) usize;
+
+pub const CurlSockType = enum(c.curlsocktype) {
+    ipcxn = c.CURLSOCKTYPE_IPCXN,
+    accept = c.CURLSOCKTYPE_ACCEPT,
+};
+
+/// Mirror of curl's struct curl_sockaddr. The addr field is a struct sockaddr
+/// inline (not a pointer), so addrlen tells you how many bytes of addr are valid.
+pub const CurlSockAddr = extern struct {
+    family: c_int,
+    socktype: c_int,
+    protocol: c_int,
+    addrlen: c_uint,
+    addr: std.posix.sockaddr,
+};
+
+pub const CURL_SOCKET_BAD: c.curl_socket_t = c.CURL_SOCKET_BAD;
 
 pub const FreeCallback = fn (ptr: ?*anyopaque) void;
 pub const StrdupCallback = fn (str: [*:0]const u8) ?[*:0]u8;
@@ -98,6 +117,23 @@ pub const CurlWaitFd = extern struct {
     revents: CurlWaitEvents,
 };
 
+pub const CurlPauseFlags = packed struct(c_short) {
+    recv: bool = false,
+    send: bool = false,
+    all: bool = false,
+    cont: bool = false,
+    _reserved: u12 = 0,
+
+    pub fn to_c(self: @This()) c_int {
+        var flags: c_int = 0;
+        if (self.recv) flags |= c.CURLPAUSE_RECV;
+        if (self.send) flags |= c.CURLPAUSE_SEND;
+        if (self.all) flags |= c.CURLPAUSE_ALL;
+        if (self.cont) flags |= c.CURLPAUSE_CONT;
+        return flags;
+    }
+};
+
 comptime {
     const debug_cb_check: c.curl_debug_callback = struct {
         fn cb(handle: ?*Curl, msg_type: c.curl_infotype, raw: [*c]u8, len: usize, user: ?*anyopaque) callconv(.c) c_int {
@@ -118,8 +154,17 @@ comptime {
             return 0;
         }
     }.cb;
+    const opensocket_cb_check: c.curl_opensocket_callback = struct {
+        fn cb(clientp: ?*anyopaque, purpose: c.curlsocktype, address: [*c]c.curl_sockaddr) callconv(.c) c.curl_socket_t {
+            _ = clientp;
+            _ = purpose;
+            _ = address;
+            return CURL_SOCKET_BAD;
+        }
+    }.cb;
     _ = debug_cb_check;
     _ = write_cb_check;
+    _ = opensocket_cb_check;
 
     if (@sizeOf(CurlWaitFd) != @sizeOf(c.curl_waitfd)) {
         @compileError("CurlWaitFd size mismatch");
@@ -132,6 +177,17 @@ comptime {
     }
     if (c.CURL_WAIT_POLLIN != 1 or c.CURL_WAIT_POLLPRI != 2 or c.CURL_WAIT_POLLOUT != 4) {
         @compileError("CURL_WAIT_* flag values don't match CurlWaitEvents packed struct bit layout");
+    }
+    if (@sizeOf(CurlSockAddr) != @sizeOf(c.curl_sockaddr)) {
+        @compileError("CurlSockAddr size mismatch with curl_sockaddr");
+    }
+    if (@offsetOf(CurlSockAddr, "family") != @offsetOf(c.curl_sockaddr, "family") or
+        @offsetOf(CurlSockAddr, "socktype") != @offsetOf(c.curl_sockaddr, "socktype") or
+        @offsetOf(CurlSockAddr, "protocol") != @offsetOf(c.curl_sockaddr, "protocol") or
+        @offsetOf(CurlSockAddr, "addrlen") != @offsetOf(c.curl_sockaddr, "addrlen") or
+        @offsetOf(CurlSockAddr, "addr") != @offsetOf(c.curl_sockaddr, "addr"))
+    {
+        @compileError("CurlSockAddr layout mismatch with curl_sockaddr");
     }
 }
 
@@ -167,6 +223,12 @@ pub const CurlOption = enum(c.CURLoption) {
     header_function = c.CURLOPT_HEADERFUNCTION,
     write_data = c.CURLOPT_WRITEDATA,
     write_function = c.CURLOPT_WRITEFUNCTION,
+    read_data = c.CURLOPT_READDATA,
+    read_function = c.CURLOPT_READFUNCTION,
+    connect_only = c.CURLOPT_CONNECT_ONLY,
+    upload = c.CURLOPT_UPLOAD,
+    opensocket_function = c.CURLOPT_OPENSOCKETFUNCTION,
+    opensocket_data = c.CURLOPT_OPENSOCKETDATA,
 };
 
 pub const CurlMOption = enum(c.CURLMoption) {
@@ -178,6 +240,7 @@ pub const CurlInfo = enum(c.CURLINFO) {
     private = c.CURLINFO_PRIVATE,
     redirect_count = c.CURLINFO_REDIRECT_COUNT,
     response_code = c.CURLINFO_RESPONSE_CODE,
+    connect_code = c.CURLINFO_HTTP_CONNECTCODE,
 };
 
 pub const Error = error{
@@ -516,6 +579,10 @@ pub fn curl_easy_cleanup(easy: *Curl) void {
     c.curl_easy_cleanup(easy);
 }
 
+pub fn curl_easy_reset(easy: *Curl) void {
+    c.curl_easy_reset(easy);
+}
+
 pub fn curl_easy_perform(easy: *Curl) Error!void {
     try errorCheck(c.curl_easy_perform(easy));
 }
@@ -525,6 +592,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
     const code = switch (option) {
         .verbose,
         .post,
+        .upload,
         .http_get,
         .ssl_verify_host,
         .ssl_verify_peer,
@@ -546,6 +614,7 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
         .max_redirs,
         .follow_location,
         .post_field_size,
+        .connect_only,
         => blk: {
             const n: c_long = switch (@typeInfo(@TypeOf(value))) {
                 .comptime_int, .int => @intCast(value),
@@ -588,7 +657,9 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
 
         .private,
         .header_data,
+        .read_data,
         .write_data,
+        .opensocket_data,
         => blk: {
             const ptr: ?*anyopaque = switch (@typeInfo(@TypeOf(value))) {
                 .null => null,
@@ -612,6 +683,20 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
             break :blk c.curl_easy_setopt(easy, opt, cb);
         },
 
+        .opensocket_function => blk: {
+            const cb: c.curl_opensocket_callback = switch (@typeInfo(@TypeOf(value))) {
+                .null => null,
+                .@"fn" => struct {
+                    fn cb(clientp: ?*anyopaque, purpose: c.curlsocktype, address: [*c]c.curl_sockaddr) callconv(.c) c.curl_socket_t {
+                        const addr: *CurlSockAddr = @ptrCast(address orelse return CURL_SOCKET_BAD);
+                        return value(@enumFromInt(purpose), addr, clientp);
+                    }
+                }.cb,
+                else => @compileError("expected Zig function or null for " ++ @tagName(option) ++ ", got " ++ @typeName(@TypeOf(value))),
+            };
+            break :blk c.curl_easy_setopt(easy, opt, cb);
+        },
+
         .header_function => blk: {
             const cb: c.curl_write_callback = switch (@typeInfo(@TypeOf(value))) {
                 .null => null,
@@ -626,13 +711,32 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
             break :blk c.curl_easy_setopt(easy, opt, cb);
         },
 
+        .read_function => blk: {
+            const cb: c.curl_write_callback = switch (@typeInfo(@TypeOf(value))) {
+                .null => null,
+                .@"fn" => |info| struct {
+                    fn cb(buffer: [*c]u8, count: usize, len: usize, user: ?*anyopaque) callconv(.c) usize {
+                        const user_arg = if (@typeInfo(info.params[3].type.?) == .optional)
+                            user
+                        else
+                            user orelse unreachable;
+                        return value(@ptrCast(buffer), count, len, user_arg);
+                    }
+                }.cb,
+                else => @compileError("expected Zig function or null for " ++ @tagName(option) ++ ", got " ++ @typeName(@TypeOf(value))),
+            };
+            break :blk c.curl_easy_setopt(easy, opt, cb);
+        },
         .write_function => blk: {
             const cb: c.curl_write_callback = switch (@typeInfo(@TypeOf(value))) {
                 .null => null,
-                .@"fn" => struct {
+                .@"fn" => |info| struct {
                     fn cb(buffer: [*c]u8, count: usize, len: usize, user: ?*anyopaque) callconv(.c) usize {
-                        const u = user orelse unreachable;
-                        return value(@ptrCast(buffer), count, len, u);
+                        const user_arg = if (@typeInfo(info.params[3].type.?) == .optional)
+                            user
+                        else
+                            user orelse unreachable;
+                        return value(@ptrCast(buffer), count, len, user_arg);
                     }
                 }.cb,
                 else => @compileError("expected Zig function or null for " ++ @tagName(option) ++ ", got " ++ @typeName(@TypeOf(value))),
@@ -655,6 +759,7 @@ pub fn curl_easy_getinfo(easy: *Curl, comptime info: CurlInfo, out: anytype) Err
             break :blk c.curl_easy_getinfo(easy, inf, p);
         },
         .response_code,
+        .connect_code,
         .redirect_count,
         => blk: {
             const p: *c_long = out;
@@ -666,6 +771,10 @@ pub fn curl_easy_getinfo(easy: *Curl, comptime info: CurlInfo, out: anytype) Err
         },
     };
     try errorCheck(code);
+}
+
+pub fn curl_easy_pause(easy: *Curl, flags: CurlPauseFlags) Error!void {
+    try errorCheck(c.curl_easy_pause(easy, flags.to_c()));
 }
 
 pub fn curl_easy_header(
@@ -753,6 +862,15 @@ pub fn curl_multi_poll(
     try errorMCheck(c.curl_multi_poll(multi, raw_fds, @intCast(extra_fds.len), timeout_ms, numfds));
 }
 
+pub fn curl_multi_waitfds(multi: *CurlM, ufds: []CurlWaitFd, fd_count: *c_uint) ErrorMulti!void {
+    const raw_fds: [*c]c.curl_waitfd = if (ufds.len == 0) null else @ptrCast(ufds.ptr);
+    try errorMCheck(c.curl_multi_waitfds(multi, raw_fds, @intCast(ufds.len), fd_count));
+}
+
+pub fn curl_multi_timeout(multi: *CurlM, timeout_ms: *c_long) ErrorMulti!void {
+    try errorMCheck(c.curl_multi_timeout(multi, timeout_ms));
+}
+
 pub fn curl_multi_info_read(multi: *CurlM, msgs_in_queue: *c_int) ?CurlMsg {
     const ptr = c.curl_multi_info_read(multi, msgs_in_queue);
     if (ptr == null) return null;
@@ -785,4 +903,80 @@ pub fn curl_slist_free_all(list: ?*CurlSList) void {
     if (list) |ptr| {
         c.curl_slist_free_all(ptr);
     }
+}
+
+// WebSocket support (requires libcurl 7.86.0+)
+pub const WsFrameType = enum {
+    text,
+    binary,
+    cont,
+    close,
+    ping,
+    pong,
+
+    fn toInt(self: WsFrameType) c_uint {
+        return switch (self) {
+            .text => c.CURLWS_TEXT,
+            .binary => c.CURLWS_BINARY,
+            .cont => c.CURLWS_CONT,
+            .close => c.CURLWS_CLOSE,
+            .ping => c.CURLWS_PING,
+            .pong => c.CURLWS_PONG,
+        };
+    }
+
+    fn fromFlags(flags: c_int) WsFrameType {
+        const f: c_uint = @bitCast(flags);
+        if (f & c.CURLWS_TEXT != 0) return .text;
+        if (f & c.CURLWS_BINARY != 0) return .binary;
+        if (f & c.CURLWS_CLOSE != 0) return .close;
+        if (f & c.CURLWS_PING != 0) return .ping;
+        if (f & c.CURLWS_PONG != 0) return .pong;
+        if (f & c.CURLWS_CONT != 0) return .cont;
+        return .binary; // default fallback
+    }
+};
+
+pub const WsFrameMeta = struct {
+    frame_type: WsFrameType,
+    offset: usize,
+    bytes_left: usize,
+    len: usize,
+
+    fn from(frame: *const c.curl_ws_frame) WsFrameMeta {
+        return .{
+            .frame_type = WsFrameType.fromFlags(frame.flags),
+            .offset = @intCast(frame.offset),
+            .bytes_left = @intCast(frame.bytesleft),
+            .len = if (frame.len < 0)
+                std.math.maxInt(usize)
+            else
+                @intCast(frame.len),
+        };
+    }
+};
+
+pub fn curl_ws_send(easy: *Curl, buffer: []const u8, sent: *usize, fragsize: CurlOffT, frame_type: WsFrameType) Error!void {
+    try errorCheck(c.curl_ws_send(easy, buffer.ptr, buffer.len, sent, fragsize, frame_type.toInt()));
+}
+
+pub fn curl_ws_recv(easy: *Curl, buffer: []u8, recv: *usize, meta: *?WsFrameMeta) Error!void {
+    var c_meta: [*c]const c.curl_ws_frame = null;
+    const code = c.curl_ws_recv(easy, buffer.ptr, buffer.len, recv, &c_meta);
+    if (c_meta) |m| {
+        meta.* = WsFrameMeta.from(m);
+    } else {
+        meta.* = null;
+    }
+    try errorCheck(code);
+}
+
+pub fn curl_ws_meta(easy: *Curl) ?WsFrameMeta {
+    const ptr = c.curl_ws_meta(easy);
+    if (ptr == null) return null;
+    return WsFrameMeta.from(ptr);
+}
+
+pub fn curl_ws_start_frame(easy: *Curl, frame_type: WsFrameType, size: CurlOffT) Error!void {
+    try errorCheck(c.curl_ws_start_frame(easy, frame_type.toInt(), size));
 }

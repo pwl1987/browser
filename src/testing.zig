@@ -17,6 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
+const log = lp.log;
 const Allocator = std.mem.Allocator;
 
 pub const allocator = std.testing.allocator;
@@ -40,7 +43,7 @@ const App = @import("App.zig");
 const js = @import("browser/js/js.zig");
 const Config = @import("Config.zig");
 const HttpClient = @import("browser/HttpClient.zig");
-const Page = @import("browser/Page.zig");
+const Frame = @import("browser/Frame.zig");
 const Browser = @import("browser/Browser.zig");
 const Session = @import("browser/Session.zig");
 const Notification = @import("Notification.zig");
@@ -177,11 +180,6 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     } else {
         std.debug.print(fmt, args);
     }
-}
-
-const String = @import("string.zig").String;
-pub fn newString(str: []const u8) String {
-    return String.init(arena_allocator, str, .{}) catch unreachable;
 }
 
 pub const Random = struct {
@@ -396,7 +394,7 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
 }
 
 fn runWebApiTest(test_file: [:0]const u8) !void {
-    const page = try test_session.createPage();
+    const frame = try test_session.createPage();
     defer test_session.removePage();
 
     const url = try std.fmt.allocPrintSentinel(
@@ -407,28 +405,55 @@ fn runWebApiTest(test_file: [:0]const u8) !void {
     );
 
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
-    var try_catch: js.TryCatch = undefined;
-    try_catch.init(&ls.local);
-    defer try_catch.deinit();
+    {
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
 
-    try page.navigate(url, .{});
-    _ = test_session.wait(2000);
+        try frame.navigate(url, .{});
+    }
 
-    test_browser.runMicrotasks();
+    var runner = try test_session.runner(.{});
+    try runner.wait(.{ .ms = 2000, .until = .load });
 
-    ls.local.eval("testing.assertOk()", "testing.assertOk()") catch |err| {
-        const caught = try_catch.caughtOrError(arena_allocator, err);
-        std.debug.print("{s}: test failure\nError: {f}\n", .{ test_file, caught });
-        return err;
-    };
+    var wait_ms: u32 = 2000;
+    var timer = try std.time.Timer.start();
+    while (true) {
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
+
+        const js_val = ls.local.exec("testing.assertOk()", "testing.assertOk()") catch |err| {
+            const caught = try_catch.caughtOrError(arena_allocator, err);
+            std.debug.print("{s}: test failure\nError: {f}\n", .{ test_file, caught });
+            return err;
+        };
+        if (js_val.isTrue()) {
+            return;
+        }
+        const sleep_ms: usize = switch (try runner.tick(.{ .ms = 20 })) {
+            .done => 20,
+            .ok => |next_ms| @min(next_ms, 20),
+        };
+
+        const ms_elapsed = timer.lap() / 1_000_000;
+        if (ms_elapsed >= wait_ms) {
+            ls.local.eval("testing.printTimeoutState()", "testing.printTimeoutState()") catch {};
+            return error.TestTimedOut;
+        }
+        wait_ms -= @intCast(ms_elapsed);
+        std.Thread.sleep(std.time.ns_per_ms * sleep_ms);
+    }
 }
 
-// Used by a few CDP tests - wouldn't be sad to see this go.
-pub fn pageTest(comptime test_file: []const u8) !*Page {
-    const page = try test_session.createPage();
+const PageTestOpts = struct {
+    wait_until_done: bool = true,
+};
+pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !*Frame {
+    const frame = try test_session.createPage();
     errdefer test_session.removePage();
 
     const url = try std.fmt.allocPrintSentinel(
@@ -438,23 +463,24 @@ pub fn pageTest(comptime test_file: []const u8) !*Page {
         0,
     );
 
-    try page.navigate(url, .{});
-    _ = test_session.wait(2000);
-    return page;
+    try frame.navigate(url, .{});
+    var runner = try test_session.runner(.{});
+    if (opts.wait_until_done) {
+        try runner.wait(.{ .ms = 2000 });
+    }
+    return frame;
 }
 
-test {
-    std.testing.refAllDecls(@This());
-}
-
-const log = @import("log.zig");
 const TestHTTPServer = @import("TestHTTPServer.zig");
+const TestWSServer = @import("TestWSServer.zig");
 
 const Server = @import("Server.zig");
 var test_cdp_server: ?*Server = null;
 var test_cdp_server_thread: ?std.Thread = null;
 var test_http_server: ?TestHTTPServer = null;
 var test_http_server_thread: ?std.Thread = null;
+var test_ws_server: ?TestWSServer = null;
+var test_ws_server_thread: ?std.Thread = null;
 
 var test_config: Config = undefined;
 
@@ -465,10 +491,9 @@ test "tests:beforeAll" {
     const test_allocator = @import("root").tracking_allocator;
 
     test_config = try Config.init(test_allocator, "test", .{ .serve = .{
-        .common = .{
-            .tls_verify_host = false,
-            .user_agent_suffix = "internal-tester",
-        },
+        .insecure_disable_tls_host_verification = true,
+        .user_agent_suffix = "internal-tester",
+        .ws_max_concurrent = 50,
     } });
 
     test_app = try App.init(test_allocator, &test_config);
@@ -487,12 +512,15 @@ test "tests:beforeAll" {
     test_session = try test_browser.newSession(test_notification);
 
     var wg: std.Thread.WaitGroup = .{};
-    wg.startMany(2);
+    wg.startMany(3);
 
     test_cdp_server_thread = try std.Thread.spawn(.{}, serveCDP, .{&wg});
 
     test_http_server = TestHTTPServer.init(testHTTPHandler);
     test_http_server_thread = try std.Thread.spawn(.{}, TestHTTPServer.run, .{ &test_http_server.?, &wg });
+
+    test_ws_server = TestWSServer.init();
+    test_ws_server_thread = try std.Thread.spawn(.{}, TestWSServer.run, .{ &test_ws_server.?, &wg });
 
     // need to wait for the servers to be listening, else tests will fail because
     // they aren't able to connect.
@@ -516,6 +544,13 @@ test "tests:afterAll" {
     }
     if (test_http_server) |*server| {
         server.deinit();
+    }
+
+    if (test_ws_server) |*server| {
+        server.stop();
+    }
+    if (test_ws_server_thread) |thread| {
+        thread.join();
     }
 
     @import("root").v8_peak_memory = test_browser.env.isolate.getHeapStatistics().total_physical_size;
@@ -575,6 +610,32 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/redirect-no-fragment")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "/redirect-target" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect-target")) {
+        return req.respond("<!DOCTYPE html><title>landed</title>", .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect-with-fragment")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "/redirect-target#target_fragment" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/xhr/404")) {
         return req.respond("Not Found", .{
             .status = .not_found,
@@ -601,6 +662,63 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/echo_referer")) {
+        // Echo the request's Referer header back as HTML so tests can assert
+        // what Referer the navigation sent. Used by the cross-page Referer test.
+        var it = req.iterateHeaders();
+        var referer: []const u8 = "NONE";
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "Referer")) {
+                referer = h.value;
+                break;
+            }
+        }
+        var html_buf: [512]u8 = undefined;
+        const html = try std.fmt.bufPrint(&html_buf, "<html><body>referer={s}</body></html>", .{referer});
+        return req.respond(html, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/referer_link.html")) {
+        // Page with an anchor link to /echo_referer. The test clicks the link
+        // via JS and asserts the resulting page reports Referer = this page.
+        return req.respond(
+            "<html><body><a id=\"link\" href=\"/echo_referer\">go</a></body></html>",
+            .{
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+                },
+            },
+        );
+    }
+
+    if (std.mem.eql(u8, path, "/echo_method")) {
+        // Echo the request method back as HTML so tests can assert on what
+        // method the navigation used. Used by the Page.reload-replays-POST test.
+        const method_name = @tagName(req.head.method);
+        var html_buf: [128]u8 = undefined;
+        const html = try std.fmt.bufPrint(&html_buf, "<html><body>method={s}</body></html>", .{method_name});
+        return req.respond(html, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect_to_echo")) {
+        // 302 to /echo_method. Used by the Page.reload-after-redirect test to
+        // confirm a POST→302→GET chain doesn't replay POST on reload.
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "/echo_method" },
+            },
+        });
+    }
+
     if (std.mem.startsWith(u8, path, "/src/browser/tests/")) {
         // strip off leading / so that it's relative to CWD
         return TestHTTPServer.sendFile(req, path[1..]);
@@ -616,12 +734,12 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
 pub const LogFilter = struct {
     old_filter: []const log.Scope,
 
-    /// Sets the log filter to only include the specified scope.
+    /// Sets the log filter to suppress the specified scope(s).
     /// Returns a LogFilter that should be deinitialized to restore previous filters.
-    pub fn init(comptime scope: log.Scope) LogFilter {
+    pub fn init(comptime scopes: []const log.Scope) LogFilter {
+        comptime std.debug.assert(@TypeOf(scopes) == []const log.Scope);
         const old_filter = log.opts.filter_scopes;
-        const new_filter = comptime &[_]log.Scope{scope};
-        log.opts.filter_scopes = new_filter;
+        log.opts.filter_scopes = scopes;
         return .{ .old_filter = old_filter };
     }
 

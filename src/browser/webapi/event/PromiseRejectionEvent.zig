@@ -16,13 +16,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+
 const Event = @import("../Event.zig");
-const Allocator = std.mem.Allocator;
+
+const String = lp.String;
 
 const PromiseRejectionEvent = @This();
 
@@ -38,12 +39,12 @@ const PromiseRejectionEventOptions = struct {
 const Options = Event.inheritOptions(PromiseRejectionEvent, PromiseRejectionEventOptions);
 
 pub fn init(typ: []const u8, opts_: ?Options, page: *Page) !*PromiseRejectionEvent {
-    const arena = try page.getArena(.{ .debug = "PromiseRejectionEvent" });
+    const arena = try page.getArena(.tiny, "PromiseRejectionEvent");
     errdefer page.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
 
     const opts = opts_ orelse Options{};
-    const event = try page._factory.event(
+    const event = try page.factory.event(
         arena,
         type_string,
         PromiseRejectionEvent{
@@ -57,14 +58,22 @@ pub fn init(typ: []const u8, opts_: ?Options, page: *Page) !*PromiseRejectionEve
     return event;
 }
 
-pub fn deinit(self: *PromiseRejectionEvent, shutdown: bool, session: *Session) void {
+pub fn deinit(self: *PromiseRejectionEvent, page: *Page) void {
     if (self._reason) |r| {
         r.release();
     }
     if (self._promise) |p| {
         p.release();
     }
-    self._proto.deinit(shutdown, session);
+    self._proto.deinit(page);
+}
+
+pub fn releaseRef(self: *PromiseRejectionEvent, page: *Page) void {
+    self._proto._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *PromiseRejectionEvent) void {
+    self._proto.acquireRef();
 }
 
 pub fn asEvent(self: *PromiseRejectionEvent) *Event {
@@ -86,8 +95,6 @@ pub const JsApi = struct {
         pub const name = "PromiseRejectionEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(PromiseRejectionEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(PromiseRejectionEvent.init, .{});

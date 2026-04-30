@@ -19,16 +19,12 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
 
 const js = @import("js/js.zig");
-const log = @import("../log.zig");
 const App = @import("../App.zig");
 const HttpClient = @import("HttpClient.zig");
 
 const ArenaPool = App.ArenaPool;
-
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Session = @import("Session.zig");
 const Notification = @import("../Notification.zig");
@@ -91,23 +87,30 @@ pub fn runMicrotasks(self: *Browser) void {
     self.env.runMicrotasks();
 }
 
-pub fn runMacrotasks(self: *Browser) !?u64 {
+pub fn runMacrotasks(self: *Browser) !void {
     const env = &self.env;
 
-    const time_to_next = try self.env.runMacrotasks();
+    try self.env.runMacrotasks();
     env.pumpMessageLoop();
 
     // either of the above could have queued more microtasks
     env.runMicrotasks();
-
-    return time_to_next;
 }
 
 pub fn hasBackgroundTasks(self: *Browser) bool {
     return self.env.hasBackgroundTasks();
 }
+
 pub fn waitForBackgroundTasks(self: *Browser) void {
     self.env.waitForBackgroundTasks();
+}
+
+pub fn msToNextMacrotask(self: *Browser) ?u64 {
+    return self.env.msToNextMacrotask();
+}
+
+pub fn msTo(self: *Browser) bool {
+    return self.env.hasBackgroundTasks();
 }
 
 pub fn runIdleTasks(self: *const Browser) void {

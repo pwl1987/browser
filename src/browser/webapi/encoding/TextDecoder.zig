@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -17,24 +17,26 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("../../js/js.zig");
+const lp = @import("lightpanda");
 
+const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+
+const html5ever = @import("../../parser/html5ever.zig");
+
 const Allocator = std.mem.Allocator;
 
 const TextDecoder = @This();
 
+_rc: lp.RC(u8) = .{},
 _fatal: bool,
 _arena: Allocator,
 _ignore_bom: bool,
-_stream: std.ArrayList(u8),
-
-const Label = enum {
-    utf8,
-    @"utf-8",
-    @"unicode-1-1-utf-8",
-};
+_bom_seen: bool,
+_decoder: ?*anyopaque, // Persistent streaming decoder
+_encoding_handle: *anyopaque,
+_encoding_name: []const u8,
+_lowercase_name: []const u8, // Cached lowercase version of encoding name
 
 const InitOpts = struct {
     fatal: bool = false,
@@ -42,26 +44,50 @@ const InitOpts = struct {
 };
 
 pub fn init(label_: ?[]const u8, opts_: ?InitOpts, page: *Page) !*TextDecoder {
-    if (label_) |label| {
-        _ = std.meta.stringToEnum(Label, label) orelse return error.RangeError;
+    const label = label_ orelse "utf-8";
+
+    const info = html5ever.encoding_for_label(label.ptr, label.len);
+    if (!info.isValid()) {
+        return error.RangeError;
     }
 
-    const arena = try page.getArena(.{ .debug = "TextDecoder" });
+    // Check for "replacement" encoding - it's not usable for decoding per spec
+    const enc_name = info.name();
+    if (std.mem.eql(u8, enc_name, "replacement")) {
+        return error.RangeError;
+    }
+
+    const arena = try page.getArena(.large, "TextDecoder");
     errdefer page.releaseArena(arena);
 
     const opts = opts_ orelse InitOpts{};
     const self = try arena.create(TextDecoder);
     self.* = .{
         ._arena = arena,
-        ._stream = .empty,
         ._fatal = opts.fatal,
         ._ignore_bom = opts.ignoreBOM,
+        ._encoding_handle = info.handle.?,
+        ._decoder = null,
+        ._bom_seen = false,
+        ._lowercase_name = "", // Will be lazily allocated
+        ._encoding_name = enc_name, // Points to static Rust memory
     };
     return self;
 }
 
-pub fn deinit(self: *TextDecoder, _: bool, session: *Session) void {
-    session.releaseArena(self._arena);
+pub fn deinit(self: *TextDecoder, page: *Page) void {
+    if (self._decoder) |decoder| {
+        html5ever.encoding_decoder_free(decoder);
+    }
+    page.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *TextDecoder, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *TextDecoder) void {
+    self._rc.acquire();
 }
 
 pub fn getIgnoreBOM(self: *const TextDecoder) bool {
@@ -72,34 +98,118 @@ pub fn getFatal(self: *const TextDecoder) bool {
     return self._fatal;
 }
 
+pub fn getEncoding(self: *TextDecoder) ![]const u8 {
+    // Spec requires lowercase encoding name
+    // Allocate buffer for lowercase name on first access
+    if (self._lowercase_name.len > 0) {
+        return self._lowercase_name;
+    }
+    self._lowercase_name = try std.ascii.allocLowerString(self._arena, self._encoding_name);
+    return self._lowercase_name;
+}
+
 const DecodeOpts = struct {
     stream: bool = false,
 };
+
 pub fn decode(self: *TextDecoder, input_: ?[]const u8, opts_: ?DecodeOpts) ![]const u8 {
-    var input = input_ orelse return "";
     const opts: DecodeOpts = opts_ orelse .{};
+    const input = input_ orelse "";
 
-    if (self._stream.items.len > 0) {
-        try self._stream.appendSlice(self._arena, input);
-        input = self._stream.items;
-    }
-
-    if (self._fatal and !std.unicode.utf8ValidateSlice(input)) {
-        if (opts.stream) {
-            if (self._stream.items.len == 0) {
-                try self._stream.appendSlice(self._arena, input);
+    if (opts.stream) {
+        // Streaming mode: create decoder if needed, keep it alive
+        if (self._decoder == null) {
+            self._decoder = html5ever.encoding_decoder_new(self._encoding_handle);
+            if (self._decoder == null) {
+                return error.OutOfMemory;
             }
-            return "";
         }
-        return error.InvalidUtf8;
+        return self._decode(input, self._decoder, false);
     }
 
-    self._stream.clearRetainingCapacity();
-    if (self._ignore_bom == false and std.mem.startsWith(u8, input, &.{ 0xEF, 0xBB, 0xBF })) {
-        return input[3..];
+    if (self._decoder) |decoder| {
+        // Non-streaming with existing decoder: flush with is_last=true, then free
+        const result = try self._decode(input, decoder, true);
+
+        // on error, _decode will free the decoder. So we only free it on non-error
+        html5ever.encoding_decoder_free(decoder);
+        self._decoder = null;
+        return result;
     }
 
-    return input;
+    // non-streaming, no existing decoder
+    return self._decode(input, null, true);
+}
+
+fn _decode(self: *TextDecoder, input: []const u8, streaming_decoder: ?*anyopaque, is_last: bool) ![]const u8 {
+    if (input.len == 0 and !is_last) {
+        return "";
+    }
+
+    // Calculate max output size (add extra for potential buffered bytes when finishing)
+    const max_out = html5ever.encoding_max_utf8_buffer_length(
+        self._encoding_handle,
+        if (input.len == 0) 4 else input.len,
+    );
+
+    if (max_out == 0) {
+        return "";
+    }
+
+    // Allocate output buffer
+    const output = try self._arena.alloc(u8, max_out);
+
+    // Decode using either streaming or one-shot decoder
+    const result = if (streaming_decoder) |decoder|
+        html5ever.encoding_decoder_decode(
+            decoder,
+            input.ptr,
+            input.len,
+            output.ptr,
+            output.len,
+            @intFromBool(is_last),
+        )
+    else
+        html5ever.encoding_decode(
+            self._encoding_handle,
+            input.ptr,
+            input.len,
+            output.ptr,
+            output.len,
+            1, // is_last = true for one-shot
+        );
+
+    // Handle errors in fatal mode
+    if (self._fatal and result.hadErrors()) {
+        if (streaming_decoder != null) {
+            // Reset decoder on error
+            if (self._decoder) |decoder| {
+                html5ever.encoding_decoder_free(decoder);
+                self._decoder = null;
+            }
+        }
+        self._bom_seen = false;
+        return error.TypeError;
+    }
+
+    var decoded: []const u8 = output[0..result.bytes_written];
+
+    // Handle BOM stripping
+    if (!self._bom_seen and !self._ignore_bom) {
+        decoded = stripBom(decoded);
+        self._bom_seen = true;
+    }
+
+    return decoded;
+}
+
+fn stripBom(data: []const u8) []const u8 {
+    // UTF-8 BOM in decoded output appears as U+FEFF (EF BB BF in UTF-8)
+    const bom = "\u{FEFF}";
+    if (std.mem.startsWith(u8, data, bom)) {
+        return data[bom.len..];
+    }
+    return data;
 }
 
 pub const JsApi = struct {
@@ -109,13 +219,11 @@ pub const JsApi = struct {
         pub const name = "TextDecoder";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(TextDecoder.deinit);
     };
 
     pub const constructor = bridge.constructor(TextDecoder.init, .{});
     pub const decode = bridge.function(TextDecoder.decode, .{});
-    pub const encoding = bridge.property("utf-8", .{ .template = false });
+    pub const encoding = bridge.accessor(TextDecoder.getEncoding, null, .{});
     pub const fatal = bridge.accessor(TextDecoder.getFatal, null, .{});
     pub const ignoreBOM = bridge.accessor(TextDecoder.getIgnoreBOM, null, .{});
 };

@@ -18,8 +18,9 @@
 
 const std = @import("std");
 const id = @import("../id.zig");
+const CDP = @import("../CDP.zig");
 
-pub fn processMessage(cmd: anytype) !void {
+pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         enable,
         disable,
@@ -32,15 +33,15 @@ pub fn processMessage(cmd: anytype) !void {
         .getFullAXTree => return getFullAXTree(cmd),
     }
 }
-fn enable(cmd: anytype) !void {
+fn enable(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn disable(cmd: anytype) !void {
+fn disable(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn getFullAXTree(cmd: anytype) !void {
+fn getFullAXTree(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         depth: ?i32 = null,
         frameId: ?[]const u8 = null,
@@ -49,18 +50,20 @@ fn getFullAXTree(cmd: anytype) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const session = bc.session;
 
-    const page = blk: {
+    const frame = blk: {
         const frame_id = params.frameId orelse {
-            break :blk session.currentPage() orelse return error.PageNotLoaded;
+            break :blk session.currentFrame() orelse return error.FrameNotLoaded;
         };
-        const page_frame_id = try id.toPageId(.frame_id, frame_id);
-        break :blk session.findPageByFrameId(page_frame_id) orelse {
+        break :blk session.findFrameByFrameId(try id.parseFrameId(frame_id)) orelse {
             return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
         };
     };
 
-    const doc = page.window._document.asNode();
+    const doc = frame.window._document.asNode();
     const node = try bc.node_registry.register(doc);
 
-    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(node, .{}) }, .{});
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer frame.releaseArena(temp_arena);
+
+    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(temp_arena, node, .{}) }, .{});
 }

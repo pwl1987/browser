@@ -17,8 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("js.zig");
-const SSO = @import("../../string.zig").String;
 
 const v8 = js.v8;
 
@@ -155,6 +156,61 @@ pub fn isBigInt64Array(self: Value) bool {
     return v8.v8__Value__IsBigInt64Array(self.handle);
 }
 
+pub fn isFloat32Array(self: Value) bool {
+    return v8.v8__Value__IsFloat32Array(self.handle);
+}
+
+pub fn isFloat64Array(self: Value) bool {
+    return v8.v8__Value__IsFloat64Array(self.handle);
+}
+
+// A few places in the code take various types, but want a string. This is a
+// type-aware version of toString(). If you do:
+//    (new ArrayBuffer(100)).toString()
+// You'll get "[object ArrayBuffer]". But this `toStringSmart()` knows about
+// buffers, and Blobs, etc and will try to return the real underlying string
+// value. It _does_ ultimately fallback to toString() - callers should check
+// for types they _don't_ want before calling this. For example, `Response`
+// checks for null or undefined before calling this to apply specific handling
+// to those cases.
+pub fn toStringSmart(self: Value) ![]const u8 {
+    if (self.isString()) |js_str| {
+        return try js_str.toSlice();
+    }
+
+    const Blob = @import("../webapi/Blob.zig");
+    if (self.local.jsValueToZig(*Blob, self)) |blob_obj| {
+        return blob_obj._slice;
+    } else |_| {}
+
+    var byte_offset: usize = 0;
+    var byte_len: usize = undefined;
+    var array_buffer: ?*const v8.ArrayBuffer = null;
+
+    if (self.isTypedArray() or self.isArrayBufferView()) {
+        const buffer_handle: *const v8.ArrayBufferView = @ptrCast(self.handle);
+        byte_len = v8.v8__ArrayBufferView__ByteLength(buffer_handle);
+        byte_offset = v8.v8__ArrayBufferView__ByteOffset(buffer_handle);
+        array_buffer = v8.v8__ArrayBufferView__Buffer(buffer_handle);
+    } else if (self.isArrayBuffer()) {
+        array_buffer = @ptrCast(self.handle);
+        byte_len = v8.v8__ArrayBuffer__ByteLength(array_buffer);
+    } else {
+        return self.toStringSlice();
+    }
+
+    const backing_store_ptr = v8.v8__ArrayBuffer__GetBackingStore(array_buffer orelse return "");
+    if (byte_len == 0) {
+        return &[_]u8{};
+    }
+
+    const backing_store_handle = v8.std__shared_ptr__v8__BackingStore__get(&backing_store_ptr) orelse return "";
+    const data = v8.v8__BackingStore__Data(backing_store_handle) orelse return "";
+    const base = @as([*]const u8, @ptrCast(data)) + byte_offset;
+
+    return base[0..byte_len];
+}
+
 pub fn isPromise(self: Value) bool {
     return v8.v8__Value__IsPromise(self.handle);
 }
@@ -222,10 +278,10 @@ pub fn toString(self: Value) !js.String {
     return .{ .local = self.local, .handle = str_handle };
 }
 
-pub fn toSSO(self: Value, comptime global: bool) !(if (global) SSO.Global else SSO) {
+pub fn toSSO(self: Value, comptime global: bool) !(if (global) lp.String.Global else lp.String) {
     return (try self.toString()).toSSO(global);
 }
-pub fn toSSOWithAlloc(self: Value, allocator: Allocator) !SSO {
+pub fn toSSOWithAlloc(self: Value, allocator: Allocator) !lp.String {
     return (try self.toString()).toSSOWithAlloc(allocator);
 }
 
@@ -245,20 +301,59 @@ pub fn toJson(self: Value, allocator: Allocator) ![]u8 {
     return js.String.toSliceWithAlloc(.{ .local = local, .handle = str_handle }, allocator);
 }
 
-// Currently does not support host objects (Blob, File, etc.) or transferables
-// which require delegate callbacks to be implemented.
+// Throws a DataCloneError for host objects (Blob, File, etc.) that cannot be serialized.
+// Does not support transferables which require additional delegate callbacks.
 pub fn structuredClone(self: Value) !Value {
-    const local = self.local;
-    const v8_context = local.handle;
-    const v8_isolate = local.isolate.handle;
+    return self.structuredCloneTo(self.local);
+}
+
+// Clone a value to a different context (within the same isolate).
+// Used for cross-context messaging (e.g., Worker <-> Page).
+pub fn structuredCloneTo(self: Value, target: *const js.Local) !Value {
+    const source_context = self.local.handle;
+    const target_context = target.handle;
+    const v8_isolate = target.isolate.handle;
+
+    const SerializerDelegate = struct {
+        // Called when V8 encounters a host object it doesn't know how to serialize.
+        // Returns false to indicate the object cannot be cloned, and throws a DataCloneError.
+        // V8 asserts has_exception() after this returns false, so we must throw here.
+        fn writeHostObject(_: ?*anyopaque, isolate: ?*v8.Isolate, _: ?*const v8.Object) callconv(.c) v8.MaybeBool {
+            const iso = isolate orelse return .{ .has_value = true, .value = false };
+            const message = v8.v8__String__NewFromUtf8(iso, "The object cannot be cloned.", v8.kNormal, -1);
+            const error_value = v8.v8__Exception__Error(message) orelse return .{ .has_value = true, .value = false };
+            _ = v8.v8__Isolate__ThrowException(iso, error_value);
+            return .{ .has_value = true, .value = false };
+        }
+
+        // Called by V8 to report serialization errors. The exception should already be thrown.
+        fn throwDataCloneError(_: ?*anyopaque, _: ?*const v8.String) callconv(.c) void {}
+
+        // Called when V8 encounters a SharedArrayBuffer. We don't support sharing them across
+        // contexts, so throw a DataCloneError and return false. V8's WriteJSArrayBuffer calls
+        // RETURN_VALUE_IF_EXCEPTION after this, so throwing prevents the fatal FromJust call.
+        fn getSharedArrayBufferId(_: ?*anyopaque, isolate: ?*v8.Isolate, _: ?*const v8.SharedArrayBuffer, _: ?*u32) callconv(.c) bool {
+            const iso = isolate orelse return false;
+            const message = v8.v8__String__NewFromUtf8(iso, "SharedArrayBuffer cannot be cloned.", v8.kNormal, -1);
+            const error_value = v8.v8__Exception__Error(message) orelse return false;
+            _ = v8.v8__Isolate__ThrowException(iso, error_value);
+            return false;
+        }
+    };
 
     const size, const data = blk: {
-        const serializer = v8.v8__ValueSerializer__New(v8_isolate, null) orelse return error.JsException;
+        const serializer = v8.v8__ValueSerializer__New(v8_isolate, &.{
+            .data = null,
+            .get_shared_array_buffer_id = SerializerDelegate.getSharedArrayBufferId,
+            .write_host_object = SerializerDelegate.writeHostObject,
+            .throw_data_clone_error = SerializerDelegate.throwDataCloneError,
+        }) orelse return error.JsException;
+
         defer v8.v8__ValueSerializer__DELETE(serializer);
 
         var write_result: v8.MaybeBool = undefined;
         v8.v8__ValueSerializer__WriteHeader(serializer);
-        v8.v8__ValueSerializer__WriteValue(serializer, v8_context, self.handle, &write_result);
+        v8.v8__ValueSerializer__WriteValue(serializer, source_context, self.handle, &write_result);
         if (!write_result.has_value or !write_result.value) {
             return error.JsException;
         }
@@ -275,14 +370,14 @@ pub fn structuredClone(self: Value) !Value {
         defer v8.v8__ValueDeserializer__DELETE(deserializer);
 
         var read_header_result: v8.MaybeBool = undefined;
-        v8.v8__ValueDeserializer__ReadHeader(deserializer, v8_context, &read_header_result);
+        v8.v8__ValueDeserializer__ReadHeader(deserializer, target_context, &read_header_result);
         if (!read_header_result.has_value or !read_header_result.value) {
             return error.JsException;
         }
-        break :blk v8.v8__ValueDeserializer__ReadValue(deserializer, v8_context) orelse return error.JsException;
+        break :blk v8.v8__ValueDeserializer__ReadValue(deserializer, target_context) orelse return error.JsException;
     };
 
-    return .{ .local = local, .handle = cloned_handle };
+    return .{ .local = target, .handle = cloned_handle };
 }
 
 pub fn persist(self: Value) !Global {
@@ -300,10 +395,10 @@ fn _persist(self: *const Value, comptime is_global: bool) !(if (is_global) Globa
     v8.v8__Global__New(ctx.isolate.handle, self.handle, &global);
     if (comptime is_global) {
         try ctx.trackGlobal(global);
-        return .{ .handle = global, .origin = {} };
+        return .{ .handle = global, .temps = {} };
     }
     try ctx.trackTemp(global);
-    return .{ .handle = global, .origin = ctx.origin };
+    return .{ .handle = global, .temps = &ctx.page.temps };
 }
 
 pub fn toZig(self: Value, comptime T: type) !T {
@@ -361,7 +456,7 @@ const GlobalType = enum(u8) {
 fn G(comptime global_type: GlobalType) type {
     return struct {
         handle: v8.Global,
-        origin: if (global_type == .temp) *js.Origin else void,
+        temps: if (global_type == .temp) *std.AutoHashMapUnmanaged(usize, v8.Global) else void,
 
         const Self = @This();
 
@@ -381,7 +476,10 @@ fn G(comptime global_type: GlobalType) type {
         }
 
         pub fn release(self: *const Self) void {
-            self.origin.releaseTemp(self.handle);
+            if (self.temps.fetchRemove(self.handle.data_ptr)) |kv| {
+                var g = kv.value;
+                v8.v8__Global__Reset(&g);
+            }
         }
     };
 }

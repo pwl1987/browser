@@ -17,23 +17,19 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+const log = lp.log;
 const builtin = @import("builtin");
-const Allocator = std.mem.Allocator;
 
-const log = @import("log.zig");
+const cli = @import("cli.zig");
 const dump = @import("browser/dump.zig");
 
+const mcp = @import("mcp.zig");
+const Storage = @import("storage/Storage.zig");
 const WebBotAuthConfig = @import("network/WebBotAuth.zig").Config;
 
-pub const RunMode = enum {
-    help,
-    fetch,
-    serve,
-    version,
-    mcp,
-};
+const Allocator = std.mem.Allocator;
 
-pub const MAX_LISTENERS = 16;
 pub const CDP_MAX_HTTP_REQUEST_SIZE = 4096;
 
 // max message size
@@ -41,11 +37,153 @@ pub const CDP_MAX_HTTP_REQUEST_SIZE = 4096;
 // +140 for the max control packet that might be interleaved in a message
 pub const CDP_MAX_MESSAGE_SIZE = 512 * 1024 + 14 + 140;
 
+// TCP keepalive parameters applied to accepted CDP connections.
+// Detection window ≈ IDLE + CNT * INTVL = 4 + 3*2 = 10s.
+pub const CDP_KEEPALIVE_IDLE_S: c_int = 4;
+pub const CDP_KEEPALIVE_INTVL_S: c_int = 2;
+pub const CDP_KEEPALIVE_CNT: c_int = 3;
+
+const Config = @This();
+
+fn logFilterScopesValidator(allocator: Allocator, args: *std.process.ArgIterator, list: *std.ArrayList(log.Scope)) !void {
+    const str = args.next() orelse return error.InvalidOption;
+
+    var it = std.mem.splitScalar(u8, str, ',');
+    while (it.next()) |part| {
+        const v = std.meta.stringToEnum(log.Scope, part) orelse {
+            log.fatal(.app, "invalid option choice", .{ .arg = "--log-filter-scopes", .value = part });
+            return error.InvalidOption;
+        };
+
+        try list.append(allocator, v);
+    }
+}
+
+fn logLevelValidator(_: Allocator, args: *std.process.ArgIterator) !?log.Level {
+    const str = args.next() orelse return error.MissingArgument;
+    if (std.mem.eql(u8, str, "error")) {
+        return .err;
+    }
+
+    return std.meta.stringToEnum(log.Level, str) orelse {
+        log.fatal(.app, "invalid option choice", .{ .arg = "--log-level", .value = str });
+        return error.InvalidArgument;
+    };
+}
+
+/// Common CLI args.
+const CommonOptions = .{
+    .{ .name = "obey_robots", .type = bool },
+    .{ .name = "proxy_bearer_token", .type = ?[:0]const u8 },
+    .{ .name = "http_proxy", .type = ?[:0]const u8 },
+    .{ .name = "http_max_concurrent", .type = ?u8 },
+    .{ .name = "http_max_host_open", .type = ?u8 },
+    .{ .name = "http_timeout", .type = ?u31 },
+    .{ .name = "http_connect_timeout", .type = ?u31 },
+    .{ .name = "http_max_response_size", .type = ?usize },
+    .{ .name = "ws_max_concurrent", .type = ?u8 },
+    .{ .name = "insecure_disable_tls_host_verification", .type = bool },
+    .{ .name = "log_level", .type = ?log.Level, .validator = logLevelValidator },
+    .{ .name = "log_format", .type = ?log.Format },
+    .{ .name = "log_filter_scopes", .type = log.Scope, .multiple = true, .validator = logFilterScopesValidator },
+    .{ .name = "user_agent_suffix", .type = ?[]const u8 },
+    .{ .name = "http_cache_dir", .type = ?[]const u8 },
+    .{ .name = "web_bot_auth_key_file", .type = ?[]const u8 },
+    .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
+    .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
+    .{ .name = "user_agent", .type = ?[]const u8 },
+    .{ .name = "block_private_networks", .type = bool },
+    .{ .name = "block_cidrs", .type = ?[]const u8 },
+    .{ .name = "cookie", .type = ?[]const u8 },
+    .{ .name = "cookie_jar", .type = ?[]const u8 },
+    .{ .name = "storage_engine", .type = ?Storage.EngineType },
+    .{ .name = "storage_sqlite_path", .type = ?[:0]const u8 },
+};
+
+fn dumpValidator(_: Allocator, args: *std.process.ArgIterator) !?DumpFormat {
+    // Peek next argument.
+    var peek_args = args.*;
+    if (peek_args.next()) |next_arg| {
+        const mode = std.meta.stringToEnum(DumpFormat, next_arg) orelse {
+            return .html;
+        };
+
+        // Skip the argument we peek if successful.
+        _ = args.next();
+        return mode;
+    }
+
+    // Means we couldn't get something like `--dump html` but we do have
+    // `--dump`; which should fall to `html` by default.
+    return .html;
+}
+
+fn waitScriptFileValidator(allocator: Allocator, args: *std.process.ArgIterator) !?[:0]const u8 {
+    const path = args.next() orelse {
+        log.fatal(.app, "missing argument value", .{ .arg = "--wait-script-file" });
+        return error.InvalidArgument;
+    };
+
+    return std.fs.cwd().readFileAllocOptions(allocator, path, 1024 * 1024, null, .of(u8), 0) catch |err| {
+        log.fatal(.app, "failed to read file", .{ .arg = "--wait-script-file", .path = path, .err = err });
+        return error.InvalidArgument;
+    };
+}
+
+/// Definition for all the commands and its arguments. See @cli.zig for further.
+const Commands = cli.Builder(.{
+    .{
+        .name = "serve",
+        .options = .{
+            .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
+            .{ .name = "port", .type = u16, .default = 9222 },
+            .{ .name = "advertise_host", .type = ?[]const u8 },
+            .{ .name = "timeout", .type = ?u31 },
+            .{ .name = "cdp_max_connections", .type = u16, .default = 16 },
+            .{ .name = "cdp_max_pending_connections", .type = u16, .default = 128 },
+        },
+        .shared_options = CommonOptions,
+    },
+    .{
+        .name = "fetch",
+        // This argument can be given out of order.
+        .positional = .{ .name = "url", .type = ?[:0]const u8 },
+        .options = .{
+            .{ .name = "dump", .type = ?DumpFormat, .validator = dumpValidator },
+            .{ .name = "with_base", .type = bool },
+            .{ .name = "with_frames", .type = bool },
+            .{ .name = "strip_mode", .type = dump.Opts.Strip, .default = dump.Opts.Strip{} },
+            .{ .name = "wait_ms", .type = u32, .default = 5_000 },
+            .{ .name = "wait_until", .type = ?WaitUntil },
+            .{
+                .name = "wait_script",
+                .type = ?[:0]const u8,
+                .variants = .{
+                    .{ .name = "wait_script_file", .validator = waitScriptFileValidator },
+                },
+            },
+            .{ .name = "wait_selector", .type = ?[:0]const u8 },
+            .{ .name = "terminate_ms", .type = ?u32 },
+        },
+        .shared_options = CommonOptions,
+    },
+    .{
+        .name = "mcp",
+        .options = .{
+            .{ .name = "cdp_port", .type = ?u16 },
+        },
+        .shared_options = CommonOptions,
+    },
+    .{ .name = "version", .options = .{} },
+    .{ .name = "help", .options = .{} },
+});
+
+pub const RunMode = Commands.Enum;
+pub const Mode = Commands.Union;
+
 mode: Mode,
 exec_name: []const u8,
 http_headers: HttpHeaders,
-
-const Config = @This();
 
 pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
     var config = Config{
@@ -63,56 +201,56 @@ pub fn deinit(self: *const Config, allocator: Allocator) void {
 
 pub fn tlsVerifyHost(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.tls_verify_host,
+        inline .serve, .fetch, .mcp => |opts| !opts.insecure_disable_tls_host_verification,
         else => unreachable,
     };
 }
 
 pub fn obeyRobots(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.obey_robots,
+        inline .serve, .fetch, .mcp => |opts| opts.obey_robots,
         else => unreachable,
     };
 }
 
 pub fn httpProxy(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.http_proxy,
+        inline .serve, .fetch, .mcp => |opts| opts.http_proxy,
         else => unreachable,
     };
 }
 
 pub fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.proxy_bearer_token,
+        inline .serve, .fetch, .mcp => |opts| opts.proxy_bearer_token,
         .help, .version => null,
     };
 }
 
 pub fn httpMaxConcurrent(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.http_max_concurrent orelse 10,
+        inline .serve, .fetch, .mcp => |opts| opts.http_max_concurrent orelse 10,
         else => unreachable,
     };
 }
 
 pub fn httpMaxHostOpen(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.http_max_host_open orelse 4,
+        inline .serve, .fetch, .mcp => |opts| opts.http_max_host_open orelse 4,
         else => unreachable,
     };
 }
 
 pub fn httpConnectTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.http_connect_timeout orelse 0,
+        inline .serve, .fetch, .mcp => |opts| opts.http_connect_timeout orelse 0,
         else => unreachable,
     };
 }
 
 pub fn httpTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.http_timeout orelse 5000,
+        inline .serve, .fetch, .mcp => |opts| opts.http_timeout orelse 5000,
         else => unreachable,
     };
 }
@@ -123,42 +261,86 @@ pub fn httpMaxRedirects(_: *const Config) u8 {
 
 pub fn httpMaxResponseSize(self: *const Config) ?usize {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.http_max_response_size,
+        inline .serve, .fetch, .mcp => |opts| opts.http_max_response_size,
+        else => unreachable,
+    };
+}
+
+pub fn wsMaxConcurrent(self: *const Config) u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.ws_max_concurrent orelse 8,
         else => unreachable,
     };
 }
 
 pub fn logLevel(self: *const Config) ?log.Level {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.log_level,
+        inline .serve, .fetch, .mcp => |opts| opts.log_level,
         else => unreachable,
     };
 }
 
 pub fn logFormat(self: *const Config) ?log.Format {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.log_format,
+        inline .serve, .fetch, .mcp => |opts| opts.log_format,
         else => unreachable,
     };
 }
 
-pub fn logFilterScopes(self: *const Config) ?[]const log.Scope {
+pub fn logFilterScopes(self: *const Config) std.ArrayList(log.Scope) {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.log_filter_scopes,
+        inline .serve, .fetch, .mcp => |opts| opts.log_filter_scopes,
         else => unreachable,
     };
 }
 
 pub fn userAgentSuffix(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp => |opts| opts.common.user_agent_suffix,
+        inline .serve, .fetch, .mcp => |opts| opts.user_agent_suffix,
         .help, .version => null,
     };
 }
 
-pub fn cdpTimeout(self: *const Config) usize {
+pub fn userAgent(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        .serve => |opts| if (opts.timeout > 604_800) 604_800_000 else @as(usize, opts.timeout) * 1000,
+        inline .serve, .fetch, .mcp => |opts| opts.user_agent,
+        .help, .version => null,
+    };
+}
+
+pub fn httpCacheDir(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.http_cache_dir,
+        else => null,
+    };
+}
+
+pub fn cookieFile(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.cookie,
+        else => null,
+    };
+}
+
+pub fn cookieJarFile(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        inline .fetch, .mcp => |opts| opts.cookie_jar,
+        else => null,
+    };
+}
+
+pub fn port(self: *const Config) u16 {
+    return switch (self.mode) {
+        .serve => |opts| opts.port,
+        .mcp => |opts| opts.cdp_port orelse 0,
+        else => unreachable,
+    };
+}
+
+pub fn advertiseHost(self: *const Config) []const u8 {
+    return switch (self.mode) {
+        .serve => |opts| opts.advertise_host orelse opts.host,
+        .mcp => "127.0.0.1",
         else => unreachable,
     };
 }
@@ -166,17 +348,32 @@ pub fn cdpTimeout(self: *const Config) usize {
 pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
     return switch (self.mode) {
         inline .serve, .fetch, .mcp => |opts| WebBotAuthConfig{
-            .key_file = opts.common.web_bot_auth_key_file orelse return null,
-            .keyid = opts.common.web_bot_auth_keyid orelse return null,
-            .domain = opts.common.web_bot_auth_domain orelse return null,
+            .key_file = opts.web_bot_auth_key_file orelse return null,
+            .keyid = opts.web_bot_auth_keyid orelse return null,
+            .domain = opts.web_bot_auth_domain orelse return null,
         },
         .help, .version => null,
+    };
+}
+
+pub fn blockPrivateNetworks(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.block_private_networks,
+        else => unreachable,
+    };
+}
+
+pub fn blockCidrs(self: *const Config) ?[]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.block_cidrs,
+        else => unreachable,
     };
 }
 
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_connections,
+        .mcp => 16,
         else => unreachable,
     };
 }
@@ -184,31 +381,24 @@ pub fn maxConnections(self: *const Config) u16 {
 pub fn maxPendingConnections(self: *const Config) u31 {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_pending_connections,
+        .mcp => 128,
         else => unreachable,
     };
 }
 
-pub const Mode = union(RunMode) {
-    help: bool, // false when being printed because of an error
-    fetch: Fetch,
-    serve: Serve,
-    version: void,
-    mcp: Mcp,
-};
+pub fn storageEngine(self: *const Config) ?Storage.EngineType {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.storage_engine,
+        else => unreachable,
+    };
+}
 
-pub const Serve = struct {
-    host: []const u8 = "127.0.0.1",
-    port: u16 = 9222,
-    timeout: u31 = 10,
-    cdp_max_connections: u16 = 16,
-    cdp_max_pending_connections: u16 = 128,
-    common: Common = .{},
-};
-
-pub const Mcp = struct {
-    common: Common = .{},
-};
-
+pub fn storageSqlitePath(self: *const Config) ?[:0]const u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp => |opts| opts.storage_sqlite_path,
+        else => unreachable,
+    };
+}
 pub const DumpFormat = enum {
     html,
     markdown,
@@ -217,33 +407,11 @@ pub const DumpFormat = enum {
     semantic_tree_text,
 };
 
-pub const Fetch = struct {
-    url: [:0]const u8,
-    dump_mode: ?DumpFormat = null,
-    common: Common = .{},
-    with_base: bool = false,
-    with_frames: bool = false,
-    strip: dump.Opts.Strip = .{},
-};
-
-pub const Common = struct {
-    obey_robots: bool = false,
-    proxy_bearer_token: ?[:0]const u8 = null,
-    http_proxy: ?[:0]const u8 = null,
-    http_max_concurrent: ?u8 = null,
-    http_max_host_open: ?u8 = null,
-    http_timeout: ?u31 = null,
-    http_connect_timeout: ?u31 = null,
-    http_max_response_size: ?usize = null,
-    tls_verify_host: bool = true,
-    log_level: ?log.Level = null,
-    log_format: ?log.Format = null,
-    log_filter_scopes: ?[]log.Scope = null,
-    user_agent_suffix: ?[]const u8 = null,
-
-    web_bot_auth_key_file: ?[]const u8 = null,
-    web_bot_auth_keyid: ?[]const u8 = null,
-    web_bot_auth_domain: ?[]const u8 = null,
+pub const WaitUntil = enum {
+    load,
+    domcontentloaded,
+    networkidle,
+    done,
 };
 
 /// Pre-formatted HTTP headers for reuse across Http and Client.
@@ -251,17 +419,46 @@ pub const Common = struct {
 pub const HttpHeaders = struct {
     const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
 
+    const Brand = struct {
+        brand: [:0]const u8,
+        version: [:0]const u8,
+    };
+
+    /// Source of truth for client-hints brand data. Both the Sec-Ch-Ua
+    /// HTTP header and navigator.userAgentData.brands derive from this
+    /// list, so the two sides cannot drift.
+    pub const brands = [_]Brand{
+        .{ .brand = "Lightpanda", .version = "1" },
+    };
+
+    pub const sec_ch_ua: [:0]const u8 = blk: {
+        var out: [:0]const u8 = "Sec-Ch-Ua:";
+        for (brands, 0..) |b, i| {
+            const sep = if (i == 0) " " else ", ";
+            out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
+        }
+        break :blk out;
+    };
+
+    // Some bot-protection frontends (e.g. Akamai on canada.ca) RST the HTTP/2
+    // stream when a client sends Accept-Encoding without Accept-Language,
+    // treating it as a bot signal. Ship a neutral default so we look like a
+    // normal client.
+    pub const accept_language: [:0]const u8 = "Accept-Language: en-US,en;q=0.9";
+
     user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
     user_agent_header: [:0]const u8,
 
     proxy_bearer_header: ?[:0]const u8,
 
     pub fn init(allocator: Allocator, config: *const Config) !HttpHeaders {
-        const user_agent: [:0]const u8 = if (config.userAgentSuffix()) |suffix|
+        const user_agent: [:0]const u8 = if (config.userAgent()) |ua|
+            try allocator.dupeZ(u8, ua)
+        else if (config.userAgentSuffix()) |suffix|
             try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ user_agent_base, suffix }, 0)
         else
             user_agent_base;
-        errdefer if (config.userAgentSuffix() != null) allocator.free(user_agent);
+        errdefer if (config.userAgent() != null or config.userAgentSuffix() != null) allocator.free(user_agent);
 
         const user_agent_header = try std.fmt.allocPrintSentinel(allocator, "User-Agent: {s}", .{user_agent}, 0);
         errdefer allocator.free(user_agent_header);
@@ -293,105 +490,175 @@ pub fn printUsageAndExit(self: *const Config, success: bool) void {
     //                                                                     MAX_HELP_LEN|
     const common_options =
         \\
-        \\--insecure_disable_tls_host_verification
+        \\--insecure-disable-tls-host-verification
         \\                Disables host verification on all HTTP requests. This is an
         \\                advanced option which should only be set if you understand
         \\                and accept the risk of disabling host verification.
         \\
-        \\--obey_robots
+        \\--obey-robots
         \\                Fetches and obeys the robots.txt (if available) of the web pages
         \\                we make requests towards.
         \\                Defaults to false.
         \\
-        \\--http_proxy    The HTTP proxy to use for all HTTP requests.
+        \\--block-private-networks
+        \\                Blocks HTTP requests to private/internal IP addresses
+        \\                after DNS resolution. Useful for sandboxing, multi-tenant
+        \\                deployments, and preventing access to internal infrastructure
+        \\                regardless of what triggers the request (JavaScript, HTML
+        \\                resources, redirects, etc.).
+        \\                Defaults to false.
+        \\
+        \\--block-cidrs
+        \\                Additional CIDR ranges to block, comma-separated.
+        \\                Prefix with '-' to allow (exempt from blocking).
+        \\                e.g. --block-cidrs 169.254.169.254/32,fd00:ec2::254/128
+        \\                e.g. --block-cidrs 10.0.0.0/8,-10.0.0.42/32
+        \\                Can be used standalone or combined with --block-private-networks.
+        \\
+        \\--http-proxy    The HTTP proxy to use for all HTTP requests.
         \\                A username:password can be included for basic authentication.
         \\                Defaults to none.
         \\
-        \\--proxy_bearer_token
+        \\--proxy-bearer-token
         \\                The <token> to send for bearer authentication with the proxy
         \\                Proxy-Authorization: Bearer <token>
         \\
-        \\--http_max_concurrent
+        \\--http-max-concurrent
         \\                The maximum number of concurrent HTTP requests.
         \\                Defaults to 10.
         \\
-        \\--http_max_host_open
+        \\--http-max-host-open
         \\                The maximum number of open connection to a given host:port.
         \\                Defaults to 4.
         \\
-        \\--http_connect_timeout
+        \\--http-connect-timeout
         \\                The time, in milliseconds, for establishing an HTTP connection
         \\                before timing out. 0 means it never times out.
         \\                Defaults to 0.
         \\
-        \\--http_timeout
+        \\--http-timeout
         \\                The maximum time, in milliseconds, the transfer is allowed
         \\                to complete. 0 means it never times out.
         \\                Defaults to 10000.
         \\
-        \\--http_max_response_size
+        \\--http-max-response-size
         \\                Limits the acceptable response size for any request
         \\                (e.g. XHR, fetch, script loading, ...).
         \\                Defaults to no limit.
         \\
-        \\--log_level     The log level: debug, info, warn, error or fatal.
+        \\--ws-max-concurrent
+        \\                The maximum number of concurrent WebSocket connections.
+        \\                Defaults to 8.
+        \\
+        \\--log-level     The log level: debug, info, warn, error or fatal.
         \\                Defaults to
     ++ (if (builtin.mode == .Debug) " info." else "warn.") ++
         \\
         \\
-        \\--log_format    The log format: pretty or logfmt.
+        \\--log-format    The log format: pretty or logfmt.
         \\                Defaults to
     ++ (if (builtin.mode == .Debug) " pretty." else " logfmt.") ++
         \\
         \\
-        \\--log_filter_scopes
+        \\--log-filter-scopes
         \\                Filter out too verbose logs per scope:
         \\                http, unknown_prop, event, ...
         \\
-        \\--user_agent_suffix
+        \\--user-agent    Override the User-Agent header entirely
+        \\                User-Agent mustn't impersonate other browser.
+        \\                Any value containing "Mozilla" is forbidden.
+        \\                The browser will continue to send Sec-Ch-Ua header.
+        \\                Incompatible with --user-agent-suffix
+        \\
+        \\--user-agent-suffix
         \\                Suffix to append to the Lightpanda/X.Y User-Agent
         \\
-        \\--web_bot_auth_key_file
+        \\--web-bot-auth-key-file
         \\                Path to the Ed25519 private key PEM file.
         \\
-        \\--web_bot_auth_keyid
+        \\--web-bot-auth-keyid
         \\                The JWK thumbprint of your public key.
         \\
-        \\--web_bot_auth_domain
+        \\--web-bot-auth-domain
         \\                Your domain e.g. yourdomain.com
+        \\
+        \\--http-cache-dir
+        \\                Path to a directory to use as a Filesystem Cache for network resources.
+        \\                Omitting this will result is no caching.
+        \\                Defaults to no caching.
+        \\
+        \\--storage-engine
+        \\                The storage engine to use. Choices are: none, sqlite.
+        \\                Default to none.
+        \\
+        \\--storage-sqlite-path
+        \\                Path to SQLite database file for persistent storage.
+        \\                Use ":memory:" for in-memory storage.
     ;
 
     //                                                                     MAX_HELP_LEN|
     const usage =
-        \\usage: {s} command [options] [URL]
+        \\usage: {0s} command [options] [URL]
         \\
         \\Command can be either 'fetch', 'serve', 'mcp' or 'help'
         \\
         \\fetch command
         \\Fetches the specified URL
-        \\Example: {s} fetch --dump html https://lightpanda.io/
+        \\Example: {0s} fetch --dump html https://lightpanda.io/
         \\
         \\Options:
         \\--dump          Dumps document to stdout.
         \\                Argument must be 'html', 'markdown', 'semantic_tree', or 'semantic_tree_text'.
         \\                Defaults to no dump.
         \\
-        \\--strip_mode    Comma separated list of tag groups to remove from dump
-        \\                the dump. e.g. --strip_mode js,css
+        \\--strip-mode    Comma separated list of tag groups to remove from dump
+        \\                the dump. e.g. --strip-mode js,css
         \\                  - "js" script and link[as=script, rel=preload]
         \\                  - "ui" includes img, picture, video, css and svg
         \\                  - "css" includes style and link[rel=stylesheet]
         \\                  - "full" includes js, ui and css
         \\
-        \\--with_base     Add a <base> tag in dump. Defaults to false.
+        \\--with-base     Add a <base> tag in dump. Defaults to false.
         \\
-        \\--with_frames   Includes the contents of iframes. Defaults to false.
+        \\--with-frames   Includes the contents of iframes. Defaults to false.
+        \\
+        \\--wait-ms       Wait time in milliseconds. Supersedes all other --wait
+        \\                parameters.
+        \\                Defaults to 5000.
+        \\
+        \\--wait-until    Wait until the specified event. Checked before the other
+        \\                --wait- options. Supported events: load, domcontentloaded,
+        \\                networkidle, done.
+        \\                Defaults to 'done'. If --wait-selector, --wait-script or
+        \\                --wait-script-file are specified, defaults to none.
+        \\
+        \\--wait-selector Wait for an element matching the CSS selector to appear.
+        \\                Checked after --wait-until condition is met.
+        \\
+        \\--wait-script   Wait for a JavaScript expression to return truthy.
+        \\                Checked after --wait-until condition is met.
+        \\
+        \\--wait-script-file
+        \\                Like --wait-script, but reads the script from a file.
+        \\
+        \\--terminate-ms  Hard deadline in milliseconds. After this time elapses,
+        \\                JavaScript execution is forcibly terminated (e.g. for
+        \\                pages with endless scripts). Unlike --wait-ms, which
+        \\                only stops waiting, --terminate-ms aborts the page.
+        \\                Defaults to no terminate.
+        \\
+        \\--cookie        Path to a JSON file to load cookies from (read-only).
+        \\                Defaults to no cookie loading.
+        \\
+        \\--cookie-jar    Path to a JSON file to save cookies to on exit (write-only).
+        \\                Available for fetch and mcp commands.
+        \\                Defaults to no cookie saving.
         \\
     ++ common_options ++
         \\
         \\serve command
         \\Starts a websocket CDP server
-        \\Example: {s} serve --host 127.0.0.1 --port 9222
+        \\Example: {0s} serve --host 127.0.0.1 --port 9222
         \\
         \\Options:
         \\--host          Host of the CDP server
@@ -400,33 +667,45 @@ pub fn printUsageAndExit(self: *const Config, success: bool) void {
         \\--port          Port of the CDP server
         \\                Defaults to 9222
         \\
-        \\--timeout       Inactivity timeout in seconds before disconnecting clients
-        \\                Defaults to 10 (seconds). Limited to 604800 (1 week).
+        \\--advertise-host
+        \\                The host to advertise, e.g. in the /json/version response.
+        \\                Useful, for example, when --host is 0.0.0.0.
+        \\                Defaults to --host value
         \\
-        \\--cdp_max_connections
+        \\--cdp-max-connections
         \\                Maximum number of simultaneous CDP connections.
         \\                Defaults to 16.
         \\
-        \\--cdp_max_pending_connections
+        \\--cdp-max-pending-connections
         \\                Maximum pending connections in the accept queue.
         \\                Defaults to 128.
+        \\
+        \\--cookie        Path to a JSON file to load cookies from (read-only).
+        \\                Defaults to no cookie loading.
         \\
     ++ common_options ++
         \\
         \\mcp command
         \\Starts an MCP (Model Context Protocol) server over stdio
-        \\Example: {s} mcp
+        \\Example: {0s} mcp
+        \\
+        \\--cookie        Path to a JSON file to load cookies from (read-only).
+        \\                Defaults to no cookie loading.
+        \\
+        \\--cookie-jar    Path to a JSON file to save cookies to on exit (write-only).
+        \\                Available for fetch and mcp commands.
+        \\                Defaults to no cookie saving.
         \\
     ++ common_options ++
         \\
         \\version command
-        \\Displays the version of {s}
+        \\Displays the version of {0s}
         \\
         \\help command
         \\Displays this message
         \\
     ;
-    std.debug.print(usage, .{ self.exec_name, self.exec_name, self.exec_name, self.exec_name, self.exec_name });
+    std.debug.print(usage, .{self.exec_name});
     if (success) {
         return std.process.cleanExit();
     }
@@ -434,478 +713,21 @@ pub fn printUsageAndExit(self: *const Config, success: bool) void {
 }
 
 pub fn parseArgs(allocator: Allocator) !Config {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-
-    const exec_name = try allocator.dupe(u8, std.fs.path.basename(args.next().?));
-
-    const mode_string = args.next() orelse "";
-    const run_mode = std.meta.stringToEnum(RunMode, mode_string) orelse blk: {
-        const inferred_mode = inferMode(mode_string) orelse
-            return init(allocator, exec_name, .{ .help = false });
-        // "command" wasn't a command but an option. We can't reset args, but
-        // we can create a new one. Not great, but this fallback is temporary
-        // as we transition to this command mode approach.
-        args.deinit();
-
-        args = try std.process.argsWithAllocator(allocator);
-        // skip the exec_name
-        _ = args.skip();
-
-        break :blk inferred_mode;
-    };
-
-    const mode: Mode = switch (run_mode) {
-        .help => .{ .help = true },
-        .serve => .{ .serve = parseServeArgs(allocator, &args) catch
-            return init(allocator, exec_name, .{ .help = false }) },
-        .fetch => .{ .fetch = parseFetchArgs(allocator, &args) catch
-            return init(allocator, exec_name, .{ .help = false }) },
-        .mcp => .{ .mcp = parseMcpArgs(allocator, &args) catch
-            return init(allocator, exec_name, .{ .help = false }) },
-        .version => .{ .version = {} },
-    };
-    return init(allocator, exec_name, mode);
+    const exec_name, const command = try Commands.parse(allocator);
+    if (command == .serve and command.serve.timeout != null) {
+        log.warn(.app, "--timeout is deprecated", .{});
+    }
+    return .init(allocator, exec_name, command);
 }
 
-fn inferMode(opt: []const u8) ?RunMode {
-    if (opt.len == 0) {
-        return .serve;
-    }
-
-    if (std.mem.startsWith(u8, opt, "--") == false) {
-        return .fetch;
-    }
-
-    if (std.mem.eql(u8, opt, "--dump")) {
-        return .fetch;
-    }
-
-    if (std.mem.eql(u8, opt, "--noscript")) {
-        return .fetch;
-    }
-
-    if (std.mem.eql(u8, opt, "--strip_mode")) {
-        return .fetch;
-    }
-
-    if (std.mem.eql(u8, opt, "--with_base")) {
-        return .fetch;
-    }
-
-    if (std.mem.eql(u8, opt, "--with_frames")) {
-        return .fetch;
-    }
-
-    if (std.mem.eql(u8, opt, "--host")) {
-        return .serve;
-    }
-
-    if (std.mem.eql(u8, opt, "--port")) {
-        return .serve;
-    }
-
-    if (std.mem.eql(u8, opt, "--timeout")) {
-        return .serve;
-    }
-
-    return null;
-}
-
-fn parseServeArgs(
-    allocator: Allocator,
-    args: *std.process.ArgIterator,
-) !Serve {
-    var serve: Serve = .{};
-
-    while (args.next()) |opt| {
-        if (std.mem.eql(u8, "--host", opt)) {
-            const str = args.next() orelse {
-                log.fatal(.app, "missing argument value", .{ .arg = "--host" });
-                return error.InvalidArgument;
-            };
-            serve.host = try allocator.dupe(u8, str);
-            continue;
+pub fn validateUserAgent(ua: []const u8) !void {
+    for (ua) |c| {
+        if (!std.ascii.isPrint(c)) {
+            return error.NonPrintable;
         }
-
-        if (std.mem.eql(u8, "--port", opt)) {
-            const str = args.next() orelse {
-                log.fatal(.app, "missing argument value", .{ .arg = "--port" });
-                return error.InvalidArgument;
-            };
-
-            serve.port = std.fmt.parseInt(u16, str, 10) catch |err| {
-                log.fatal(.app, "invalid argument value", .{ .arg = "--port", .err = err });
-                return error.InvalidArgument;
-            };
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--timeout", opt)) {
-            const str = args.next() orelse {
-                log.fatal(.app, "missing argument value", .{ .arg = "--timeout" });
-                return error.InvalidArgument;
-            };
-
-            serve.timeout = std.fmt.parseInt(u31, str, 10) catch |err| {
-                log.fatal(.app, "invalid argument value", .{ .arg = "--timeout", .err = err });
-                return error.InvalidArgument;
-            };
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--cdp_max_connections", opt)) {
-            const str = args.next() orelse {
-                log.fatal(.app, "missing argument value", .{ .arg = "--cdp_max_connections" });
-                return error.InvalidArgument;
-            };
-
-            serve.cdp_max_connections = std.fmt.parseInt(u16, str, 10) catch |err| {
-                log.fatal(.app, "invalid argument value", .{ .arg = "--cdp_max_connections", .err = err });
-                return error.InvalidArgument;
-            };
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--cdp_max_pending_connections", opt)) {
-            const str = args.next() orelse {
-                log.fatal(.app, "missing argument value", .{ .arg = "--cdp_max_pending_connections" });
-                return error.InvalidArgument;
-            };
-
-            serve.cdp_max_pending_connections = std.fmt.parseInt(u16, str, 10) catch |err| {
-                log.fatal(.app, "invalid argument value", .{ .arg = "--cdp_max_pending_connections", .err = err });
-                return error.InvalidArgument;
-            };
-            continue;
-        }
-
-        if (try parseCommonArg(allocator, opt, args, &serve.common)) {
-            continue;
-        }
-
-        log.fatal(.app, "unknown argument", .{ .mode = "serve", .arg = opt });
-        return error.UnkownOption;
     }
 
-    return serve;
-}
-
-fn parseMcpArgs(
-    allocator: Allocator,
-    args: *std.process.ArgIterator,
-) !Mcp {
-    var mcp: Mcp = .{};
-
-    while (args.next()) |opt| {
-        if (try parseCommonArg(allocator, opt, args, &mcp.common)) {
-            continue;
-        }
-
-        log.fatal(.mcp, "unknown argument", .{ .mode = "mcp", .arg = opt });
-        return error.UnkownOption;
+    if (std.ascii.indexOfIgnoreCase(ua, "mozilla") != null) {
+        return error.Reserved;
     }
-
-    return mcp;
-}
-
-fn parseFetchArgs(
-    allocator: Allocator,
-    args: *std.process.ArgIterator,
-) !Fetch {
-    var dump_mode: ?DumpFormat = null;
-    var with_base: bool = false;
-    var with_frames: bool = false;
-    var url: ?[:0]const u8 = null;
-    var common: Common = .{};
-    var strip: dump.Opts.Strip = .{};
-
-    while (args.next()) |opt| {
-        if (std.mem.eql(u8, "--dump", opt)) {
-            var peek_args = args.*;
-            if (peek_args.next()) |next_arg| {
-                if (std.meta.stringToEnum(DumpFormat, next_arg)) |mode| {
-                    dump_mode = mode;
-                    _ = args.next();
-                } else {
-                    dump_mode = .html;
-                }
-            } else {
-                dump_mode = .html;
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--noscript", opt)) {
-            log.warn(.app, "deprecation warning", .{
-                .feature = "--noscript argument",
-                .hint = "use '--strip_mode js' instead",
-            });
-            strip.js = true;
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--with_base", opt)) {
-            with_base = true;
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--with_frames", opt)) {
-            with_frames = true;
-            continue;
-        }
-
-        if (std.mem.eql(u8, "--strip_mode", opt)) {
-            const str = args.next() orelse {
-                log.fatal(.app, "missing argument value", .{ .arg = "--strip_mode" });
-                return error.InvalidArgument;
-            };
-
-            var it = std.mem.splitScalar(u8, str, ',');
-            while (it.next()) |part| {
-                const trimmed = std.mem.trim(u8, part, &std.ascii.whitespace);
-                if (std.mem.eql(u8, trimmed, "js")) {
-                    strip.js = true;
-                } else if (std.mem.eql(u8, trimmed, "ui")) {
-                    strip.ui = true;
-                } else if (std.mem.eql(u8, trimmed, "css")) {
-                    strip.css = true;
-                } else if (std.mem.eql(u8, trimmed, "full")) {
-                    strip.js = true;
-                    strip.ui = true;
-                    strip.css = true;
-                } else {
-                    log.fatal(.app, "invalid option choice", .{ .arg = "--strip_mode", .value = trimmed });
-                }
-            }
-            continue;
-        }
-
-        if (try parseCommonArg(allocator, opt, args, &common)) {
-            continue;
-        }
-
-        if (std.mem.startsWith(u8, opt, "--")) {
-            log.fatal(.app, "unknown argument", .{ .mode = "fetch", .arg = opt });
-            return error.UnkownOption;
-        }
-
-        if (url != null) {
-            log.fatal(.app, "duplicate fetch url", .{ .help = "only 1 URL can be specified" });
-            return error.TooManyURLs;
-        }
-        url = try allocator.dupeZ(u8, opt);
-    }
-
-    if (url == null) {
-        log.fatal(.app, "missing fetch url", .{ .help = "URL to fetch must be provided" });
-        return error.MissingURL;
-    }
-
-    return .{
-        .url = url.?,
-        .dump_mode = dump_mode,
-        .strip = strip,
-        .common = common,
-        .with_base = with_base,
-        .with_frames = with_frames,
-    };
-}
-
-fn parseCommonArg(
-    allocator: Allocator,
-    opt: []const u8,
-    args: *std.process.ArgIterator,
-    common: *Common,
-) !bool {
-    if (std.mem.eql(u8, "--insecure_disable_tls_host_verification", opt)) {
-        common.tls_verify_host = false;
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--obey_robots", opt)) {
-        common.obey_robots = true;
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--http_proxy", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--http_proxy" });
-            return error.InvalidArgument;
-        };
-        common.http_proxy = try allocator.dupeZ(u8, str);
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--proxy_bearer_token", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--proxy_bearer_token" });
-            return error.InvalidArgument;
-        };
-        common.proxy_bearer_token = try allocator.dupeZ(u8, str);
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--http_max_concurrent", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--http_max_concurrent" });
-            return error.InvalidArgument;
-        };
-
-        common.http_max_concurrent = std.fmt.parseInt(u8, str, 10) catch |err| {
-            log.fatal(.app, "invalid argument value", .{ .arg = "--http_max_concurrent", .err = err });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--http_max_host_open", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--http_max_host_open" });
-            return error.InvalidArgument;
-        };
-
-        common.http_max_host_open = std.fmt.parseInt(u8, str, 10) catch |err| {
-            log.fatal(.app, "invalid argument value", .{ .arg = "--http_max_host_open", .err = err });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--http_connect_timeout", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--http_connect_timeout" });
-            return error.InvalidArgument;
-        };
-
-        common.http_connect_timeout = std.fmt.parseInt(u31, str, 10) catch |err| {
-            log.fatal(.app, "invalid argument value", .{ .arg = "--http_connect_timeout", .err = err });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--http_timeout", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--http_timeout" });
-            return error.InvalidArgument;
-        };
-
-        common.http_timeout = std.fmt.parseInt(u31, str, 10) catch |err| {
-            log.fatal(.app, "invalid argument value", .{ .arg = "--http_timeout", .err = err });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--http_max_response_size", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--http_max_response_size" });
-            return error.InvalidArgument;
-        };
-
-        common.http_max_response_size = std.fmt.parseInt(usize, str, 10) catch |err| {
-            log.fatal(.app, "invalid argument value", .{ .arg = "--http_max_response_size", .err = err });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--log_level", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--log_level" });
-            return error.InvalidArgument;
-        };
-
-        common.log_level = std.meta.stringToEnum(log.Level, str) orelse blk: {
-            if (std.mem.eql(u8, str, "error")) {
-                break :blk .err;
-            }
-            log.fatal(.app, "invalid option choice", .{ .arg = "--log_level", .value = str });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--log_format", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--log_format" });
-            return error.InvalidArgument;
-        };
-
-        common.log_format = std.meta.stringToEnum(log.Format, str) orelse {
-            log.fatal(.app, "invalid option choice", .{ .arg = "--log_format", .value = str });
-            return error.InvalidArgument;
-        };
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--log_filter_scopes", opt)) {
-        if (builtin.mode != .Debug) {
-            log.fatal(.app, "experimental", .{ .help = "log scope filtering is only available in debug builds" });
-            return false;
-        }
-
-        const str = args.next() orelse {
-            // disables the default filters
-            common.log_filter_scopes = &.{};
-            return true;
-        };
-
-        var arr: std.ArrayList(log.Scope) = .empty;
-
-        var it = std.mem.splitScalar(u8, str, ',');
-        while (it.next()) |part| {
-            try arr.append(allocator, std.meta.stringToEnum(log.Scope, part) orelse {
-                log.fatal(.app, "invalid option choice", .{ .arg = "--log_filter_scopes", .value = part });
-                return false;
-            });
-        }
-        common.log_filter_scopes = arr.items;
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--user_agent_suffix", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--user_agent_suffix" });
-            return error.InvalidArgument;
-        };
-        for (str) |c| {
-            if (!std.ascii.isPrint(c)) {
-                log.fatal(.app, "not printable character", .{ .arg = "--user_agent_suffix" });
-                return error.InvalidArgument;
-            }
-        }
-        common.user_agent_suffix = try allocator.dupe(u8, str);
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--web_bot_auth_key_file", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--web_bot_auth_key_file" });
-            return error.InvalidArgument;
-        };
-        common.web_bot_auth_key_file = try allocator.dupe(u8, str);
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--web_bot_auth_keyid", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--web_bot_auth_keyid" });
-            return error.InvalidArgument;
-        };
-        common.web_bot_auth_keyid = try allocator.dupe(u8, str);
-        return true;
-    }
-
-    if (std.mem.eql(u8, "--web_bot_auth_domain", opt)) {
-        const str = args.next() orelse {
-            log.fatal(.app, "missing argument value", .{ .arg = "--web_bot_auth_domain" });
-            return error.InvalidArgument;
-        };
-        common.web_bot_auth_domain = try allocator.dupe(u8, str);
-        return true;
-    }
-
-    return false;
 }

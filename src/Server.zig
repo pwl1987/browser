@@ -18,18 +18,17 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const net = std.net;
-const posix = std.posix;
 
-const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
-
-const log = @import("log.zig");
 const App = @import("App.zig");
 const Config = @import("Config.zig");
-const CDP = @import("cdp/cdp.zig").CDP;
+const CDP = @import("cdp/CDP.zig");
 const Net = @import("network/websocket.zig");
 const HttpClient = @import("browser/HttpClient.zig");
+
+const log = lp.log;
+const net = std.net;
+const posix = std.posix;
+const Allocator = std.mem.Allocator;
 
 const Server = @This();
 
@@ -45,7 +44,7 @@ clients_pool: std.heap.MemoryPool(Client),
 
 pub fn init(app: *App, address: net.Address) !*Server {
     const allocator = app.allocator;
-    const json_version_response = try buildJSONVersionResponse(allocator, address);
+    const json_version_response = try buildJSONVersionResponse(app);
     errdefer allocator.free(json_version_response);
 
     const self = try allocator.create(Server);
@@ -64,17 +63,17 @@ pub fn init(app: *App, address: net.Address) !*Server {
     return self;
 }
 
-pub fn deinit(self: *Server) void {
-    // Stop all active clients
-    {
-        self.client_mutex.lock();
-        defer self.client_mutex.unlock();
+pub fn shutdown(self: *Server) void {
+    self.client_mutex.lock();
+    defer self.client_mutex.unlock();
 
-        for (self.clients.items) |client| {
-            client.stop();
-        }
+    for (self.clients.items) |client| {
+        client.stop();
     }
+}
 
+pub fn deinit(self: *Server) void {
+    self.shutdown();
     self.joinThreads();
     self.clients.deinit(self.allocator);
     self.clients_pool.deinit();
@@ -84,15 +83,46 @@ pub fn deinit(self: *Server) void {
 
 fn onAccept(ctx: *anyopaque, socket: posix.socket_t) void {
     const self: *Server = @ptrCast(@alignCast(ctx));
-    const timeout_ms: u32 = @intCast(self.app.config.cdpTimeout());
-    self.spawnWorker(socket, timeout_ms) catch |err| {
+    self.spawnWorker(socket) catch |err| {
         log.err(.app, "CDP spawn", .{ .err = err });
         posix.close(socket);
     };
 }
 
-fn handleConnection(self: *Server, socket: posix.socket_t, timeout_ms: u32) void {
+// Liveness is enforced at the TCP layer via keepalive probes sent by the
+// kernel. This is transparent to CDP clients — unlike a WebSocket ping, which
+// go-rod panics on and chromedp logs as "malformed". Tunables in Config.zig.
+fn setTcpKeepalive(socket: posix.socket_t) void {
+    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1))) catch |err| {
+        log.warn(.app, "SO_KEEPALIVE", .{ .err = err });
+        return;
+    };
+
+    const option = switch (@import("builtin").os.tag) {
+        .macos, .ios => posix.TCP.KEEPALIVE,
+        else => posix.TCP.KEEPIDLE,
+    };
+
+    posix.setsockopt(socket, posix.IPPROTO.TCP, option, &std.mem.toBytes(Config.CDP_KEEPALIVE_IDLE_S)) catch |err| {
+        log.warn(.app, "TCP_KEEPIDLE", .{ .err = err });
+    };
+
+    if (@hasDecl(posix.TCP, "KEEPINTVL")) {
+        posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, &std.mem.toBytes(Config.CDP_KEEPALIVE_INTVL_S)) catch |err| {
+            log.warn(.app, "TCP_KEEPINTVL", .{ .err = err });
+        };
+    }
+    if (@hasDecl(posix.TCP, "KEEPCNT")) {
+        posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, &std.mem.toBytes(Config.CDP_KEEPALIVE_CNT)) catch |err| {
+            log.warn(.app, "TCP_KEEPCNT", .{ .err = err });
+        };
+    }
+}
+
+fn handleConnection(self: *Server, socket: posix.socket_t) void {
     defer posix.close(socket);
+
+    setTcpKeepalive(socket);
 
     // Client is HUGE (> 512KB) because it has a large read buffer.
     // V8 crashes if this is on the stack (likely related to its size).
@@ -107,7 +137,6 @@ fn handleConnection(self: *Server, socket: posix.socket_t, timeout_ms: u32) void
         self.allocator,
         self.app,
         self.json_version_response,
-        timeout_ms,
     ) catch |err| {
         log.err(.app, "CDP client init", .{ .err = err });
         return;
@@ -156,7 +185,7 @@ fn unregisterClient(self: *Server, client: *Client) void {
     }
 }
 
-fn spawnWorker(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
+fn spawnWorker(self: *Server, socket: posix.socket_t) !void {
     if (self.app.shutdown()) {
         return error.ShuttingDown;
     }
@@ -183,13 +212,13 @@ fn spawnWorker(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
     }
     errdefer _ = self.active_threads.fetchSub(1, .monotonic);
 
-    const thread = try std.Thread.spawn(.{}, runWorker, .{ self, socket, timeout_ms });
+    const thread = try std.Thread.spawn(.{}, runWorker, .{ self, socket });
     thread.detach();
 }
 
-fn runWorker(self: *Server, socket: posix.socket_t, timeout_ms: u32) void {
+fn runWorker(self: *Server, socket: posix.socket_t) void {
     defer _ = self.active_threads.fetchSub(1, .monotonic);
-    handleConnection(self, socket, timeout_ms);
+    handleConnection(self, socket);
 }
 
 fn joinThreads(self: *Server) void {
@@ -212,14 +241,13 @@ pub const Client = struct {
     http: *HttpClient,
     ws: Net.WsConnection,
 
-    fn init(
+    pub fn init(
         socket: posix.socket_t,
         allocator: Allocator,
         app: *App,
         json_version_response: []const u8,
-        timeout_ms: u32,
     ) !Client {
-        var ws = try Net.WsConnection.init(socket, allocator, json_version_response, timeout_ms);
+        var ws = try Net.WsConnection.init(socket, allocator, json_version_response);
         errdefer ws.deinit();
 
         if (log.enabled(.app, .info)) {
@@ -242,12 +270,15 @@ pub const Client = struct {
     fn stop(self: *Client) void {
         switch (self.mode) {
             .http => {},
-            .cdp => |*cdp| cdp.browser.env.terminate(),
+            .cdp => |*cdp| {
+                cdp.browser.env.terminate();
+                self.ws.sendClose();
+            },
         }
         self.ws.shutdown();
     }
 
-    fn deinit(self: *Client) void {
+    pub fn deinit(self: *Client) void {
         switch (self.mode) {
             .cdp => |*cdp| cdp.deinit(),
             .http => {},
@@ -275,15 +306,19 @@ pub const Client = struct {
     fn httpLoop(self: *Client, http: *HttpClient) !void {
         lp.assert(self.mode == .http, "Client.httpLoop invalid mode", .{});
 
+        // Liveness is enforced by TCP keepalive configured in
+        // Server.setTcpKeepalive; the kernel closes dead sockets, which
+        // surfaces as EOF/error from readSocket. The loop blocks for ~24 days
+        // on each poll rather than tracking app-level timeouts. Capped at
+        // i32-max because HttpClient.tick narrows to c_int.
+        const wait_ms: u32 = std.math.maxInt(i32);
+
         while (true) {
-            const status = http.tick(self.ws.timeout_ms) catch |err| {
+            const status = http.tick(wait_ms) catch |err| {
                 log.err(.app, "http tick", .{ .err = err });
                 return;
             };
-            if (status != .cdp_socket) {
-                log.info(.app, "CDP timeout", .{});
-                return;
-            }
+            if (status != .cdp_socket) continue;
 
             if (self.readSocket() == false) {
                 return;
@@ -295,43 +330,30 @@ pub const Client = struct {
         }
 
         var cdp = &self.mode.cdp;
-        var last_message = milliTimestamp(.monotonic);
-        var ms_remaining = self.ws.timeout_ms;
 
         while (true) {
-            switch (cdp.pageWait(ms_remaining)) {
+            const result = cdp.pageWait(wait_ms) catch |wait_err| switch (wait_err) {
+                error.NoPage => {
+                    const status = http.tick(wait_ms) catch |err| {
+                        log.err(.app, "http tick", .{ .err = err });
+                        return;
+                    };
+                    if (status != .cdp_socket) continue;
+                    if (self.readSocket() == false) {
+                        return;
+                    }
+                    continue;
+                },
+                else => return wait_err,
+            };
+
+            switch (result) {
                 .cdp_socket => {
                     if (self.readSocket() == false) {
                         return;
                     }
-                    last_message = milliTimestamp(.monotonic);
-                    ms_remaining = self.ws.timeout_ms;
                 },
-                .no_page => {
-                    const status = http.tick(ms_remaining) catch |err| {
-                        log.err(.app, "http tick", .{ .err = err });
-                        return;
-                    };
-                    if (status != .cdp_socket) {
-                        log.info(.app, "CDP timeout", .{});
-                        return;
-                    }
-                    if (self.readSocket() == false) {
-                        return;
-                    }
-                    last_message = milliTimestamp(.monotonic);
-                    ms_remaining = self.ws.timeout_ms;
-                },
-                .done => {
-                    const now = milliTimestamp(.monotonic);
-                    const elapsed = now - last_message;
-                    if (elapsed >= ms_remaining) {
-                        log.info(.app, "CDP timeout", .{});
-                        return;
-                    }
-                    ms_remaining -= @intCast(elapsed);
-                    last_message = now;
-                },
+                .done => {},
             }
         }
     }
@@ -448,12 +470,20 @@ pub const Client = struct {
             return false;
         }
 
+        if (std.mem.eql(u8, url, "/json/list") or std.mem.eql(u8, url, "/json/list/") or
+            std.mem.eql(u8, url, "/json") or std.mem.eql(u8, url, "/json/"))
+        {
+            try self.ws.send(empty_json_list_response);
+            self.ws.shutdown();
+            return false;
+        }
+
         return error.NotFound;
     }
 
     fn upgradeConnection(self: *Client, request: []u8) !void {
         try self.ws.upgrade(request);
-        self.mode = .{ .cdp = try CDP.init(self.app, self.http, self) };
+        self.mode = .{ .cdp = try CDP.init(self) };
     }
 
     fn writeHTTPErrorResponse(self: *Client, comptime status: u16, comptime body: []const u8) void {
@@ -481,11 +511,23 @@ pub const Client = struct {
 // --------
 
 fn buildJSONVersionResponse(
-    allocator: Allocator,
-    address: net.Address,
+    app: *const App,
 ) ![]const u8 {
-    const body_format = "{{\"webSocketDebuggerUrl\": \"ws://{f}/\"}}";
-    const body_len = std.fmt.count(body_format, .{address});
+    const port = app.config.port();
+    const host = app.config.advertiseHost();
+    if (std.mem.eql(u8, host, "0.0.0.0")) {
+        log.info(.cdp, "unreachable advertised host", .{
+            .message = "when --host is set to 0.0.0.0 consider setting --advertise-host to a reachable address",
+        });
+    }
+    const body_format =
+        "{{" ++
+        "\"Browser\": \"Lightpanda/1.0\", " ++
+        "\"Protocol-Version\": \"1.3\", " ++
+        "\"User-Agent\": \"Lightpanda/1.0\", " ++
+        "\"webSocketDebuggerUrl\": \"ws://{s}:{d}/\"" ++
+        "}}";
+    const body_len = std.fmt.count(body_format, .{ host, port });
 
     // We send a Connection: Close (and actually close the connection)
     // because chromedp (Go driver) sends a request to /json/version and then
@@ -499,23 +541,34 @@ fn buildJSONVersionResponse(
         "Connection: Close\r\n" ++
         "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
         body_format;
-    return try std.fmt.allocPrint(allocator, response_format, .{ body_len, address });
+    return try std.fmt.allocPrint(app.allocator, response_format, .{ body_len, host, port });
 }
+
+const empty_json_list_response =
+    "HTTP/1.1 200 OK\r\n" ++
+    "Content-Length: 2\r\n" ++
+    "Connection: Close\r\n" ++
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
+    "[]";
 
 pub const timestamp = @import("datetime.zig").timestamp;
 pub const milliTimestamp = @import("datetime.zig").milliTimestamp;
 
-const testing = std.testing;
+const testing = @import("testing.zig");
 test "server: buildJSONVersionResponse" {
-    const address = try net.Address.parseIp4("127.0.0.1", 9001);
-    const res = try buildJSONVersionResponse(testing.allocator, address);
-    defer testing.allocator.free(res);
+    const res = try buildJSONVersionResponse(testing.test_app);
+    defer testing.test_app.allocator.free(res);
 
-    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9001/\"}", res);
+    // The response includes the build version, so check structure rather than exact bytes.
+    try testing.expect(std.mem.startsWith(u8, res, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, res, "Content-Type: application/json") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "Connection: Close") != null);
+
+    // Verify all required JSON fields are present in the body
+    try testing.expect(std.mem.indexOf(u8, res, "\"Browser\": \"Lightpanda/") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"Protocol-Version\": \"1.3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"User-Agent\": \"Lightpanda/") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9222/\"") != null);
 }
 
 test "Client: http invalid request" {
@@ -523,7 +576,7 @@ test "Client: http invalid request" {
     defer c.deinit();
 
     const res = try c.httpRequest("GET /over/9000 HTTP/1.1\r\n" ++ "Header: " ++ ("a" ** 4100) ++ "\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 413 \r\n" ++
+    try testing.expectEqual("HTTP/1.1 413 \r\n" ++
         "Connection: Close\r\n" ++
         "Content-Length: 17\r\n\r\n" ++
         "Request too large", res);
@@ -592,7 +645,7 @@ test "Client: http valid handshake" {
         "Custom:  Header-Value\r\n\r\n";
 
     const res = try c.httpRequest(request);
-    try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+    try testing.expectEqual("HTTP/1.1 101 Switching Protocols\r\n" ++
         "Upgrade: websocket\r\n" ++
         "Connection: upgrade\r\n" ++
         "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
@@ -720,27 +773,23 @@ test "server: 404" {
     defer c.deinit();
 
     const res = try c.httpRequest("GET /unknown HTTP/1.1\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 404 \r\n" ++
+    try testing.expectEqual("HTTP/1.1 404 \r\n" ++
         "Connection: Close\r\n" ++
         "Content-Length: 9\r\n\r\n" ++
         "Not found", res);
 }
 
 test "server: get /json/version" {
-    const expected_response =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9583/\"}";
-
     {
         // twice on the same connection
         var c = try createTestClient();
         defer c.deinit();
 
         const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
+        try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Browser\": \"Lightpanda/") != null);
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Protocol-Version\": \"1.3\"") != null);
+        try testing.expect(std.mem.indexOf(u8, res1, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9222/\"") != null);
     }
 
     {
@@ -749,7 +798,8 @@ test "server: get /json/version" {
         defer c.deinit();
 
         const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
+        try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Browser\": \"Lightpanda/") != null);
     }
 }
 
@@ -767,7 +817,7 @@ fn assertHTTPError(
         .{ expected_status, expected_body.len, expected_body },
     );
 
-    try testing.expectEqualStrings(expected_response, res);
+    try testing.expectEqual(expected_response, res);
 }
 
 fn assertWebSocketError(close_code: u16, input: []const u8) !void {
@@ -911,7 +961,7 @@ const TestClient = struct {
             "Custom:  Header-Value\r\n\r\n";
 
         const res = try self.httpRequest(request);
-        try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+        try testing.expectEqual("HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);

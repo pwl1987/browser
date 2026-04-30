@@ -17,11 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
 const Event = @import("../Event.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 const ProgressEvent = @This();
@@ -38,23 +39,23 @@ const ProgressEventOptions = struct {
 
 const Options = Event.inheritOptions(ProgressEvent, ProgressEventOptions);
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*ProgressEvent {
-    const arena = try page.getArena(.{ .debug = "ProgressEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*ProgressEvent {
+    const arena = try frame.getArena(.tiny, "ProgressEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, _opts, false, page);
+    return initWithTrusted(arena, type_string, _opts, false, frame);
 }
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*ProgressEvent {
-    const arena = try page.getArena(.{ .debug = "ProgressEvent.trusted" });
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*ProgressEvent {
+    const arena = try frame.getArena(.tiny, "ProgressEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*ProgressEvent {
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*ProgressEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         ProgressEvent{
@@ -66,10 +67,6 @@ fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool
 
     Event.populatePrototypes(event, opts, trusted);
     return event;
-}
-
-pub fn deinit(self: *ProgressEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *ProgressEvent) *Event {
@@ -96,8 +93,6 @@ pub const JsApi = struct {
         pub const name = "ProgressEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(ProgressEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(ProgressEvent.init, .{});

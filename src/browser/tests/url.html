@@ -591,6 +591,35 @@
   testing.expectEqual('/new/path', url.pathname);
 }
 
+// Pathname setter must percent-encode spaces and special characters
+{
+  const url = new URL('http://a/');
+  url.pathname = 'c d';
+  testing.expectEqual('http://a/c%20d', url.href);
+}
+
+{
+  const url = new URL('https://example.com/path');
+  url.pathname = '/path with spaces/file name';
+  testing.expectEqual('https://example.com/path%20with%20spaces/file%20name', url.href);
+  testing.expectEqual('/path%20with%20spaces/file%20name', url.pathname);
+}
+
+// Already-encoded sequences should not be double-encoded
+{
+  const url = new URL('https://example.com/path');
+  url.pathname = '/already%20encoded';
+  testing.expectEqual('https://example.com/already%20encoded', url.href);
+}
+
+// This is the exact check the URL polyfill uses to decide if native URL is sufficient
+{
+  const url = new URL('b', 'http://a');
+  url.pathname = 'c d';
+  testing.expectEqual('http://a/c%20d', url.href);
+  testing.expectEqual(true, !!url.searchParams);
+}
+
 {
   const url = new URL('https://example.com/path');
   url.search = '?a=b';
@@ -657,6 +686,20 @@
 }
 
 {
+  const url = new URL('https://example.com/path');
+  url.hash = '#a b';
+  testing.expectEqual('https://example.com/path#a%20b', url.href);
+  testing.expectEqual('#a%20b', url.hash);
+}
+
+{
+  const url = new URL('https://example.com/path');
+  url.hash = 'a b';
+  testing.expectEqual('https://example.com/path#a%20b', url.href);
+  testing.expectEqual('#a%20b', url.hash);
+}
+
+{
   const url = new URL('https://example.com/path?a=b');
   url.search = '';
   testing.expectEqual('https://example.com/path', url.href);
@@ -671,6 +714,20 @@
 
   testing.expectEqual('d', url.searchParams.get('c'));
   testing.expectEqual(null, url.searchParams.get('a'));
+}
+
+{
+  const url = new URL('https://example.com/path?a=b');
+  const sp = url.searchParams;
+  testing.expectEqual('b', sp.get('a'));
+  url.search = 'c=d b';
+
+  testing.expectEqual('d b', url.searchParams.get('c'));
+  testing.expectEqual(null, url.searchParams.get('a'));
+
+  url.search = 'c d=d b';
+  testing.expectEqual('d b', url.searchParams.get('c d'));
+  testing.expectEqual(null, url.searchParams.get('c'));
 }
 
 {
@@ -797,4 +854,69 @@
   testing.expectEqual(true, url1.startsWith('blob:'));
   testing.expectEqual(true, url2.startsWith('blob:'));
 }
+</script>
+
+<script id="about:blank">
+  {
+    const url = new URL('about:blank');
+    testing.expectEqual('about:blank', url.href);
+    testing.expectEqual('null', url.origin);
+    testing.expectEqual('about:', url.protocol);
+    testing.expectEqual('blank', url.pathname);
+    testing.expectEqual('', url.username);
+    testing.expectEqual('', url.password);
+    testing.expectEqual('', url.host);
+    testing.expectEqual('', url.hostname);
+    testing.expectEqual('', url.port);
+    testing.expectEqual('', url.search);
+  }
+</script>
+
+<script id=idna>
+  // WHATWG "domain to ASCII": non-ASCII hosts are converted to punycode at
+  // parse time, so getters always return the ASCII form.
+  {
+    const url = new URL('https://räksmörgås.se/');
+    testing.expectEqual('xn--rksmrgs-5wao1o.se', url.hostname);
+    testing.expectEqual('xn--rksmrgs-5wao1o.se', url.host);
+    testing.expectEqual('https://xn--rksmrgs-5wao1o.se/', url.href);
+  }
+
+  // UTS#46 non-transitional processing preserves ß rather than mapping to ss.
+  {
+    const url = new URL('https://faß.de/');
+    testing.expectEqual('xn--fa-hia.de', url.hostname);
+  }
+
+  // Pure-ASCII hosts must not be touched.
+  {
+    const url = new URL('https://example.com/');
+    testing.expectEqual('example.com', url.hostname);
+    testing.expectEqual('https://example.com/', url.href);
+  }
+
+  // IDN preserved alongside port, userinfo, path, query, and fragment.
+  {
+    const url = new URL('https://räksmörgås.se:8443/p?q=1#h');
+    testing.expectEqual('xn--rksmrgs-5wao1o.se', url.hostname);
+    testing.expectEqual('xn--rksmrgs-5wao1o.se:8443', url.host);
+    testing.expectEqual('8443', url.port);
+    testing.expectEqual('/p', url.pathname);
+    testing.expectEqual('?q=1', url.search);
+    testing.expectEqual('#h', url.hash);
+  }
+
+  {
+    const url = new URL('https://user:pass@räksmörgås.se/');
+    testing.expectEqual('xn--rksmrgs-5wao1o.se', url.hostname);
+    testing.expectEqual('user', url.username);
+    testing.expectEqual('pass', url.password);
+  }
+
+  // Resolving a relative path against an IDN base preserves the punycode host.
+  {
+    const url = new URL('/about', 'https://räksmörgås.se/');
+    testing.expectEqual('xn--rksmrgs-5wao1o.se', url.hostname);
+    testing.expectEqual('https://xn--rksmrgs-5wao1o.se/about', url.href);
+  }
 </script>
