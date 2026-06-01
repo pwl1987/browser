@@ -17,15 +17,16 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../../log.zig");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const CssParser = @import("../../css/Parser.zig");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
 const Element = @import("../Element.zig");
 
+const log = lp.log;
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 const CSSStyleDeclaration = @This();
@@ -34,8 +35,8 @@ _element: ?*Element = null,
 _properties: std.DoublyLinkedList = .{},
 _is_computed: bool = false,
 
-pub fn init(element: ?*Element, is_computed: bool, page: *Page) !*CSSStyleDeclaration {
-    const self = try page._factory.create(CSSStyleDeclaration{
+pub fn init(element: ?*Element, is_computed: bool, frame: *Frame) !*CSSStyleDeclaration {
+    const self = try frame._factory.create(CSSStyleDeclaration{
         ._element = element,
         ._is_computed = is_computed,
     });
@@ -48,7 +49,7 @@ pub fn init(element: ?*Element, is_computed: bool, page: *Page) !*CSSStyleDeclar
             if (el.getAttributeSafe(comptime .wrap("style"))) |attr_value| {
                 var it = CssParser.parseDeclarationsList(attr_value);
                 while (it.next()) |declaration| {
-                    try self.setPropertyImpl(declaration.name, declaration.value, declaration.important, page);
+                    try self.setPropertyImpl(declaration.name, declaration.value, declaration.important, frame);
                 }
             }
         }
@@ -75,25 +76,40 @@ pub fn item(self: *const CSSStyleDeclaration, index: u32) []const u8 {
     return "";
 }
 
-pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const u8, page: *Page) []const u8 {
-    const normalized = normalizePropertyName(property_name, &page.buf);
-    const prop = self.findProperty(normalized) orelse {
+pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {
+    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const wrapped = String.wrap(normalized);
+
+    // Computed styles must reflect stylesheet rules, not just the element's
+    // inline `style=` attribute. Limited to display/visibility — what aria
+    // tree builders (Playwright ariaSnapshot) consult on every element.
+    if (self._is_computed) {
+        if (self._element) |element| {
+            if (wrapped.eql(comptime .wrap("display"))) {
+                if (frame._style_manager.hasDisplayNone(element)) return "none";
+            } else if (wrapped.eql(comptime .wrap("visibility"))) {
+                if (frame._style_manager.hasVisibilityHiddenInherited(element)) return "hidden";
+            }
+        }
+    }
+
+    const prop = self.findProperty(wrapped) orelse {
         // Only return default values for computed styles
         if (self._is_computed) {
-            return getDefaultPropertyValue(self, normalized);
+            return getDefaultPropertyValue(self, wrapped);
         }
         return "";
     };
     return prop._value.str();
 }
 
-pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []const u8, page: *Page) []const u8 {
-    const normalized = normalizePropertyName(property_name, &page.buf);
-    const prop = self.findProperty(normalized) orelse return "";
+pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {
+    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const prop = self.findProperty(.wrap(normalized)) orelse return "";
     return if (prop._important) "important" else "";
 }
 
-pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value: []const u8, priority_: ?[]const u8, page: *Page) !void {
+pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value: []const u8, priority_: ?[]const u8, frame: *Frame) !void {
     // Validate priority
     const priority = priority_ orelse "";
     const important = if (priority.len > 0) blk: {
@@ -103,101 +119,97 @@ pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value:
         break :blk true;
     } else false;
 
-    try self.setPropertyImpl(property_name, value, important, page);
+    try self.setPropertyImpl(property_name, value, important, frame);
 
-    try self.syncStyleAttribute(page);
+    try self.syncStyleAttribute(frame);
 }
 
-fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value: []const u8, important: bool, page: *Page) !void {
+fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value: []const u8, important: bool, frame: *Frame) !void {
     if (value.len == 0) {
-        _ = try self.removePropertyImpl(property_name, page);
+        _ = try self.removePropertyImpl(property_name, frame);
         return;
     }
 
-    const normalized = normalizePropertyName(property_name, &page.buf);
+    const normalized = normalizePropertyName(property_name, &frame.buf);
 
     // Normalize the value for canonical serialization
-    const normalized_value = try normalizePropertyValue(page.call_arena, normalized, value);
+    const normalized_value = try normalizePropertyValue(frame.call_arena, normalized, value);
 
     // Find existing property
-    if (self.findProperty(normalized)) |existing| {
-        existing._value = try String.init(page.arena, normalized_value, .{});
+    if (self.findProperty(.wrap(normalized))) |existing| {
+        existing._value = try String.init(frame.arena, normalized_value, .{});
         existing._important = important;
         return;
     }
 
     // Create new property
-    const prop = try page._factory.create(Property{
+    const prop = try frame._factory.create(Property{
         ._node = .{},
-        ._name = try String.init(page.arena, normalized, .{}),
-        ._value = try String.init(page.arena, normalized_value, .{}),
+        ._name = try String.init(frame.arena, normalized, .{}),
+        ._value = try String.init(frame.arena, normalized_value, .{}),
         ._important = important,
     });
     self._properties.append(&prop._node);
 }
 
-pub fn removeProperty(self: *CSSStyleDeclaration, property_name: []const u8, page: *Page) ![]const u8 {
-    const result = try self.removePropertyImpl(property_name, page);
-    try self.syncStyleAttribute(page);
+pub fn removeProperty(self: *CSSStyleDeclaration, property_name: []const u8, frame: *Frame) ![]const u8 {
+    const result = try self.removePropertyImpl(property_name, frame);
+    try self.syncStyleAttribute(frame);
     return result;
 }
 
-fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, page: *Page) ![]const u8 {
-    const normalized = normalizePropertyName(property_name, &page.buf);
-    const prop = self.findProperty(normalized) orelse return "";
+fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, frame: *Frame) ![]const u8 {
+    const normalized = normalizePropertyName(property_name, &frame.buf);
+    const prop = self.findProperty(.wrap(normalized)) orelse return "";
 
     // the value might not be on the heap (it could be inlined in the small string
     // optimization), so we need to dupe it.
-    const old_value = try page.call_arena.dupe(u8, prop._value.str());
+    const old_value = try frame.call_arena.dupe(u8, prop._value.str());
     self._properties.remove(&prop._node);
-    page._factory.destroy(prop);
+    frame._factory.destroy(prop);
     return old_value;
 }
 
 // Serialize current properties back to the element's style attribute so that
 // DOM serialization (outerHTML, getAttribute) reflects JS-modified styles.
-fn syncStyleAttribute(self: *CSSStyleDeclaration, page: *Page) !void {
+fn syncStyleAttribute(self: *CSSStyleDeclaration, frame: *Frame) !void {
     const element = self._element orelse return;
-    const css_text = try self.getCssText(page);
-    try element.setAttributeSafe(comptime .wrap("style"), .wrap(css_text), page);
+    const css_text = try self.getCssText(frame);
+    try element.setAttributeSafe(comptime .wrap("style"), .wrap(css_text), frame);
 }
 
-pub fn getFloat(self: *const CSSStyleDeclaration, page: *Page) []const u8 {
-    return self.getPropertyValue("float", page);
+pub fn getFloat(self: *const CSSStyleDeclaration, frame: *Frame) []const u8 {
+    return self.getPropertyValue("float", frame);
 }
 
-pub fn setFloat(self: *CSSStyleDeclaration, value_: ?[]const u8, page: *Page) !void {
-    try self.setPropertyImpl("float", value_ orelse "", false, page);
-    try self.syncStyleAttribute(page);
+pub fn setFloat(self: *CSSStyleDeclaration, value_: ?[]const u8, frame: *Frame) !void {
+    try self.setPropertyImpl("float", value_ orelse "", false, frame);
+    try self.syncStyleAttribute(frame);
 }
 
-pub fn getCssText(self: *const CSSStyleDeclaration, page: *Page) ![]const u8 {
-    if (self._element == null) return "";
-
-    var buf = std.Io.Writer.Allocating.init(page.call_arena);
+pub fn getCssText(self: *const CSSStyleDeclaration, frame: *Frame) ![]const u8 {
+    var buf = std.Io.Writer.Allocating.init(frame.call_arena);
     try self.format(&buf.writer);
     return buf.written();
 }
 
-pub fn setCssText(self: *CSSStyleDeclaration, text: []const u8, page: *Page) !void {
-    if (self._element == null) return;
-
+pub fn setCssText(self: *CSSStyleDeclaration, text: []const u8, frame: *Frame) !void {
     // Clear existing properties
     var node = self._properties.first;
     while (node) |n| {
         const next = n.next;
         const prop = Property.fromNodeLink(n);
         self._properties.remove(n);
-        page._factory.destroy(prop);
+        frame._factory.destroy(prop);
         node = next;
     }
 
     // Parse and set new properties
     var it = CssParser.parseDeclarationsList(text);
     while (it.next()) |declaration| {
-        try self.setPropertyImpl(declaration.name, declaration.value, declaration.important, page);
+        try self.setPropertyImpl(declaration.name, declaration.value, declaration.important, frame);
     }
-    try self.syncStyleAttribute(page);
+    try self.syncStyleAttribute(frame);
 }
 
 pub fn format(self: *const CSSStyleDeclaration, writer: *std.Io.Writer) !void {
@@ -212,11 +224,11 @@ pub fn format(self: *const CSSStyleDeclaration, writer: *std.Io.Writer) !void {
     }
 }
 
-fn findProperty(self: *const CSSStyleDeclaration, name: []const u8) ?*Property {
+pub fn findProperty(self: *const CSSStyleDeclaration, name: String) ?*Property {
     var node = self._properties.first;
     while (node) |n| {
         const prop = Property.fromNodeLink(n);
-        if (prop._name.eqlSlice(name)) {
+        if (prop._name.eql(name)) {
             return prop;
         }
         node = n.next;
@@ -259,8 +271,16 @@ fn normalizePropertyValue(arena: Allocator, property_name: []const u8, value: []
     }
 
     // Canonicalize anchor-size() function: anchor name (dashed ident) comes before size keyword
-    if (std.mem.indexOf(u8, value, "anchor-size(") != null) {
-        return try canonicalizeAnchorSize(arena, value);
+    if (std.mem.indexOf(u8, value, "anchor-size(")) |idx| {
+        return canonicalizeAnchorSize(arena, value, idx);
+    }
+
+    // Canonicalize anchor() function: anchor name (dashed ident) comes before position keyword
+    // Note: indexOf finds first occurrence, so we check it's not part of "anchor-size("
+    if (std.mem.indexOf(u8, value, "anchor(")) |idx| {
+        if (idx == 0 or value[idx - 1] != '-') {
+            return canonicalizeAnchor(arena, value, idx);
+        }
     }
 
     return value;
@@ -268,9 +288,13 @@ fn normalizePropertyValue(arena: Allocator, property_name: []const u8, value: []
 
 // Canonicalize anchor-size() so that the dashed ident (anchor name) comes before the size keyword.
 // e.g. "anchor-size(width --foo)" -> "anchor-size(--foo width)"
-fn canonicalizeAnchorSize(arena: Allocator, value: []const u8) ![]const u8 {
+fn canonicalizeAnchorSize(arena: Allocator, value: []const u8, start_index: usize) ![]const u8 {
     var buf = std.Io.Writer.Allocating.init(arena);
-    var i: usize = 0;
+
+    // Copy everything before the first anchor-size(
+    try buf.writer.writeAll(value[0..start_index]);
+
+    var i: usize = start_index;
 
     while (i < value.len) {
         // Look for "anchor-size("
@@ -279,7 +303,7 @@ fn canonicalizeAnchorSize(arena: Allocator, value: []const u8) ![]const u8 {
             i += "anchor-size(".len;
 
             // Parse and canonicalize the arguments
-            i = try canonicalizeAnchorSizeArgs(value, i, &buf.writer);
+            i = try canonicalizeAnchorFnArgs(value, i, &buf.writer, .anchor_size);
         } else {
             try buf.writer.writeByte(value[i]);
             i += 1;
@@ -289,21 +313,24 @@ fn canonicalizeAnchorSize(arena: Allocator, value: []const u8) ![]const u8 {
     return buf.written();
 }
 
-// Parse anchor-size arguments and write them in canonical order
-fn canonicalizeAnchorSizeArgs(value: []const u8, start: usize, writer: *std.Io.Writer) !usize {
+const AnchorFnKind = enum { anchor, anchor_size };
+
+// Parse anchor/anchor-size arguments and write them in canonical order
+fn canonicalizeAnchorFnArgs(value: []const u8, start: usize, writer: *std.Io.Writer, kind: AnchorFnKind) !usize {
     var i = start;
     var depth: usize = 1;
 
     // Skip leading whitespace
     while (i < value.len and value[i] == ' ') : (i += 1) {}
 
-    // Collect tokens before the comma or close paren
-    var first_token_start: ?usize = null;
-    var first_token_end: usize = 0;
-    var second_token_start: ?usize = null;
-    var second_token_end: usize = 0;
-    var comma_pos: ?usize = null;
     var token_count: usize = 0;
+    var comma_pos: ?usize = null;
+
+    var first_token_end: usize = 0;
+    var first_token_start: ?usize = null;
+
+    var second_token_end: usize = 0;
+    var second_token_start: ?usize = null;
 
     const args_start = i;
     var in_token = false;
@@ -381,13 +408,16 @@ fn canonicalizeAnchorSizeArgs(value: []const u8, start: usize, writer: *std.Io.W
         const first_token = value[first_start..first_token_end];
         const second_token = value[second_start..second_token_end];
 
-        // If second token is a dashed ident and first is a size keyword, swap them
-        if (std.mem.startsWith(u8, second_token, "--") and isAnchorSizeKeyword(first_token)) {
+        // If second token is a dashed ident, it should come first
+        // For anchor-size, also check that first token is a size keyword
+        const should_swap = std.mem.startsWith(u8, second_token, "--") and
+            (kind == .anchor or isAnchorSizeKeyword(first_token));
+
+        if (should_swap) {
             try writer.writeAll(second_token);
             try writer.writeByte(' ');
             try writer.writeAll(first_token);
         } else {
-            // Keep original order
             try writer.writeAll(first_token);
             try writer.writeByte(' ');
             try writer.writeAll(second_token);
@@ -397,20 +427,26 @@ fn canonicalizeAnchorSizeArgs(value: []const u8, start: usize, writer: *std.Io.W
         try writer.writeAll(value[fts..first_token_end]);
     }
 
-    // Handle comma and fallback value (may contain nested anchor-size)
+    // Handle comma and fallback value (may contain nested functions)
     if (comma_pos) |cp| {
         try writer.writeAll(", ");
         i = cp + 1;
         // Skip whitespace after comma
         while (i < value.len and value[i] == ' ') : (i += 1) {}
 
-        // Copy the fallback, recursively handling nested anchor-size
+        // Copy the fallback, recursively handling nested anchor/anchor-size
         while (i < value.len and depth > 0) {
             if (std.mem.startsWith(u8, value[i..], "anchor-size(")) {
                 try writer.writeAll("anchor-size(");
                 i += "anchor-size(".len;
                 depth += 1;
-                i = try canonicalizeAnchorSizeArgs(value, i, writer);
+                i = try canonicalizeAnchorFnArgs(value, i, writer, .anchor_size);
+                depth -= 1;
+            } else if (std.mem.startsWith(u8, value[i..], "anchor(")) {
+                try writer.writeAll("anchor(");
+                i += "anchor(".len;
+                depth += 1;
+                i = try canonicalizeAnchorFnArgs(value, i, writer, .anchor);
                 depth -= 1;
             } else if (value[i] == '(') {
                 depth += 1;
@@ -444,6 +480,33 @@ fn isAnchorSizeKeyword(token: []const u8) bool {
         .{ "self-inline", {} },
     });
     return keywords.has(token);
+}
+
+// Canonicalize anchor() so that the dashed ident (anchor name) comes before the position keyword.
+// e.g. "anchor(left --foo)" -> "anchor(--foo left)"
+fn canonicalizeAnchor(arena: Allocator, value: []const u8, start_index: usize) ![]const u8 {
+    var buf = std.Io.Writer.Allocating.init(arena);
+
+    // Copy everything before the first anchor(
+    try buf.writer.writeAll(value[0..start_index]);
+
+    var i: usize = start_index;
+
+    while (i < value.len) {
+        // Look for "anchor(" but not "anchor-size("
+        if (std.mem.startsWith(u8, value[i..], "anchor(") and (i == 0 or value[i - 1] != '-')) {
+            try buf.writer.writeAll("anchor(");
+            i += "anchor(".len;
+
+            // Parse and canonicalize the arguments
+            i = try canonicalizeAnchorFnArgs(value, i, &buf.writer, .anchor);
+        } else {
+            try buf.writer.writeByte(value[i]);
+            i += 1;
+        }
+    }
+
+    return buf.written();
 }
 
 // Check if a value is "X X" (duplicate) and return just "X"
@@ -621,26 +684,36 @@ fn isLengthProperty(name: []const u8) bool {
     return length_properties.has(name);
 }
 
-fn getDefaultPropertyValue(self: *const CSSStyleDeclaration, normalized_name: []const u8) []const u8 {
-    if (std.mem.eql(u8, normalized_name, "visibility")) {
-        return "visible";
+fn getDefaultPropertyValue(self: *const CSSStyleDeclaration, name: String) []const u8 {
+    switch (name.len) {
+        5 => {
+            if (name.eql(comptime .wrap("color"))) {
+                const element = self._element orelse return "";
+                return getDefaultColor(element);
+            }
+        },
+        7 => {
+            if (name.eql(comptime .wrap("opacity"))) {
+                return "1";
+            }
+            if (name.eql(comptime .wrap("display"))) {
+                const element = self._element orelse return "";
+                return getDefaultDisplay(element);
+            }
+        },
+        10 => {
+            if (name.eql(comptime .wrap("visibility"))) {
+                return "visible";
+            }
+        },
+        16 => {
+            if (name.eqlSlice("background-color")) {
+                // transparent
+                return "rgba(0, 0, 0, 0)";
+            }
+        },
+        else => {},
     }
-    if (std.mem.eql(u8, normalized_name, "opacity")) {
-        return "1";
-    }
-    if (std.mem.eql(u8, normalized_name, "display")) {
-        const element = self._element orelse return "";
-        return getDefaultDisplay(element);
-    }
-    if (std.mem.eql(u8, normalized_name, "color")) {
-        const element = self._element orelse return "";
-        return getDefaultColor(element);
-    }
-    if (std.mem.eql(u8, normalized_name, "background-color")) {
-        // transparent
-        return "rgba(0, 0, 0, 0)";
-    }
-
     return "";
 }
 
@@ -649,7 +722,7 @@ fn getDefaultDisplay(element: *const Element) []const u8 {
         .html => |html| {
             return switch (html._type) {
                 .anchor, .br, .span, .label, .time, .font, .mod, .quote => "inline",
-                .body, .div, .dl, .p, .heading, .form, .button, .canvas, .details, .dialog, .embed, .head, .html, .hr, .iframe, .img, .input, .li, .link, .meta, .ol, .option, .script, .select, .slot, .style, .template, .textarea, .title, .ul, .media, .area, .base, .datalist, .directory, .fieldset, .legend, .map, .meter, .object, .optgroup, .output, .param, .picture, .pre, .progress, .source, .table, .table_caption, .table_cell, .table_col, .table_row, .table_section, .track => "block",
+                .body, .div, .dl, .p, .heading, .form, .button, .canvas, .details, .dialog, .embed, .head, .html, .hr, .iframe, .img, .input, .li, .link, .meta, .ol, .option, .script, .select, .slot, .style, .template, .textarea, .title, .ul, .media, .area, .base, .datalist, .directory, .fieldset, .frameset, .legend, .map, .meter, .object, .optgroup, .output, .param, .picture, .pre, .progress, .source, .table, .table_caption, .table_cell, .table_col, .table_row, .table_section, .track => "block",
                 .generic, .custom, .unknown, .data => blk: {
                     const tag = element.getTagNameLower();
                     if (isInlineTag(tag)) break :blk "inline";
@@ -738,8 +811,7 @@ pub const JsApi = struct {
     pub const cssFloat = bridge.accessor(CSSStyleDeclaration.getFloat, CSSStyleDeclaration.setFloat, .{});
 };
 
-const testing = @import("std").testing;
-
+const testing = @import("../../../testing.zig");
 test "normalizePropertyValue: unitless zero to 0px" {
     const cases = .{
         .{ "width", "0", "0px" },
@@ -760,16 +832,16 @@ test "normalizePropertyValue: unitless zero to 0px" {
     };
     inline for (cases) |case| {
         const result = try normalizePropertyValue(testing.allocator, case[0], case[1]);
-        try testing.expectEqualStrings(case[2], result);
+        try testing.expectEqual(case[2], result);
     }
 }
 
 test "normalizePropertyValue: first baseline to baseline" {
     const result = try normalizePropertyValue(testing.allocator, "align-items", "first baseline");
-    try testing.expectEqualStrings("baseline", result);
+    try testing.expectEqual("baseline", result);
 
     const result2 = try normalizePropertyValue(testing.allocator, "align-self", "last baseline");
-    try testing.expectEqualStrings("last baseline", result2);
+    try testing.expectEqual("last baseline", result2);
 }
 
 test "normalizePropertyValue: collapse duplicate two-value shorthands" {
@@ -786,6 +858,27 @@ test "normalizePropertyValue: collapse duplicate two-value shorthands" {
     };
     inline for (cases) |case| {
         const result = try normalizePropertyValue(testing.allocator, case[0], case[1]);
-        try testing.expectEqualStrings(case[2], result);
+        try testing.expectEqual(case[2], result);
+    }
+}
+
+test "normalizePropertyValue: anchor() canonical order" {
+    defer testing.reset();
+    const cases = .{
+        // Dashed ident should come before keyword
+        .{ "left", "anchor(left --foo)", "anchor(--foo left)" },
+        .{ "left", "anchor(inside --foo)", "anchor(--foo inside)" },
+        .{ "left", "anchor(50% --foo)", "anchor(--foo 50%)" },
+        // Already canonical order - keep as-is
+        .{ "left", "anchor(--foo left)", "anchor(--foo left)" },
+        .{ "left", "anchor(left)", "anchor(left)" },
+        // With fallback
+        .{ "left", "anchor(left --foo, 1px)", "anchor(--foo left, 1px)" },
+        // Nested anchor in fallback
+        .{ "left", "anchor(left --foo, anchor(right --bar))", "anchor(--foo left, anchor(--bar right))" },
+    };
+    inline for (cases) |case| {
+        const result = try normalizePropertyValue(testing.arena_allocator, case[0], case[1]);
+        try testing.expectEqual(case[2], result);
     }
 }

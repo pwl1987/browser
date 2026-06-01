@@ -17,6 +17,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 pub const v8 = @import("v8").c;
 
 const string = @import("../../string.zig");
@@ -25,7 +27,9 @@ pub const Env = @import("Env.zig");
 pub const bridge = @import("bridge.zig");
 pub const Caller = @import("Caller.zig");
 pub const Origin = @import("Origin.zig");
+pub const Identity = @import("Identity.zig");
 pub const Context = @import("Context.zig");
+pub const Execution = @import("Execution.zig");
 pub const Local = @import("Local.zig");
 pub const Inspector = @import("Inspector.zig");
 pub const Snapshot = @import("Snapshot.zig");
@@ -40,6 +44,7 @@ pub const Object = @import("Object.zig");
 pub const TryCatch = @import("TryCatch.zig");
 pub const Function = @import("Function.zig");
 pub const Promise = @import("Promise.zig");
+pub const RegExp = @import("RegExp.zig");
 pub const Module = @import("Module.zig");
 pub const BigInt = @import("BigInt.zig");
 pub const Number = @import("Number.zig");
@@ -47,6 +52,7 @@ pub const Integer = @import("Integer.zig");
 pub const PromiseResolver = @import("PromiseResolver.zig");
 pub const PromiseRejection = @import("PromiseRejection.zig");
 
+const js = @This();
 const Allocator = std.mem.Allocator;
 
 pub fn Bridge(comptime T: type) type {
@@ -232,6 +238,7 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
         .@"struct" => {
             switch (@TypeOf(value)) {
                 string.String => return isolate.initStringHandle(value.str()),
+                String.OneByte => return @ptrCast(isolate.initOneByteStringHandle(value.bytes)),
                 ArrayBuffer => {
                     const values = value.values;
                     const len = values.len;
@@ -317,6 +324,9 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
     return null;
 }
 
+// marker interface
+pub const Undefined = struct {};
+
 // These are here, and not in Inspector.zig, because Inspector.zig isn't always
 // included (e.g. in the wpt build).
 
@@ -351,4 +361,77 @@ pub export fn v8_inspector__Client__IMPL__descriptionForValueSubtype(
 test "TaggedAnyOpaque" {
     // If we grow this, fine, but it should be a conscious decision
     try std.testing.expectEqual(24, @sizeOf(@import("TaggedOpaque.zig")));
+}
+
+// Every finalizable instance of Zig gets 1 FinalizerCallback registered in the
+// Page. This is to ensure that, if v8 doesn't finalize the value, we can
+// release on Page teardown.
+pub const FinalizerCallback = struct {
+    page: *Page,
+    arena: Allocator,
+    resolved_ptr_id: usize,
+    finalizer_ptr_id: usize,
+    release_ref: *const fn (ptr_id: usize, page: *Page) void,
+
+    // Linked list of Identities referencing this FC.
+    identities: ?*FinalizerCallback.Identity = null,
+    // Count of active identities (for knowing when to clean up FC).
+    identity_count: u8 = 0,
+
+    const Page = @import("../Page.zig");
+    const Browser = @import("../Browser.zig");
+
+    // For every FinalizerCallback we'll have 1+ FinalizerCallback.Identity: one
+    // for every identity that gets the instance. In most cases, that'll be 1.
+    // Allocated from Browser.fc_identity_pool so it survives Page *and* Session
+    // teardowns — V8 may fire the weak callback any time before the Isolate is
+    // torn down — and lets the callback safely check the done flag.
+    pub const Identity = struct {
+        // The Page that owns the FinalizerCallback this Identity references.
+        // Only safe to dereference when `done == false`. When done is true,
+        // the Page may have been torn down and this pointer is stale.
+        page: *Page,
+
+        // Stable handle to the pool this struct came from. The weak callback
+        // reaches the pool through here (not via page/session) so it stays
+        // valid to self-destruct even when `done` and the page/session are gone.
+        browser: *Browser,
+
+        // The world's identity map. Only safe to dereference when `done == false`
+        // (see `browser` above) — its teardown already reset every Global.
+        identity: *js.Identity,
+        finalizer_ptr_id: usize,
+        resolved_ptr_id: usize,
+        next: ?*FinalizerCallback.Identity = null,
+        done: bool = false,
+    };
+
+    // Called during Page teardown to force cleanup regardless of identities.
+    pub fn deinit(self: *FinalizerCallback, page: *Page) void {
+        // Mark all identities as done so stale V8 weak callbacks
+        // won't find the wrong FC if resolved_ptr_id is reused.
+        var id = self.identities;
+        while (id) |identity| {
+            identity.done = true;
+            id = identity.next;
+        }
+        self.release_ref(self.finalizer_ptr_id, page);
+        page.releaseArena(self.arena);
+    }
+};
+
+pub fn writeStackTrace(isolate: *v8.Isolate, stack_handle: *const v8.StackTrace, writer: *std.Io.Writer) !void {
+    const separator = lp.log.separator();
+    const frame_count = v8.v8__StackTrace__GetFrameCount(stack_handle);
+
+    for (0..@intCast(frame_count)) |i| {
+        const frame_handle = v8.v8__StackTrace__GetFrame(stack_handle, isolate, @intCast(i)).?;
+        if (v8.v8__StackFrame__GetFunctionName(frame_handle)) |name| {
+            var buf: [1024]u8 = undefined;
+            const n = v8.v8__String__WriteUtf8(name, isolate, &buf, buf.len, v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8);
+            try writer.print("{s}{s}:{d}", .{ separator, buf[0..n], v8.v8__StackFrame__GetLineNumber(frame_handle) });
+        } else {
+            try writer.print("{s}<anonymous>:{d}", .{ separator, v8.v8__StackFrame__GetLineNumber(frame_handle) });
+        }
+    }
 }

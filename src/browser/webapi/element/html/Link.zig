@@ -18,15 +18,20 @@
 
 const std = @import("std");
 const js = @import("../../../js/js.zig");
-const Page = @import("../../../Page.zig");
+const Frame = @import("../../../Frame.zig");
 
-const URL = @import("../../URL.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 
 const Link = @This();
 _proto: *HtmlElement,
+// Cached CSSStyleSheet for an external `rel=stylesheet` once
+// `Frame.loadExternalStylesheet` has registered it. Re-fetches (href
+// mutated on a connected link) reuse this sheet via `replaceSync` so the
+// old rules are dropped instead of accumulating in `document.styleSheets`.
+// Mirrors `Style._sheet`.
+_sheet: ?*@import("../../css/CSSStyleSheet.zig") = null,
 
 pub fn asElement(self: *Link) *Element {
     return self._proto._proto;
@@ -38,23 +43,21 @@ pub fn asNode(self: *Link) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getHref(self: *Link, page: *Page) ![]const u8 {
+pub fn getHref(self: *Link, frame: *Frame) ![]const u8 {
     const element = self.asElement();
     const href = element.getAttributeSafe(comptime .wrap("href")) orelse return "";
     if (href.len == 0) {
         return "";
     }
-
-    // Always resolve the href against the page URL
-    return URL.resolve(page.call_arena, page.base(), href, .{ .encode = true });
+    return element.asNode().resolveURL(href, frame, .{});
 }
 
-pub fn setHref(self: *Link, value: []const u8, page: *Page) !void {
+pub fn setHref(self: *Link, value: []const u8, frame: *Frame) !void {
     const element = self.asElement();
-    try element.setAttributeSafe(comptime .wrap("href"), .wrap(value), page);
+    try element.setAttributeSafe(comptime .wrap("href"), .wrap(value), frame);
 
     if (element.asNode().isConnected()) {
-        try self.linkAddedCallback(page);
+        try self.linkAddedCallback(frame);
     }
 }
 
@@ -62,46 +65,70 @@ pub fn getRel(self: *Link) []const u8 {
     return self.asElement().getAttributeSafe(comptime .wrap("rel")) orelse return "";
 }
 
-pub fn setRel(self: *Link, value: []const u8, page: *Page) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("rel"), .wrap(value), page);
+pub fn setRel(self: *Link, value: []const u8, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("rel"), .wrap(value), frame);
 }
 
 pub fn getAs(self: *const Link) []const u8 {
     return self.asConstElement().getAttributeSafe(comptime .wrap("as")) orelse "";
 }
 
-pub fn setAs(self: *Link, value: []const u8, page: *Page) !void {
-    return self.asElement().setAttributeSafe(comptime .wrap("as"), .wrap(value), page);
+pub fn setAs(self: *Link, value: []const u8, frame: *Frame) !void {
+    return self.asElement().setAttributeSafe(comptime .wrap("as"), .wrap(value), frame);
+}
+
+pub fn getMedia(self: *Link) []const u8 {
+    return self.asElement().getAttributeSafe(comptime .wrap("media")) orelse return "";
+}
+
+pub fn setMedia(self: *Link, value: []const u8, frame: *Frame) !void {
+    return self.asElement().setAttributeSafe(comptime .wrap("media"), .wrap(value), frame);
 }
 
 pub fn getCrossOrigin(self: *const Link) ?[]const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("crossOrigin"));
+    return self.asConstElement().getAttributeSafe(comptime .wrap("crossorigin"));
 }
 
-pub fn setCrossOrigin(self: *Link, value: []const u8, page: *Page) !void {
+pub fn setCrossOrigin(self: *Link, value: []const u8, frame: *Frame) !void {
     var normalized: []const u8 = "anonymous";
     if (std.ascii.eqlIgnoreCase(value, "use-credentials")) {
         normalized = "use-credentials";
     }
-    return self.asElement().setAttributeSafe(comptime .wrap("crossOrigin"), .wrap(normalized), page);
+    return self.asElement().setAttributeSafe(comptime .wrap("crossorigin"), .wrap(normalized), frame);
 }
 
-pub fn linkAddedCallback(self: *Link, page: *Page) !void {
-    // if we're planning on navigating to another page, don't trigger load event.
-    if (page.isGoingAway()) {
+pub fn linkAddedCallback(self: *Link, frame: *Frame) !void {
+    // if we're planning on navigating to another frame, don't trigger load event.
+    if (frame.isGoingAway()) {
         return;
     }
 
     const element = self.asElement();
-    // Exit if rel not set.
-    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return;
-    // Exit if rel is not stylesheet.
-    if (!std.mem.eql(u8, rel, "stylesheet")) return;
-    // Exit if href not set.
-    const href = element.getAttributeSafe(comptime .wrap("href")) orelse return;
-    if (href.len == 0) return;
 
-    try page._to_load.append(page.arena, self._proto);
+    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return;
+    const loadable_rels = std.StaticStringMap(void).initComptime(.{
+        .{ "stylesheet", {} },
+        .{ "preload", {} },
+        .{ "modulepreload", {} },
+    });
+    if (loadable_rels.has(rel) == false) {
+        return;
+    }
+
+    const href = element.getAttributeSafe(comptime .wrap("href")) orelse return;
+    if (href.len == 0) {
+        return;
+    }
+
+    // Opt-in fetch for `rel="stylesheet"` — drives `frame.loadExternalStylesheet`,
+    // which fires the load/error event itself. Other rels (preload,
+    // modulepreload) and the disabled case keep the rendering-free stub that
+    // fires a synthetic `load` event without touching the network.
+    if (std.mem.eql(u8, rel, "stylesheet")) {
+        return frame.loadExternalStylesheet(self, href);
+    }
+
+    try frame.queueLoad(self._proto);
 }
 
 pub const JsApi = struct {
@@ -113,23 +140,41 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const as = bridge.accessor(Link.getAs, Link.setAs, .{});
-    pub const rel = bridge.accessor(Link.getRel, Link.setRel, .{});
-    pub const href = bridge.accessor(Link.getHref, Link.setHref, .{});
-    pub const crossOrigin = bridge.accessor(Link.getCrossOrigin, Link.setCrossOrigin, .{});
+    pub const as = bridge.accessor(Link.getAs, Link.setAs, .{ .ce_reactions = true });
+    pub const rel = bridge.accessor(Link.getRel, Link.setRel, .{ .ce_reactions = true });
+    pub const media = bridge.accessor(Link.getMedia, Link.setMedia, .{ .ce_reactions = true });
+    pub const href = bridge.accessor(Link.getHref, Link.setHref, .{ .ce_reactions = true });
+    pub const crossOrigin = bridge.accessor(Link.getCrossOrigin, Link.setCrossOrigin, .{ .ce_reactions = true });
     pub const relList = bridge.accessor(_getRelList, null, .{ .null_as_undefined = true });
 
-    fn _getRelList(self: *Link, page: *Page) !?*@import("../../collections.zig").DOMTokenList {
+    fn _getRelList(self: *Link, frame: *Frame) !?*@import("../../collections.zig").DOMTokenList {
         const element = self.asElement();
         // relList is only valid for HTML <link> elements, not SVG or MathML
         if (element._namespace != .html) {
             return null;
         }
-        return element.getRelList(page);
+        return element.getRelList(frame);
+    }
+};
+
+// Parser-created <link> elements are void (no closing tag) so they never
+// reach `Frame.nodeComplete`. Mirror `Image.Build.created` so static head
+// links in HTML go through `linkAddedCallback` at element-create time,
+// with attributes already populated by `populateElementAttributes`.
+pub const Build = struct {
+    pub fn created(node: *Node, frame: *Frame) !void {
+        const self = node.as(Link);
+        return self.linkAddedCallback(frame);
     }
 };
 
 const testing = @import("../../../../testing.zig");
 test "WebApi: HTML.Link" {
     try testing.htmlRunner("element/html/link.html", .{});
+}
+
+test "WebApi: HTML.Link external stylesheet" {
+    const filter: testing.LogFilter = .init(&.{.http});
+    defer filter.deinit();
+    try testing.htmlRunner("css/external_stylesheet.html", .{ .load_external_stylesheets = true });
 }

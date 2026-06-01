@@ -18,145 +18,123 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const net = std.net;
-const posix = std.posix;
+const builtin = @import("builtin");
 
-const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
-
-const log = @import("log.zig");
 const App = @import("App.zig");
 const Config = @import("Config.zig");
-const CDP = @import("cdp/cdp.zig").CDP;
-const Net = @import("network/websocket.zig");
-const HttpClient = @import("browser/HttpClient.zig");
+
+const CDP = @import("cdp/CDP.zig");
+
+const log = lp.log;
+const net = std.net;
+const posix = std.posix;
+const Allocator = std.mem.Allocator;
 
 const Server = @This();
 
 app: *App,
-allocator: Allocator,
+max_connections: usize,
 json_version_response: []const u8,
 
-// Thread management
 active_threads: std.atomic.Value(u32) = .init(0),
-clients: std.ArrayList(*Client) = .{},
-client_mutex: std.Thread.Mutex = .{},
-clients_pool: std.heap.MemoryPool(Client),
+
+cdps: std.ArrayList(*CDP) = .{},
+cdp_mutex: std.Thread.Mutex = .{},
+cdp_pool: std.heap.MemoryPool(CDP),
 
 pub fn init(app: *App, address: net.Address) !*Server {
-    const allocator = app.allocator;
-    const json_version_response = try buildJSONVersionResponse(allocator, address);
-    errdefer allocator.free(json_version_response);
-
-    const self = try allocator.create(Server);
-    errdefer allocator.destroy(self);
+    const self = try app.allocator.create(Server);
+    errdefer app.allocator.destroy(self);
 
     self.* = .{
         .app = app,
-        .allocator = allocator,
-        .json_version_response = json_version_response,
-        .clients_pool = std.heap.MemoryPool(Client).init(allocator),
+        .json_version_response = "",
+        .cdp_pool = .init(app.allocator),
+        .max_connections = app.config.maxConnections(),
     };
+    errdefer self.cdp_pool.deinit();
 
-    try self.app.network.bind(address, self, onAccept);
-    log.info(.app, "server running", .{ .address = address });
+    // Bind first so /json/version can advertise the OS-assigned port (--port 0).
+    var bound_address = address;
+    try app.network.bind(&bound_address, self, onAccept);
+    log.info(.app, "server running", .{ .address = bound_address });
 
+    self.json_version_response = try buildJSONVersionResponse(app, bound_address.getPort());
     return self;
 }
 
-pub fn deinit(self: *Server) void {
-    // Stop all active clients
-    {
-        self.client_mutex.lock();
-        defer self.client_mutex.unlock();
+pub fn shutdown(self: *Server) void {
+    self.cdp_mutex.lock();
+    defer self.cdp_mutex.unlock();
 
-        for (self.clients.items) |client| {
-            client.stop();
+    self.app.network.unbind();
+
+    for (self.cdps.items) |cdp| {
+        if (cdp.conn.state == .live) {
+            cdp.browser.env.terminate();
+            // We use to send a nice WS close frame here but (a) it isn't
+            // strictly required and (b) we'd have to protect against an interleaved
+            // write from the worker thread.
         }
+        cdp.conn.shutdown();
+    }
+}
+
+pub fn deinit(self: *Server) void {
+    self.shutdown();
+
+    while (self.active_threads.load(.monotonic) > 0) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
-    self.joinThreads();
-    self.clients.deinit(self.allocator);
-    self.clients_pool.deinit();
-    self.allocator.free(self.json_version_response);
-    self.allocator.destroy(self);
+    self.cdps.deinit(self.app.allocator);
+    self.cdp_pool.deinit();
+    self.app.allocator.free(self.json_version_response);
+    self.app.allocator.destroy(self);
 }
 
 fn onAccept(ctx: *anyopaque, socket: posix.socket_t) void {
     const self: *Server = @ptrCast(@alignCast(ctx));
-    const timeout_ms: u32 = @intCast(self.app.config.cdpTimeout());
-    self.spawnWorker(socket, timeout_ms) catch |err| {
+
+    configureSocket(socket) catch {
+        posix.close(socket);
+        return;
+    };
+
+    self.spawnWorker(socket) catch |err| {
         log.err(.app, "CDP spawn", .{ .err = err });
         posix.close(socket);
     };
 }
 
-fn handleConnection(self: *Server, socket: posix.socket_t, timeout_ms: u32) void {
-    defer posix.close(socket);
-
-    // Client is HUGE (> 512KB) because it has a large read buffer.
-    // V8 crashes if this is on the stack (likely related to its size).
-    const client = self.getClient() catch |err| {
-        log.err(.app, "CDP client create", .{ .err = err });
-        return;
+// Liveness is enforced at the TCP layer via keepalive probes sent by the
+// kernel. This is transparent to CDP clients — unlike a WebSocket ping, which
+// go-rod panics on and chromedp logs as "malformed". Tunables in Config.zig.
+fn configureSocket(socket: posix.socket_t) !void {
+    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1))) catch |err| {
+        log.warn(.app, "SO_KEEPALIVE", .{ .err = err });
+        return err;
     };
-    defer self.releaseClient(client);
 
-    client.* = Client.init(
-        socket,
-        self.allocator,
-        self.app,
-        self.json_version_response,
-        timeout_ms,
-    ) catch |err| {
-        log.err(.app, "CDP client init", .{ .err = err });
-        return;
+    const idle_opt = switch (builtin.os.tag) {
+        .macos, .ios => posix.TCP.KEEPALIVE,
+        else => posix.TCP.KEEPIDLE,
     };
-    defer client.deinit();
-
-    self.registerClient(client);
-    defer self.unregisterClient(client);
-
-    // Check shutdown after registering to avoid missing the stop signal.
-    // If deinit() already iterated over clients, this client won't receive stop()
-    // and would block joinThreads() indefinitely.
-    if (self.app.shutdown()) {
-        return;
-    }
-
-    client.start();
+    posix.setsockopt(socket, posix.IPPROTO.TCP, idle_opt, &std.mem.toBytes(Config.CDP_KEEPALIVE_IDLE_S)) catch |err| {
+        log.warn(.app, "TCP_KEEPIDLE", .{ .err = err });
+        return err;
+    };
+    posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, &std.mem.toBytes(Config.CDP_KEEPALIVE_INTVL_S)) catch |err| {
+        log.warn(.app, "TCP_KEEPINTVL", .{ .err = err });
+        return err;
+    };
+    posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, &std.mem.toBytes(Config.CDP_KEEPALIVE_CNT)) catch |err| {
+        log.warn(.app, "TCP_KEEPCNT", .{ .err = err });
+        return err;
+    };
 }
 
-fn getClient(self: *Server) !*Client {
-    self.client_mutex.lock();
-    defer self.client_mutex.unlock();
-    return self.clients_pool.create();
-}
-
-fn releaseClient(self: *Server, client: *Client) void {
-    self.client_mutex.lock();
-    defer self.client_mutex.unlock();
-    self.clients_pool.destroy(client);
-}
-
-fn registerClient(self: *Server, client: *Client) void {
-    self.client_mutex.lock();
-    defer self.client_mutex.unlock();
-    self.clients.append(self.allocator, client) catch {};
-}
-
-fn unregisterClient(self: *Server, client: *Client) void {
-    self.client_mutex.lock();
-    defer self.client_mutex.unlock();
-    for (self.clients.items, 0..) |c, i| {
-        if (c == client) {
-            _ = self.clients.swapRemove(i);
-            break;
-        }
-    }
-}
-
-fn spawnWorker(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
+fn spawnWorker(self: *Server, socket: posix.socket_t) !void {
     if (self.app.shutdown()) {
         return error.ShuttingDown;
     }
@@ -174,318 +152,133 @@ fn spawnWorker(self: *Server, socket: posix.socket_t, timeout_ms: u32) !void {
     //
     // On failure, cmpxchgWeak returns the actual value, which we reuse to avoid
     // an extra load on the next iteration.
-    const max_connections = self.app.config.maxConnections();
     var current = self.active_threads.load(.monotonic);
-    while (current < max_connections) {
+    while (current < self.max_connections) {
         current = self.active_threads.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) orelse break;
     } else {
         return error.MaxThreadsReached;
     }
     errdefer _ = self.active_threads.fetchSub(1, .monotonic);
 
-    const thread = try std.Thread.spawn(.{}, runWorker, .{ self, socket, timeout_ms });
+    const thread = try std.Thread.spawn(.{}, handleConnection, .{ self, socket });
     thread.detach();
 }
 
-fn runWorker(self: *Server, socket: posix.socket_t, timeout_ms: u32) void {
+fn handleConnection(self: *Server, socket: posix.socket_t) void {
     defer _ = self.active_threads.fetchSub(1, .monotonic);
-    handleConnection(self, socket, timeout_ms);
-}
+    defer posix.close(socket);
 
-fn joinThreads(self: *Server) void {
-    while (self.active_threads.load(.monotonic) > 0) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
-}
-
-// Handle exactly one TCP connection.
-pub const Client = struct {
-    // The client is initially serving HTTP requests but, under normal circumstances
-    // should eventually be upgraded to a websocket connections
-    mode: union(enum) {
-        http: void,
-        cdp: CDP,
-    },
-
-    allocator: Allocator,
-    app: *App,
-    http: *HttpClient,
-    ws: Net.WsConnection,
-
-    fn init(
-        socket: posix.socket_t,
-        allocator: Allocator,
-        app: *App,
-        json_version_response: []const u8,
-        timeout_ms: u32,
-    ) !Client {
-        var ws = try Net.WsConnection.init(socket, allocator, json_version_response, timeout_ms);
-        errdefer ws.deinit();
-
-        if (log.enabled(.app, .info)) {
-            const client_address = ws.getAddress() catch null;
-            log.info(.app, "client connected", .{ .ip = client_address });
-        }
-
-        const http = try HttpClient.init(allocator, &app.network);
-        errdefer http.deinit();
-
-        return .{
-            .allocator = allocator,
-            .app = app,
-            .http = http,
-            .ws = ws,
-            .mode = .{ .http = {} },
-        };
+    const cdp = blk: {
+        self.cdp_mutex.lock();
+        defer self.cdp_mutex.unlock();
+        break :blk self.cdp_pool.create() catch @panic("OOM");
+    };
+    defer {
+        self.cdp_mutex.lock();
+        defer self.cdp_mutex.unlock();
+        self.cdp_pool.destroy(cdp);
     }
 
-    fn stop(self: *Client) void {
-        switch (self.mode) {
-            .http => {},
-            .cdp => |*cdp| cdp.browser.env.terminate(),
-        }
-        self.ws.shutdown();
+    cdp.init(self.app, socket, self.json_version_response) catch |err| {
+        log.err(.app, "CDP init", .{ .err = err });
+        return;
+    };
+    defer cdp.deinit();
+
+    if (log.enabled(.app, .info)) {
+        const client_address = cdp.conn.getAddress() catch null;
+        log.info(.app, "client connected", .{ .ip = client_address });
     }
 
-    fn deinit(self: *Client) void {
-        switch (self.mode) {
-            .cdp => |*cdp| cdp.deinit(),
-            .http => {},
-        }
-        self.ws.deinit();
-        self.http.deinit();
+    {
+        // track the connection
+        self.cdp_mutex.lock();
+        defer self.cdp_mutex.unlock();
+        self.cdps.append(self.app.allocator, cdp) catch {};
     }
 
-    fn start(self: *Client) void {
-        const http = self.http;
-        http.cdp_client = .{
-            .socket = self.ws.socket,
-            .ctx = self,
-            .blocking_read_start = Client.blockingReadStart,
-            .blocking_read = Client.blockingRead,
-            .blocking_read_end = Client.blockingReadStop,
-        };
-        defer http.cdp_client = null;
-
-        self.httpLoop(http) catch |err| {
-            log.err(.app, "CDP client loop", .{ .err = err });
-        };
-    }
-
-    fn httpLoop(self: *Client, http: *HttpClient) !void {
-        lp.assert(self.mode == .http, "Client.httpLoop invalid mode", .{});
-
-        while (true) {
-            const status = http.tick(self.ws.timeout_ms) catch |err| {
-                log.err(.app, "http tick", .{ .err = err });
-                return;
-            };
-            if (status != .cdp_socket) {
-                log.info(.app, "CDP timeout", .{});
-                return;
-            }
-
-            if (self.readSocket() == false) {
-                return;
-            }
-
-            if (self.mode == .cdp) {
+    defer {
+        // untrack the connection
+        self.cdp_mutex.lock();
+        defer self.cdp_mutex.unlock();
+        for (self.cdps.items, 0..) |c, i| {
+            if (c == cdp) {
+                _ = self.cdps.swapRemove(i);
                 break;
             }
         }
-
-        var cdp = &self.mode.cdp;
-        var last_message = milliTimestamp(.monotonic);
-        var ms_remaining = self.ws.timeout_ms;
-
-        while (true) {
-            switch (cdp.pageWait(ms_remaining)) {
-                .cdp_socket => {
-                    if (self.readSocket() == false) {
-                        return;
-                    }
-                    last_message = milliTimestamp(.monotonic);
-                    ms_remaining = self.ws.timeout_ms;
-                },
-                .no_page => {
-                    const status = http.tick(ms_remaining) catch |err| {
-                        log.err(.app, "http tick", .{ .err = err });
-                        return;
-                    };
-                    if (status != .cdp_socket) {
-                        log.info(.app, "CDP timeout", .{});
-                        return;
-                    }
-                    if (self.readSocket() == false) {
-                        return;
-                    }
-                    last_message = milliTimestamp(.monotonic);
-                    ms_remaining = self.ws.timeout_ms;
-                },
-                .done => {
-                    const now = milliTimestamp(.monotonic);
-                    const elapsed = now - last_message;
-                    if (elapsed >= ms_remaining) {
-                        log.info(.app, "CDP timeout", .{});
-                        return;
-                    }
-                    ms_remaining -= @intCast(elapsed);
-                    last_message = now;
-                },
-            }
-        }
     }
 
-    fn blockingReadStart(ctx: *anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx));
-        self.ws.setBlocking(true) catch |err| {
-            log.warn(.app, "CDP blockingReadStart", .{ .err = err });
-            return false;
+    const upgraded = cdp.conn.handshake() catch |err| {
+        log.err(.app, "CDP handshake", .{ .err = err });
+        return;
+    };
+
+    if (!upgraded) {
+        return;
+    }
+
+    {
+        // Transition from .handshake state to .live
+        // Lock needed even though the main thread hasn't seen this yet because
+        // shutdown could access this from the sighandler thread.
+        self.cdp_mutex.lock();
+        defer self.cdp_mutex.unlock();
+        cdp.conn.state = .live;
+    }
+
+    // Hand the read side of the CDP socket over to the Network thread.
+    // From here until the matching unregisterCdp, the worker must NOT
+    // read from the socket directly — bytes arrive via the inbox.
+    // unregisterCdp is synchronous, so by the time it returns Network
+    // is guaranteed to be done with this link.
+    //
+    // cdp_link_active gates HttpClient.perform's block in
+    // curl_multi_poll: with it false (tests, pre-handshake), perform
+    // skips the poll when there's no in-flight curl work — sleeping
+    // would just eat the timeout waiting for a wakeup that won't
+    // come. We set it true *after* registerCdp so Network is already
+    // accepting wakeups by the time the worker might poll, and clear
+    // it *after* unregisterCdp returns (Network is guaranteed done
+    // with us by then).
+    self.app.network.registerCdp(&cdp.link);
+    cdp.browser.http_client.cdp_link_active = true;
+    defer {
+        self.app.network.unregisterCdp(&cdp.link);
+        cdp.browser.http_client.cdp_link_active = false;
+    }
+
+    // Check shutdown after markLive so that a concurrent shutdown either
+    // sees us as .live and terminates us, or we observe the stop signal
+    // here. Otherwise we could miss it and block deinit() indefinitely.
+    if (self.app.shutdown()) {
+        return;
+    }
+
+    while (true) {
+        const next = cdp.tick() catch |err| {
+            log.err(.app, "cdp tick", .{ .err = err });
+            return;
         };
-        return true;
+        if (!next) break;
     }
+}
 
-    fn blockingRead(ctx: *anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx));
-        return self.readSocket();
+fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
+    const host = app.config.advertiseHost();
+    if (std.mem.eql(u8, host, "0.0.0.0")) {
+        log.info(.cdp, "unreachable advertised host", .{
+            .message = "when --host is set to 0.0.0.0 consider setting --advertise-host to a reachable address",
+        });
     }
-
-    fn blockingReadStop(ctx: *anyopaque) bool {
-        const self: *Client = @ptrCast(@alignCast(ctx));
-        self.ws.setBlocking(false) catch |err| {
-            log.warn(.app, "CDP blockingReadStop", .{ .err = err });
-            return false;
-        };
-        return true;
-    }
-
-    fn readSocket(self: *Client) bool {
-        const n = self.ws.read() catch |err| {
-            log.warn(.app, "CDP read", .{ .err = err });
-            return false;
-        };
-
-        if (n == 0) {
-            log.info(.app, "CDP disconnect", .{});
-            return false;
-        }
-
-        return self.processData() catch false;
-    }
-
-    fn processData(self: *Client) !bool {
-        switch (self.mode) {
-            .cdp => |*cdp| return self.processWebsocketMessage(cdp),
-            .http => return self.processHTTPRequest(),
-        }
-    }
-
-    fn processHTTPRequest(self: *Client) !bool {
-        lp.assert(self.ws.reader.pos == 0, "Client.HTTP pos", .{ .pos = self.ws.reader.pos });
-        const request = self.ws.reader.buf[0..self.ws.reader.len];
-
-        if (request.len > Config.CDP_MAX_HTTP_REQUEST_SIZE) {
-            self.writeHTTPErrorResponse(413, "Request too large");
-            return error.RequestTooLarge;
-        }
-
-        // we're only expecting [body-less] GET requests.
-        if (std.mem.endsWith(u8, request, "\r\n\r\n") == false) {
-            // we need more data, put any more data here
-            return true;
-        }
-
-        // the next incoming data can go to the front of our buffer
-        defer self.ws.reader.len = 0;
-        return self.handleHTTPRequest(request) catch |err| {
-            switch (err) {
-                error.NotFound => self.writeHTTPErrorResponse(404, "Not found"),
-                error.InvalidRequest => self.writeHTTPErrorResponse(400, "Invalid request"),
-                error.InvalidProtocol => self.writeHTTPErrorResponse(400, "Invalid HTTP protocol"),
-                error.MissingHeaders => self.writeHTTPErrorResponse(400, "Missing required header"),
-                error.InvalidUpgradeHeader => self.writeHTTPErrorResponse(400, "Unsupported upgrade type"),
-                error.InvalidVersionHeader => self.writeHTTPErrorResponse(400, "Invalid websocket version"),
-                error.InvalidConnectionHeader => self.writeHTTPErrorResponse(400, "Invalid connection header"),
-                else => {
-                    log.err(.app, "server 500", .{ .err = err, .req = request[0..@min(100, request.len)] });
-                    self.writeHTTPErrorResponse(500, "Internal Server Error");
-                },
-            }
-            return err;
-        };
-    }
-
-    fn handleHTTPRequest(self: *Client, request: []u8) !bool {
-        if (request.len < 18) {
-            // 18 is [generously] the smallest acceptable HTTP request
-            return error.InvalidRequest;
-        }
-
-        if (std.mem.eql(u8, request[0..4], "GET ") == false) {
-            return error.NotFound;
-        }
-
-        const url_end = std.mem.indexOfScalarPos(u8, request, 4, ' ') orelse {
-            return error.InvalidRequest;
-        };
-
-        const url = request[4..url_end];
-
-        if (std.mem.eql(u8, url, "/")) {
-            try self.upgradeConnection(request);
-            return true;
-        }
-
-        if (std.mem.eql(u8, url, "/json/version") or std.mem.eql(u8, url, "/json/version/")) {
-            try self.ws.send(self.ws.json_version_response);
-            // Chromedp (a Go driver) does an http request to /json/version
-            // then to / (websocket upgrade) using a different connection.
-            // Since we only allow 1 connection at a time, the 2nd one (the
-            // websocket upgrade) blocks until the first one times out.
-            // We can avoid that by closing the connection. json_version_response
-            // has a Connection: Close header too.
-            self.ws.shutdown();
-            return false;
-        }
-
-        return error.NotFound;
-    }
-
-    fn upgradeConnection(self: *Client, request: []u8) !void {
-        try self.ws.upgrade(request);
-        self.mode = .{ .cdp = try CDP.init(self.app, self.http, self) };
-    }
-
-    fn writeHTTPErrorResponse(self: *Client, comptime status: u16, comptime body: []const u8) void {
-        self.ws.sendHttpError(status, body);
-    }
-
-    fn processWebsocketMessage(self: *Client, cdp: *CDP) !bool {
-        return self.ws.processMessages(cdp);
-    }
-
-    pub fn sendAllocator(self: *Client) Allocator {
-        return self.ws.send_arena.allocator();
-    }
-
-    pub fn sendJSON(self: *Client, message: anytype, opts: std.json.Stringify.Options) !void {
-        return self.ws.sendJSON(message, opts);
-    }
-
-    pub fn sendJSONRaw(self: *Client, buf: std.ArrayList(u8)) !void {
-        return self.ws.sendJSONRaw(buf);
-    }
-};
-
-// Utils
-// --------
-
-fn buildJSONVersionResponse(
-    allocator: Allocator,
-    address: net.Address,
-) ![]const u8 {
-    const body_format = "{{\"webSocketDebuggerUrl\": \"ws://{f}/\"}}";
-    const body_len = std.fmt.count(body_format, .{address});
+    const body_format =
+        "{{" ++
+        "\"Browser\": \"Lightpanda/1.0\", " ++
+        "\"Protocol-Version\": \"1.3\", " ++
+        "\"User-Agent\": \"Lightpanda/1.0\", " ++
+        "\"webSocketDebuggerUrl\": \"ws://{s}:{d}/\"" ++
+        "}}";
+    const body_len = std.fmt.count(body_format, .{ host, port });
 
     // We send a Connection: Close (and actually close the connection)
     // because chromedp (Go driver) sends a request to /json/version and then
@@ -499,23 +292,24 @@ fn buildJSONVersionResponse(
         "Connection: Close\r\n" ++
         "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
         body_format;
-    return try std.fmt.allocPrint(allocator, response_format, .{ body_len, address });
+    return try std.fmt.allocPrint(app.allocator, response_format, .{ body_len, host, port });
 }
 
-pub const timestamp = @import("datetime.zig").timestamp;
-pub const milliTimestamp = @import("datetime.zig").milliTimestamp;
-
-const testing = std.testing;
+const testing = @import("testing.zig");
 test "server: buildJSONVersionResponse" {
-    const address = try net.Address.parseIp4("127.0.0.1", 9001);
-    const res = try buildJSONVersionResponse(testing.allocator, address);
-    defer testing.allocator.free(res);
+    const res = try buildJSONVersionResponse(testing.test_app, testing.test_app.config.port());
+    defer testing.test_app.allocator.free(res);
 
-    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9001/\"}", res);
+    // The response includes the build version, so check structure rather than exact bytes.
+    try testing.expect(std.mem.startsWith(u8, res, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, res, "Content-Type: application/json") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "Connection: Close") != null);
+
+    // Verify all required JSON fields are present in the body
+    try testing.expect(std.mem.indexOf(u8, res, "\"Browser\": \"Lightpanda/") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"Protocol-Version\": \"1.3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"User-Agent\": \"Lightpanda/") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9222/\"") != null);
 }
 
 test "Client: http invalid request" {
@@ -523,7 +317,7 @@ test "Client: http invalid request" {
     defer c.deinit();
 
     const res = try c.httpRequest("GET /over/9000 HTTP/1.1\r\n" ++ "Header: " ++ ("a" ** 4100) ++ "\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 413 \r\n" ++
+    try testing.expectEqual("HTTP/1.1 413 \r\n" ++
         "Connection: Close\r\n" ++
         "Content-Length: 17\r\n\r\n" ++
         "Request too large", res);
@@ -592,7 +386,7 @@ test "Client: http valid handshake" {
         "Custom:  Header-Value\r\n\r\n";
 
     const res = try c.httpRequest(request);
-    try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+    try testing.expectEqual("HTTP/1.1 101 Switching Protocols\r\n" ++
         "Upgrade: websocket\r\n" ++
         "Connection: upgrade\r\n" ++
         "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
@@ -720,27 +514,23 @@ test "server: 404" {
     defer c.deinit();
 
     const res = try c.httpRequest("GET /unknown HTTP/1.1\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 404 \r\n" ++
+    try testing.expectEqual("HTTP/1.1 404 \r\n" ++
         "Connection: Close\r\n" ++
         "Content-Length: 9\r\n\r\n" ++
         "Not found", res);
 }
 
 test "server: get /json/version" {
-    const expected_response =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9583/\"}";
-
     {
         // twice on the same connection
         var c = try createTestClient();
         defer c.deinit();
 
         const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
+        try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Browser\": \"Lightpanda/") != null);
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Protocol-Version\": \"1.3\"") != null);
+        try testing.expect(std.mem.indexOf(u8, res1, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9583/\"") != null);
     }
 
     {
@@ -749,7 +539,8 @@ test "server: get /json/version" {
         defer c.deinit();
 
         const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
+        try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Browser\": \"Lightpanda/") != null);
     }
 }
 
@@ -767,7 +558,7 @@ fn assertHTTPError(
         .{ expected_status, expected_body.len, expected_body },
     );
 
-    try testing.expectEqualStrings(expected_response, res);
+    try testing.expectEqual(expected_response, res);
 }
 
 fn assertWebSocketError(close_code: u16, input: []const u8) !void {
@@ -850,7 +641,9 @@ fn createTestClient() !TestClient {
 const TestClient = struct {
     stream: std.net.Stream,
     buf: [1024]u8 = undefined,
-    reader: Net.Reader(false),
+    reader: WS.Reader(false, 1024),
+
+    const WS = @import("network/WS.zig");
 
     fn deinit(self: *TestClient) void {
         self.stream.close();
@@ -911,13 +704,13 @@ const TestClient = struct {
             "Custom:  Header-Value\r\n\r\n";
 
         const res = try self.httpRequest(request);
-        try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+        try testing.expectEqual("HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
     }
 
-    fn readWebsocketMessage(self: *TestClient) !?Net.Message {
+    fn readWebsocketMessage(self: *TestClient) !?WS.Message {
         while (true) {
             const n = try self.stream.read(self.reader.readBuf());
             if (n == 0) {

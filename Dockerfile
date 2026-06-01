@@ -3,24 +3,29 @@ FROM debian:stable-slim
 ARG MINISIG=0.12
 ARG ZIG_MINISIG=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 ARG V8=14.0.365.4
-ARG ZIG_V8=v0.3.3
+ARG ZIG_V8=v0.4.5
 ARG TARGETPLATFORM
 
 RUN apt-get update -yq && \
-    apt-get install -yq xz-utils ca-certificates \
+    apt-get install -yq --no-install-recommends xz-utils ca-certificates \
         pkg-config libglib2.0-dev \
-        clang make curl git
+        clang make curl git && \
+    rm -rf /var/lib/apt/lists/*
 
 # Get Rust
-RUN curl https://sh.rustup.rs -sSf | sh -s -- --profile minimal -y
+# Download then execute (rather than `curl | sh`) so a failed download is not
+# masked by sh's exit code under /bin/sh, which has no pipefail.
+RUN curl --fail -sSL --retry 3 --retry-delay 2 -o /tmp/rustup.sh https://sh.rustup.rs && \
+    sh /tmp/rustup.sh --profile minimal -y && \
+    rm /tmp/rustup.sh
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # install minisig
-RUN curl --fail -L -O https://github.com/jedisct1/minisign/releases/download/${MINISIG}/minisign-${MINISIG}-linux.tar.gz && \
-    tar xvzf minisign-${MINISIG}-linux.tar.gz -C /
+RUN curl --fail -L --retry 3 --retry-delay 2 -O https://github.com/jedisct1/minisign/releases/download/${MINISIG}/minisign-${MINISIG}-linux.tar.gz && \
+    tar xzf minisign-${MINISIG}-linux.tar.gz -C /
 
 # clone lightpanda
-RUN git clone https://github.com/lightpanda-io/browser.git
+RUN git clone --depth 1 https://github.com/lightpanda-io/browser.git
 WORKDIR /browser
 
 # install zig
@@ -29,10 +34,10 @@ RUN ZIG=$(grep '\.minimum_zig_version = "' "build.zig.zon" | cut -d'"' -f2) && \
       "linux/arm64") ARCH="aarch64" ;; \
       *) ARCH="x86_64" ;; \
     esac && \
-    curl --fail -L -O https://ziglang.org/download/${ZIG}/zig-${ARCH}-linux-${ZIG}.tar.xz && \
-    curl --fail -L -O https://ziglang.org/download/${ZIG}/zig-${ARCH}-linux-${ZIG}.tar.xz.minisig && \
+    curl --fail -L --retry 3 --retry-delay 2 -O https://ziglang.org/download/${ZIG}/zig-${ARCH}-linux-${ZIG}.tar.xz && \
+    curl --fail -L --retry 3 --retry-delay 2 -O https://ziglang.org/download/${ZIG}/zig-${ARCH}-linux-${ZIG}.tar.xz.minisig && \
     /minisign-linux/${ARCH}/minisign -Vm zig-${ARCH}-linux-${ZIG}.tar.xz -P ${ZIG_MINISIG} && \
-    tar xvf zig-${ARCH}-linux-${ZIG}.tar.xz && \
+    tar xf zig-${ARCH}-linux-${ZIG}.tar.xz && \
     mv zig-${ARCH}-linux-${ZIG} /usr/local/lib && \
     ln -s /usr/local/lib/zig-${ARCH}-linux-${ZIG}/zig /usr/local/bin/zig
 
@@ -41,7 +46,7 @@ RUN case $TARGETPLATFORM in \
     "linux/arm64") ARCH="aarch64" ;; \
     *) ARCH="x86_64" ;; \
     esac && \
-    curl --fail -L -o libc_v8.a https://github.com/lightpanda-io/zig-v8-fork/releases/download/${ZIG_V8}/libc_v8_${V8}_linux_${ARCH}.a && \
+    curl --fail -L --retry 3 --retry-delay 2 -o libc_v8.a https://github.com/lightpanda-io/zig-v8-fork/releases/download/${ZIG_V8}/libc_v8_${V8}_linux_${ARCH}.a && \
     mkdir -p v8/ && \
     mv libc_v8.a v8/libc_v8.a
 
@@ -53,13 +58,13 @@ RUN zig build -Doptimize=ReleaseFast \
 # build release
 RUN zig build -Doptimize=ReleaseFast \
     -Dsnapshot_path=../../snapshot.bin \
-    -Dprebuilt_v8_path=v8/libc_v8.a \
-    -Dgit_commit=$(git rev-parse --short HEAD)
+    -Dprebuilt_v8_path=v8/libc_v8.a
 
 FROM debian:stable-slim
 
 RUN apt-get update -yq && \
-    apt-get install -yq tini
+    apt-get install -yq --no-install-recommends tini && \
+    rm -rf /var/lib/apt/lists/*
 
 FROM debian:stable-slim
 
@@ -75,4 +80,4 @@ EXPOSE 9222/tcp
 # Using "tini" as PID1 ensures that signals work as expected, so e.g. "docker stop" will not hang.
 # (See https://github.com/krallin/tini#why-tini).
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/bin/lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222", "--log_level", "info"]
+CMD ["/bin/lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222", "--log-level", "info"]

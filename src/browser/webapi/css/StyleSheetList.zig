@@ -1,23 +1,36 @@
 const std = @import("std");
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
 const CSSStyleSheet = @import("CSSStyleSheet.zig");
 
 const StyleSheetList = @This();
 
-_sheets: []*CSSStyleSheet = &.{},
+_sheets: std.ArrayList(*CSSStyleSheet) = .empty,
 
-pub fn init(page: *Page) !*StyleSheetList {
-    return page._factory.create(StyleSheetList{});
+pub fn init(frame: *Frame) !*StyleSheetList {
+    return frame._factory.create(StyleSheetList{});
 }
 
 pub fn length(self: *const StyleSheetList) u32 {
-    return @intCast(self._sheets.len);
+    return @intCast(self._sheets.items.len);
 }
 
 pub fn item(self: *const StyleSheetList, index: usize) ?*CSSStyleSheet {
-    if (index >= self._sheets.len) return null;
-    return self._sheets[index];
+    if (index >= self._sheets.items.len) return null;
+    return self._sheets.items[index];
+}
+
+pub fn add(self: *StyleSheetList, sheet: *CSSStyleSheet, frame: *Frame) !void {
+    try self._sheets.append(frame.arena, sheet);
+}
+
+pub fn remove(self: *StyleSheetList, sheet: *CSSStyleSheet) void {
+    for (self._sheets.items, 0..) |s, i| {
+        if (s == sheet) {
+            _ = self._sheets.orderedRemove(i);
+            return;
+        }
+    }
 }
 
 pub const JsApi = struct {

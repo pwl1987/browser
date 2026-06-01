@@ -18,22 +18,87 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
 const js = @import("../js/js.zig");
-const Page = @import("../Page.zig");
+const Frame = @import("../Frame.zig");
+
 const PluginArray = @import("PluginArray.zig");
+const Permissions = @import("Permissions.zig");
+const StorageManager = @import("StorageManager.zig");
+const NavigatorUAData = @import("NavigatorUAData.zig");
+const ModelContext = @import("ModelContext.zig");
 
 const Navigator = @This();
 _pad: bool = false,
 _plugins: PluginArray = .{},
+_permissions: Permissions = .{},
+_storage: StorageManager = .{},
+_ua_data: NavigatorUAData = .{},
 
 pub const init: Navigator = .{};
 
-pub fn getUserAgent(_: *const Navigator, page: *Page) []const u8 {
-    return page._session.browser.app.config.http_headers.user_agent;
+pub fn getUserAgent(_: *const Navigator, frame: *Frame) []const u8 {
+    return frame._session.browser.http_client.getUserAgent();
 }
 
-pub fn getLanguages(_: *const Navigator) [1][]const u8 {
-    return .{"en-US"};
+pub fn getLanguages(_: *const Navigator) [2][]const u8 {
+    return .{ "en-US", "en" };
+}
+
+pub fn getDoNotTrack(_: *const Navigator) ?[]const u8 {
+    return null;
+}
+
+pub fn getAppName(_: *const Navigator) []const u8 {
+    return "Netscape";
+}
+
+pub fn getAppCodeName(_: *const Navigator) []const u8 {
+    return "Mozilla";
+}
+
+pub fn getAppVersion(_: *const Navigator) []const u8 {
+    return "1.0";
+}
+
+pub fn getLanguage(_: *const Navigator) []const u8 {
+    return "en-US";
+}
+
+pub fn getOnLine(_: *const Navigator) bool {
+    return true;
+}
+
+pub fn getCookieEnabled(_: *const Navigator) bool {
+    return true;
+}
+
+pub fn getHardwareConcurrency(_: *const Navigator) u32 {
+    return 4;
+}
+
+pub fn getDeviceMemory(_: *const Navigator) f64 {
+    return 8.0;
+}
+
+pub fn getMaxTouchPoints(_: *const Navigator) u32 {
+    return 0;
+}
+
+pub fn getVendor(_: *const Navigator) []const u8 {
+    return "";
+}
+
+pub fn getProduct(_: *const Navigator) []const u8 {
+    return "Gecko";
+}
+
+pub fn getWebdriver(_: *const Navigator) bool {
+    return false;
+}
+
+pub fn getGlobalPrivacyControl(_: *const Navigator) bool {
+    return true;
 }
 
 pub fn getPlatform(_: *const Navigator) []const u8 {
@@ -55,13 +120,29 @@ pub fn getPlugins(self: *Navigator) *PluginArray {
     return &self._plugins;
 }
 
-pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {
-    try validateProtocolHandlerScheme(scheme);
-    try validateProtocolHandlerURL(url, page);
+pub fn getPermissions(self: *Navigator) *Permissions {
+    return &self._permissions;
 }
-pub fn unregisterProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {
+
+pub fn getStorage(self: *Navigator) *StorageManager {
+    return &self._storage;
+}
+
+pub fn getUserAgentData(self: *Navigator) *NavigatorUAData {
+    return &self._ua_data;
+}
+
+pub fn getModelContext(_: *const Navigator, frame: *Frame) *ModelContext {
+    return &frame.window._model_context;
+}
+
+pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, frame: *const Frame) !void {
     try validateProtocolHandlerScheme(scheme);
-    try validateProtocolHandlerURL(url, page);
+    try validateProtocolHandlerURL(url, frame);
+}
+pub fn unregisterProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, frame: *const Frame) !void {
+    try validateProtocolHandlerScheme(scheme);
+    try validateProtocolHandlerURL(url, frame);
 }
 
 fn validateProtocolHandlerScheme(scheme: []const u8) !void {
@@ -114,11 +195,11 @@ fn validateProtocolHandlerScheme(scheme: []const u8) !void {
     }
 }
 
-fn validateProtocolHandlerURL(url: [:0]const u8, page: *const Page) !void {
+fn validateProtocolHandlerURL(url: [:0]const u8, frame: *const Frame) !void {
     if (std.mem.indexOf(u8, url, "%s") == null) {
         return error.SyntaxError;
     }
-    if (try page.isSameOrigin(url) == false) {
+    if (frame.isSameOrigin(url) == false) {
         return error.SyntaxError;
     }
 }
@@ -133,27 +214,39 @@ pub const JsApi = struct {
         pub const empty_with_no_proto = true;
     };
 
-    // Read-only properties
+    // Read-only properties. All are accessors (not data properties) so they
+    // present as native getters on Navigator.prototype, matching real browsers
+    // — see the getter definitions above for why.
     pub const userAgent = bridge.accessor(Navigator.getUserAgent, null, .{});
-    pub const appName = bridge.property("Netscape", .{ .template = false });
-    pub const appCodeName = bridge.property("Netscape", .{ .template = false });
-    pub const appVersion = bridge.property("1.0", .{ .template = false });
+    pub const appName = bridge.accessor(Navigator.getAppName, null, .{});
+    pub const appCodeName = bridge.accessor(Navigator.getAppCodeName, null, .{});
+    pub const appVersion = bridge.accessor(Navigator.getAppVersion, null, .{});
     pub const platform = bridge.accessor(Navigator.getPlatform, null, .{});
-    pub const language = bridge.property("en-US", .{ .template = false });
+    pub const language = bridge.accessor(Navigator.getLanguage, null, .{});
     pub const languages = bridge.accessor(Navigator.getLanguages, null, .{});
-    pub const onLine = bridge.property(true, .{ .template = false });
-    pub const cookieEnabled = bridge.property(true, .{ .template = false });
-    pub const hardwareConcurrency = bridge.property(4, .{ .template = false });
-    pub const maxTouchPoints = bridge.property(0, .{ .template = false });
-    pub const vendor = bridge.property("", .{ .template = false });
-    pub const product = bridge.property("Gecko", .{ .template = false });
-    pub const webdriver = bridge.property(false, .{ .template = false });
+    pub const onLine = bridge.accessor(Navigator.getOnLine, null, .{});
+    pub const cookieEnabled = bridge.accessor(Navigator.getCookieEnabled, null, .{});
+    pub const hardwareConcurrency = bridge.accessor(Navigator.getHardwareConcurrency, null, .{});
+    pub const deviceMemory = bridge.accessor(Navigator.getDeviceMemory, null, .{});
+    pub const maxTouchPoints = bridge.accessor(Navigator.getMaxTouchPoints, null, .{});
+    pub const vendor = bridge.accessor(Navigator.getVendor, null, .{});
+    pub const product = bridge.accessor(Navigator.getProduct, null, .{});
+    pub const webdriver = bridge.accessor(Navigator.getWebdriver, null, .{});
     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
-    pub const doNotTrack = bridge.property(null, .{ .template = false });
-    pub const globalPrivacyControl = bridge.property(true, .{ .template = false });
+    pub const doNotTrack = bridge.accessor(Navigator.getDoNotTrack, null, .{});
+    pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
     pub const registerProtocolHandler = bridge.function(Navigator.registerProtocolHandler, .{ .dom_exception = true });
     pub const unregisterProtocolHandler = bridge.function(Navigator.unregisterProtocolHandler, .{ .dom_exception = true });
 
     // Methods
     pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{});
+    pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
+    pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
+    pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
+    pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{});
 };
+
+const testing = @import("../../testing.zig");
+test "WebApi: Navigator" {
+    try testing.htmlRunner("navigator", .{});
+}

@@ -36,10 +36,10 @@ pub struct ElementData {
 }
 impl ElementData {
     fn new(qname: QualName, flags: ElementFlags) -> Self {
-        return Self {
+        Self {
             qname: qname,
             mathml_annotation_xml_integration_point: flags.mathml_annotation_xml_integration_point,
-        };
+        }
     }
 }
 
@@ -62,6 +62,8 @@ pub struct Sink<'arena> {
     pub reparent_children_callback: ReparentChildrenCallback,
     pub append_before_sibling_callback: AppendBeforeSiblingCallback,
     pub append_based_on_parent_node_callback: AppendBasedOnParentNodeCallback,
+    pub attach_declarative_shadow_callback: AttachDeclarativeShadowCallback,
+    pub allow_declarative_shadow: bool,
 }
 
 impl<'arena> TreeSink for Sink<'arena> {
@@ -130,12 +132,12 @@ impl<'arena> TreeSink for Sink<'arena> {
         unsafe {
             let mut attribute_iterator = CAttributeIterator { vec: attrs, pos: 0 };
 
-            return (self.create_element_callback)(
+            (self.create_element_callback)(
                 self.ctx,
                 data as *mut _ as *mut c_void,
                 CQualName::create(&name),
                 &mut attribute_iterator as *mut _ as *mut c_void,
-            );
+            )
         }
     }
 
@@ -284,6 +286,28 @@ impl<'arena> TreeSink for Sink<'arena> {
     fn reparent_children(&self, node: &Ref, new_parent: &Ref) {
         unsafe {
             (self.reparent_children_callback)(self.ctx, *node, *new_parent);
+        }
+    }
+
+    fn allow_declarative_shadow_roots(&self, _intended_parent: &Ref) -> bool {
+        self.allow_declarative_shadow
+    }
+
+    fn attach_declarative_shadow(&self, location: &Ref, template: &Ref, attrs: &[Attribute]) -> bool {
+        // html5ever only calls this when shadowrootmode is "open" or "closed",
+        // so anything other than "open" is treated as "closed".
+        let mode_is_open = attrs
+            .iter()
+            .find(|a| a.name.local.as_ref() == "shadowrootmode")
+            .map(|a| a.value.as_ref() == "open")
+            .unwrap_or(true);
+        unsafe {
+            (self.attach_declarative_shadow_callback)(
+                self.ctx,
+                *location,
+                *template,
+                if mode_is_open { 1 } else { 0 },
+            ) != 0
         }
     }
 }

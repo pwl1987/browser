@@ -17,18 +17,22 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const id = @import("../id.zig");
-const log = @import("../../log.zig");
+const CDP = @import("../CDP.zig");
 const Node = @import("../Node.zig");
-const DOMNode = @import("../../browser/webapi/Node.zig");
-const Selector = @import("../../browser/webapi/selector/Selector.zig");
 
 const dump = @import("../../browser/dump.zig");
 const js = @import("../../browser/js/js.zig");
+const DOMNode = @import("../../browser/webapi/Node.zig");
+const Selector = @import("../../browser/webapi/selector/Selector.zig");
+const xpath = @import("../../browser/xpath/Evaluator.zig");
 
+const log = lp.log;
 const Allocator = std.mem.Allocator;
 
-pub fn processMessage(cmd: anytype) !void {
+pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         enable,
         getDocument,
@@ -69,7 +73,7 @@ pub fn processMessage(cmd: anytype) !void {
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-getDocument
-fn getDocument(cmd: anytype) !void {
+fn getDocument(cmd: *CDP.Command) !void {
     const Params = struct {
         // CDP documentation implies that 0 isn't valid, but it _does_ work in Chrome
         depth: i32 = 3,
@@ -82,30 +86,88 @@ fn getDocument(cmd: anytype) !void {
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
-    const node = try bc.node_registry.register(page.window._document.asNode());
+    const node = try bc.node_registry.register(frame.window._document.asNode());
     return cmd.sendResult(.{ .root = bc.nodeWriter(node, .{ .depth = params.depth }) }, .{});
 }
 
+// Closed set of XPath 1.0 named axes. Matched literally before `::` so
+// CSS pseudo-elements (`a::before`, `div::first-line`) don't get
+// misrouted to the XPath evaluator just because they have an
+// identifier-looking word before `::`.
+const xpath_axis_names = std.StaticStringMap(void).initComptime(.{
+    .{ "child", {} },
+    .{ "descendant", {} },
+    .{ "descendant-or-self", {} },
+    .{ "self", {} },
+    .{ "parent", {} },
+    .{ "ancestor", {} },
+    .{ "ancestor-or-self", {} },
+    .{ "following-sibling", {} },
+    .{ "preceding-sibling", {} },
+    .{ "following", {} },
+    .{ "preceding", {} },
+    .{ "attribute", {} },
+    .{ "namespace", {} },
+});
+
+// Heuristic (decision #2/#9): treat the query as XPath when it begins
+// with a path operator or contains an axis specifier; otherwise fall
+// through to CSS.
+fn isXPathQuery(q: []const u8) bool {
+    if (q.len == 0) return false;
+    if (q[0] == '/') return true;
+    if (q[0] == '.' and q.len > 1 and q[1] == '/') return true;
+    if (q[0] == '(' and q.len > 1) {
+        if (q[1] == '/') return true;
+        if (q[1] == '.' and q.len > 2 and q[2] == '/') return true;
+    }
+    // For `::` to be an XPath axis separator, the identifier immediately
+    // before it must be one of the 13 named axes. Walk back the run of
+    // [a-zA-Z-] characters and look it up in the closed set.
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, q, idx, "::")) |hit| : (idx = hit + 1) {
+        if (hit == 0) continue;
+        var start = hit;
+        while (start > 0) {
+            const c = q[start - 1];
+            const is_axis_char = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '-';
+            if (!is_axis_char) break;
+            start -= 1;
+        }
+        if (start == hit) continue;
+        if (xpath_axis_names.has(q[start..hit])) return true;
+    }
+    return false;
+}
+
 // https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-performSearch
-fn performSearch(cmd: anytype) !void {
+fn performSearch(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         query: []const u8,
         includeUserAgentShadowDOM: ?bool = null,
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
-    const list = try Selector.querySelectorAll(page.window._document.asNode(), params.query, page);
-    defer list.deinit(page._session);
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
+    const root = frame.window._document.asNode();
 
-    const search = try bc.node_search_list.create(list._nodes);
+    if (isXPathQuery(params.query)) {
+        const arena = try frame.getArena(.medium, "DOM.performSearch");
+        defer frame.releaseArena(arena);
+        const nodes = try xpath.searchAll(arena, root, params.query, frame);
+        return finishSearch(cmd, bc, nodes);
+    }
 
-    // dispatch setChildNodesEvents to inform the client of the subpart of node
-    // tree covering the results.
-    try dispatchSetChildNodes(cmd, list._nodes);
+    const list = try Selector.querySelectorAll(root, params.query, frame);
+    defer list.deinit(frame._page);
+    return finishSearch(cmd, bc, list._nodes);
+}
 
+fn finishSearch(cmd: *CDP.Command, bc: *CDP.BrowserContext, nodes: []const *DOMNode) !void {
+    const search = try bc.node_search_list.create(nodes);
+    try dispatchSetChildNodes(cmd, nodes);
     return cmd.sendResult(.{
         .searchId = search.name,
         .resultCount = @as(u32, @intCast(search.node_ids.len)),
@@ -116,7 +178,7 @@ fn performSearch(cmd: anytype) !void {
 // hierarchy of each nodes.
 // We dispatch event in the reverse order: from the top level to the direct parents.
 // We should dispatch a node only if it has never been sent.
-fn dispatchSetChildNodes(cmd: anytype, dom_nodes: []const *DOMNode) !void {
+fn dispatchSetChildNodes(cmd: *CDP.Command, dom_nodes: []const *DOMNode) !void {
     const arena = cmd.arena;
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const session_id = bc.session_id orelse return error.SessionIdNotLoaded;
@@ -172,7 +234,7 @@ fn dispatchSetChildNodes(cmd: anytype, dom_nodes: []const *DOMNode) !void {
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-discardSearchResults
-fn discardSearchResults(cmd: anytype) !void {
+fn discardSearchResults(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         searchId: []const u8,
     })) orelse return error.InvalidParams;
@@ -184,7 +246,7 @@ fn discardSearchResults(cmd: anytype) !void {
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-getSearchResults
-fn getSearchResults(cmd: anytype) !void {
+fn getSearchResults(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         searchId: []const u8,
         fromIndex: u32,
@@ -209,20 +271,20 @@ fn getSearchResults(cmd: anytype) !void {
     return cmd.sendResult(.{ .nodeIds = node_ids[params.fromIndex..params.toIndex] }, .{});
 }
 
-fn querySelector(cmd: anytype) !void {
+fn querySelector(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: Node.Id,
         selector: []const u8,
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
     const node = bc.node_registry.lookup_by_id.get(params.nodeId) orelse {
         return cmd.sendError(-32000, "Could not find node with given id", .{});
     };
 
-    const element = try Selector.querySelector(node.dom, params.selector, page) orelse return error.NodeNotFoundForGivenId;
+    const element = try Selector.querySelector(node.dom, params.selector, frame) orelse return error.NodeNotFoundForGivenId;
     const dom_node = element.asNode();
     const registered_node = try bc.node_registry.register(dom_node);
 
@@ -235,21 +297,21 @@ fn querySelector(cmd: anytype) !void {
     }, .{});
 }
 
-fn querySelectorAll(cmd: anytype) !void {
+fn querySelectorAll(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: Node.Id,
         selector: []const u8,
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
     const node = bc.node_registry.lookup_by_id.get(params.nodeId) orelse {
         return cmd.sendError(-32000, "Could not find node with given id", .{});
     };
 
-    const selected_nodes = try Selector.querySelectorAll(node.dom, params.selector, page);
-    defer selected_nodes.deinit(page._session);
+    const selected_nodes = try Selector.querySelectorAll(node.dom, params.selector, frame);
+    defer selected_nodes.deinit(frame._page);
 
     const nodes = selected_nodes._nodes;
 
@@ -266,7 +328,7 @@ fn querySelectorAll(cmd: anytype) !void {
     }, .{});
 }
 
-fn resolveNode(cmd: anytype) !void {
+fn resolveNode(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: ?Node.Id = null,
         backendNodeId: ?u32 = null,
@@ -275,7 +337,7 @@ fn resolveNode(cmd: anytype) !void {
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
     var ls: ?js.Local.Scope = null;
     defer if (ls) |*_ls| {
@@ -284,7 +346,7 @@ fn resolveNode(cmd: anytype) !void {
 
     if (params.executionContextId) |context_id| blk: {
         ls = undefined;
-        page.js.localScope(&ls.?);
+        frame.js.localScope(&ls.?);
         if (ls.?.local.debugContextId() == context_id) {
             break :blk;
         }
@@ -302,7 +364,7 @@ fn resolveNode(cmd: anytype) !void {
         } else return error.ContextNotFound;
     } else {
         ls = undefined;
-        page.js.localScope(&ls.?);
+        frame.js.localScope(&ls.?);
     }
 
     const input_node_id = params.nodeId orelse params.backendNodeId orelse return error.InvalidParam;
@@ -327,7 +389,7 @@ fn resolveNode(cmd: anytype) !void {
     } }, .{});
 }
 
-fn describeNode(cmd: anytype) !void {
+fn describeNode(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: ?Node.Id = null,
         backendNodeId: ?Node.Id = null,
@@ -374,7 +436,7 @@ fn rectToQuad(rect: DOMNode.Element.DOMRect) Quad {
     };
 }
 
-fn scrollIntoViewIfNeeded(cmd: anytype) !void {
+fn scrollIntoViewIfNeeded(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: ?Node.Id = null,
         backendNodeId: ?u32 = null,
@@ -397,15 +459,15 @@ fn scrollIntoViewIfNeeded(cmd: anytype) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn getNode(arena: Allocator, bc: anytype, node_id: ?Node.Id, backend_node_id: ?Node.Id, object_id: ?[]const u8) !*Node {
+pub fn getNode(arena: Allocator, bc: *CDP.BrowserContext, node_id: ?Node.Id, backend_node_id: ?Node.Id, object_id: ?[]const u8) !*Node {
     const input_node_id = node_id orelse backend_node_id;
     if (input_node_id) |input_node_id_| {
         return bc.node_registry.lookup_by_id.get(input_node_id_) orelse return error.NodeNotFound;
     }
     if (object_id) |object_id_| {
-        const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+        const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
         var ls: js.Local.Scope = undefined;
-        page.js.localScope(&ls);
+        frame.js.localScope(&ls);
         defer ls.deinit();
 
         // Retrieve the object from which ever context it is in.
@@ -417,7 +479,7 @@ fn getNode(arena: Allocator, bc: anytype, node_id: ?Node.Id, backend_node_id: ?N
 
 // https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-getContentQuads
 // Related to: https://drafts.csswg.org/cssom-view/#the-geometryutils-interface
-fn getContentQuads(cmd: anytype) !void {
+fn getContentQuads(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: ?Node.Id = null,
         backendNodeId: ?Node.Id = null,
@@ -425,7 +487,7 @@ fn getContentQuads(cmd: anytype) !void {
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
     const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
 
@@ -439,11 +501,11 @@ fn getContentQuads(cmd: anytype) !void {
     // Text may be tricky, multiple quads in case of multiple lines? empty quads of text  = ""?
     // Elements like SVGElement may have multiple quads.
 
-    const quad = rectToQuad(element.getBoundingClientRect(page));
+    const quad = rectToQuad(element.getBoundingClientRect(frame));
     return cmd.sendResult(.{ .quads = &.{quad} }, .{});
 }
 
-fn getBoxModel(cmd: anytype) !void {
+fn getBoxModel(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: ?Node.Id = null,
         backendNodeId: ?u32 = null,
@@ -451,14 +513,14 @@ fn getBoxModel(cmd: anytype) !void {
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
     const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
 
     // TODO implement for document or text
     const element = node.dom.is(DOMNode.Element) orelse return error.NodeIsNotAnElement;
 
-    const rect = element.getBoundingClientRect(page);
+    const rect = element.getBoundingClientRect(frame);
     const quad = rectToQuad(rect);
     const zero = [_]f64{0.0} ** 8;
 
@@ -472,7 +534,7 @@ fn getBoxModel(cmd: anytype) !void {
     } }, .{});
 }
 
-fn requestChildNodes(cmd: anytype) !void {
+fn requestChildNodes(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: Node.Id,
         depth: i32 = 1,
@@ -496,23 +558,23 @@ fn requestChildNodes(cmd: anytype) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn getFrameOwner(cmd: anytype) !void {
+fn getFrameOwner(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         frameId: []const u8,
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page_frame_id = try id.toPageId(.frame_id, params.frameId);
+    const frame_id = try id.parseFrameId(params.frameId);
 
-    const page = bc.session.findPageByFrameId(page_frame_id) orelse {
+    const frame = bc.session.findFrameByFrameId(frame_id) orelse {
         return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
     };
 
-    const node = try bc.node_registry.register(page.window._document.asNode());
+    const node = try bc.node_registry.register(frame.window._document.asNode());
     return cmd.sendResult(.{ .nodeId = node.id, .backendNodeId = node.id }, .{});
 }
 
-fn getOuterHTML(cmd: anytype) !void {
+fn getOuterHTML(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         nodeId: ?Node.Id = null,
         backendNodeId: ?Node.Id = null,
@@ -524,17 +586,17 @@ fn getOuterHTML(cmd: anytype) !void {
         log.warn(.not_implemented, "DOM.getOuterHTML", .{ .param = "includeShadowDOM" });
     }
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const page = bc.session.currentPage() orelse return error.PageNotLoaded;
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
 
     const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
 
     var aw = std.Io.Writer.Allocating.init(cmd.arena);
-    try dump.deep(node.dom, .{}, &aw.writer, page);
+    try dump.deep(node.dom, .{}, &aw.writer, frame);
 
     return cmd.sendResult(.{ .outerHTML = aw.written() }, .{});
 }
 
-fn requestNode(cmd: anytype) !void {
+fn requestNode(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         objectId: []const u8,
     })) orelse return error.InvalidParams;
@@ -547,7 +609,7 @@ fn requestNode(cmd: anytype) !void {
 
 const testing = @import("../testing.zig");
 test "cdp.dom: getSearchResults unknown search id" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
 
     try ctx.processMessage(.{
@@ -559,7 +621,7 @@ test "cdp.dom: getSearchResults unknown search id" {
 }
 
 test "cdp.dom: search flow" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
 
     _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/dom1.html" });
@@ -613,8 +675,80 @@ test "cdp.dom: search flow" {
     try ctx.expectSentError(-31998, "SearchResultNotFound", .{ .id = 17 });
 }
 
+test "cdp.dom: performSearch with XPath" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/perform_search_xpath.html" });
+
+    try ctx.processMessage(.{
+        .id = 20,
+        .method = "DOM.performSearch",
+        .params = .{ .query = "//p" },
+    });
+    try ctx.expectSentResult(.{ .searchId = "0", .resultCount = 3 }, .{ .id = 20 });
+
+    try ctx.processMessage(.{
+        .id = 21,
+        .method = "DOM.performSearch",
+        .params = .{ .query = "descendant::p" },
+    });
+    try ctx.expectSentResult(.{ .searchId = "1", .resultCount = 3 }, .{ .id = 21 });
+
+    try ctx.processMessage(.{
+        .id = 22,
+        .method = "DOM.performSearch",
+        .params = .{ .query = "//*[@id='outer']" },
+    });
+    try ctx.expectSentResult(.{ .searchId = "2", .resultCount = 1 }, .{ .id = 22 });
+
+    try ctx.processMessage(.{
+        .id = 23,
+        .method = "DOM.performSearch",
+        .params = .{ .query = "p" },
+    });
+    try ctx.expectSentResult(.{ .searchId = "3", .resultCount = 3 }, .{ .id = 23 });
+
+    try ctx.processMessage(.{
+        .id = 24,
+        .method = "DOM.performSearch",
+        .params = .{ .query = "div p" },
+    });
+    try ctx.expectSentResult(.{ .searchId = "4", .resultCount = 2 }, .{ .id = 24 });
+}
+
+test "cdp.dom: isXPathQuery heuristic" {
+    // XPath-shaped queries — each line covers a distinct heuristic branch.
+    try std.testing.expect(isXPathQuery("/html"));
+    try std.testing.expect(isXPathQuery("//p"));
+    try std.testing.expect(isXPathQuery(".//foo"));
+    try std.testing.expect(isXPathQuery("(//foo)[1]"));
+    try std.testing.expect(isXPathQuery("(./bar)[2]"));
+    try std.testing.expect(isXPathQuery("descendant::p"));
+    try std.testing.expect(isXPathQuery("ancestor-or-self::*"));
+    try std.testing.expect(isXPathQuery("//*[@id='x']"));
+
+    // CSS-shaped queries — fall through to the existing path.
+    try std.testing.expect(!isXPathQuery(""));
+    try std.testing.expect(!isXPathQuery("p"));
+    try std.testing.expect(!isXPathQuery("div p"));
+    try std.testing.expect(!isXPathQuery("#main"));
+    try std.testing.expect(!isXPathQuery(".cls"));
+    try std.testing.expect(!isXPathQuery("[data-x]"));
+    try std.testing.expect(!isXPathQuery("(p)")); // parens without path → CSS
+    try std.testing.expect(!isXPathQuery(".x")); // leading dot without /
+
+    // CSS pseudo-elements: identifier before `::` is not an XPath axis name.
+    try std.testing.expect(!isXPathQuery("a::before"));
+    try std.testing.expect(!isXPathQuery("div::after"));
+    try std.testing.expect(!isXPathQuery("p::first-line"));
+    try std.testing.expect(!isXPathQuery("input::placeholder"));
+    // Attribute selector with `::` inside a literal — nothing axis-like before it.
+    try std.testing.expect(!isXPathQuery("[data-x=\"x::y\"]"));
+}
+
 test "cdp.dom: querySelector unknown search id" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
 
     _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/dom1.html" });
@@ -635,7 +769,7 @@ test "cdp.dom: querySelector unknown search id" {
 }
 
 test "cdp.dom: querySelector Node not found" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
 
     _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/dom1.html" });
@@ -663,7 +797,7 @@ test "cdp.dom: querySelector Node not found" {
 }
 
 test "cdp.dom: querySelector Nodes found" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
 
     _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/dom2.html" });
@@ -693,7 +827,7 @@ test "cdp.dom: querySelector Nodes found" {
 }
 
 test "cdp.dom: getBoxModel" {
-    var ctx = testing.context();
+    var ctx = try testing.context();
     defer ctx.deinit();
 
     _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/dom2.html" });
@@ -710,13 +844,16 @@ test "cdp.dom: getBoxModel" {
     });
     try ctx.expectSentResult(.{ .nodeId = 3 }, .{ .id = 4 });
 
+    // Box model on the <p> nodeId returned above.
+    // Note: nodeId 6 is <head>, which is `display: none` per HTML Rendering
+    // §15.3.1, so its box model is all-zeros — exercise a visible element.
     try ctx.processMessage(.{
         .id = 5,
         .method = "DOM.getBoxModel",
-        .params = .{ .nodeId = 6 },
+        .params = .{ .nodeId = 3 },
     });
     try ctx.expectSentResult(.{ .model = BoxModel{
-        .content = Quad{ 10.0, 10.0, 15.0, 10.0, 15.0, 15.0, 10.0, 15.0 },
+        .content = Quad{ 25.0, 25.0, 30.0, 25.0, 30.0, 30.0, 25.0, 30.0 },
         .padding = Quad{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
         .border = Quad{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
         .margin = Quad{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },

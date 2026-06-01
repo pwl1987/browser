@@ -16,13 +16,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const String = @import("../../../string.zig").String;
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 const Window = @import("../Window.zig");
+
+const String = lp.String;
 
 const UIEvent = @This();
 
@@ -37,6 +39,8 @@ pub const Type = union(enum) {
     keyboard_event: *@import("KeyboardEvent.zig"),
     focus_event: *@import("FocusEvent.zig"),
     text_event: *@import("TextEvent.zig"),
+    input_event: *@import("InputEvent.zig"),
+    composition_event: *@import("CompositionEvent.zig"),
 };
 
 pub const UIEventOptions = struct {
@@ -49,29 +53,25 @@ pub const Options = Event.inheritOptions(
     UIEventOptions,
 );
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*UIEvent {
-    const arena = try page.getArena(.{ .debug = "UIEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*UIEvent {
+    const arena = try frame.getArena(.tiny, "UIEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
 
     const opts = _opts orelse Options{};
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         type_string,
         UIEvent{
             ._type = .generic,
             ._proto = undefined,
             ._detail = opts.detail,
-            ._view = opts.view orelse page.window,
+            ._view = opts.view orelse frame.window,
         },
     );
 
     Event.populatePrototypes(event, opts, false);
     return event;
-}
-
-pub fn deinit(self: *UIEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn as(self: *UIEvent, comptime T: type) *T {
@@ -88,6 +88,8 @@ pub fn is(self: *UIEvent, comptime T: type) ?*T {
         .keyboard_event => |e| return if (T == @import("KeyboardEvent.zig")) e else null,
         .focus_event => |e| return if (T == @import("FocusEvent.zig")) e else null,
         .text_event => |e| return if (T == @import("TextEvent.zig")) e else null,
+        .input_event => |e| return if (T == @import("InputEvent.zig")) e else null,
+        .composition_event => |e| return if (T == @import("CompositionEvent.zig")) e else null,
     }
     return null;
 }
@@ -107,11 +109,38 @@ pub fn getDetail(self: *UIEvent) u32 {
 
 // sourceCapabilities not implemented
 
-pub fn getView(self: *UIEvent, page: *Page) *Window {
-    return self._view orelse page.window;
+pub fn getView(self: *UIEvent, frame: *Frame) *Window {
+    return self._view orelse frame.window;
 }
 
-// deprecated `initUIEvent()` not implemented
+// Legacy: see https://w3c.github.io/uievents/#dom-uievent-which
+pub fn getWhich(self: *const UIEvent) u32 {
+    return switch (self._type) {
+        .mouse_event => |me| @as(u32, @intCast(me.getButton())) + 1,
+        .keyboard_event => 0,
+        else => 0,
+    };
+}
+
+pub fn initUIEvent(
+    self: *UIEvent,
+    typ: []const u8,
+    bubbles: ?bool,
+    cancelable: ?bool,
+    view: ?*Window,
+    detail: ?i32,
+) !void {
+    const event = self._proto;
+    if (event._event_phase != .none) {
+        return;
+    }
+
+    event._type_string = try String.init(event._arena, typ, .{});
+    event._bubbles = bubbles orelse false;
+    event._cancelable = cancelable orelse false;
+    self._view = view;
+    self._detail = if (detail) |d| @intCast(@max(d, 0)) else 0;
+}
 
 pub const JsApi = struct {
     pub const bridge = js.Bridge(UIEvent);
@@ -120,13 +149,13 @@ pub const JsApi = struct {
         pub const name = "UIEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(UIEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(UIEvent.init, .{});
     pub const detail = bridge.accessor(UIEvent.getDetail, null, .{});
     pub const view = bridge.accessor(UIEvent.getView, null, .{});
+    pub const which = bridge.accessor(UIEvent.getWhich, null, .{});
+    pub const initUIEvent = bridge.function(UIEvent.initUIEvent, .{});
 };
 
 const testing = @import("../../../testing.zig");

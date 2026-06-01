@@ -16,17 +16,20 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
-const String = @import("../../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../../js/js.zig");
-const log = @import("../../../../log.zig");
-const Page = @import("../../../Page.zig");
+const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
+const Document = @import("../../Document.zig");
 const HtmlElement = @import("../Html.zig");
 const CustomElementDefinition = @import("../../CustomElementDefinition.zig");
+const Reaction = @import("../../../CustomElementReactions.zig").Reaction;
+
+const log = lp.log;
+const String = lp.String;
 
 const Custom = @This();
 _proto: *HtmlElement,
@@ -42,73 +45,52 @@ pub fn asNode(self: *Custom) *Node {
     return self.asElement().asNode();
 }
 
-pub fn invokeConnectedCallback(self: *Custom, page: *Page) void {
-    // Only invoke if we haven't already called it while connected
-    if (self._connected_callback_invoked) {
-        return;
-    }
+// Reactions are queued via enqueue* and fired via fireReaction at the outer
+// CEReactions boundary (set up by the JS bridge, the parser pump, etc.).
+//
+// Dedup happens at enqueue time: the connected/disconnected flags flip when
+// we queue a reaction so that a redundant enqueue (already-in-this-state)
+// is dropped, and a remove+re-insert in the same scope queues both reactions
+// in order. Fire-time is unconditional.
 
-    self._connected_callback_invoked = true;
-    self._disconnected_callback_invoked = false;
-    self.invokeCallback("connectedCallback", .{}, page);
-}
-
-pub fn invokeDisconnectedCallback(self: *Custom, page: *Page) void {
-    // Only invoke if we haven't already called it while disconnected
-    if (self._disconnected_callback_invoked) {
-        return;
-    }
-
-    self._disconnected_callback_invoked = true;
-    self._connected_callback_invoked = false;
-    self.invokeCallback("disconnectedCallback", .{}, page);
-}
-
-pub fn invokeAttributeChangedCallback(self: *Custom, name: String, old_value: ?String, new_value: ?String, page: *Page) void {
-    const definition = self._definition orelse return;
-    if (!definition.isAttributeObserved(name)) {
-        return;
-    }
-    self.invokeCallback("attributeChangedCallback", .{ name, old_value, new_value }, page);
-}
-
-pub fn invokeConnectedCallbackOnElement(comptime from_parser: bool, element: *Element, page: *Page) !void {
+pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *Element, frame: *Frame) error{OutOfMemory}!void {
     // Autonomous custom element
     if (element.is(Custom)) |custom| {
-        // If the element is undefined, check if a definition now exists and upgrade
+        // Upgrade if a definition exists but isn't yet attached
         if (custom._definition == null) {
             const name = custom._tag_name.str();
-            if (page.window._custom_elements._definitions.get(name)) |definition| {
+            if (frame.window._custom_elements._definitions.get(name)) |definition| {
                 const CustomElementRegistry = @import("../../CustomElementRegistry.zig");
-                CustomElementRegistry.upgradeCustomElement(custom, definition, page) catch {};
+                CustomElementRegistry.upgradeCustomElement(custom, definition, frame) catch {};
                 return;
             }
+            // Element is undefined and no definition exists yet — nothing to queue.
+            return;
         }
 
-        if (comptime from_parser) {
-            // From parser, we know the element is brand new
-            custom._connected_callback_invoked = true;
-            custom.invokeCallback("connectedCallback", .{}, page);
-        } else {
-            custom.invokeConnectedCallback(page);
-        }
+        // Dedup: skip if already queued/fired while connected.
+        if (custom._connected_callback_invoked) return;
+        custom._connected_callback_invoked = true;
+        custom._disconnected_callback_invoked = false;
+        try frame._ce_reactions.enqueueConnected(frame, element);
         return;
     }
 
     // Customized built-in element - check if it actually has a definition first
-    const definition = page.getCustomizedBuiltInDefinition(element) orelse return;
+    if (frame.getCustomizedBuiltInDefinition(element) == null) {
+        return;
+    }
 
     if (comptime from_parser) {
-        // From parser, we know the element is brand new, skip the tracking check
-        try page._customized_builtin_connected_callback_invoked.put(
-            page.arena,
+        // From parser, we know the element is brand new; skip the dedup check.
+        try frame._customized_builtin_connected_callback_invoked.put(
+            frame.arena,
             element,
             {},
         );
     } else {
-        // Not from parser, check if we've already invoked while connected
-        const gop = try page._customized_builtin_connected_callback_invoked.getOrPut(
-            page.arena,
+        const gop = try frame._customized_builtin_connected_callback_invoked.getOrPut(
+            frame.arena,
             element,
         );
         if (gop.found_existing) {
@@ -117,51 +99,103 @@ pub fn invokeConnectedCallbackOnElement(comptime from_parser: bool, element: *El
         gop.value_ptr.* = {};
     }
 
-    _ = page._customized_builtin_disconnected_callback_invoked.remove(element);
-    invokeCallbackOnElement(element, definition, "connectedCallback", .{}, page);
+    _ = frame._customized_builtin_disconnected_callback_invoked.remove(element);
+    try frame._ce_reactions.enqueueConnected(frame, element);
 }
 
-pub fn invokeDisconnectedCallbackOnElement(element: *Element, page: *Page) void {
-    // Autonomous custom element
+pub fn enqueueDisconnectedCallbackOnElement(element: *Element, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
-        custom.invokeDisconnectedCallback(page);
+        if (custom._definition == null) return;
+        if (custom._disconnected_callback_invoked) return;
+        custom._disconnected_callback_invoked = true;
+        custom._connected_callback_invoked = false;
+        frame._ce_reactions.enqueueDisconnected(frame, element) catch |err| {
+            log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+        };
         return;
     }
 
-    // Customized built-in element - check if it actually has a definition first
-    const definition = page.getCustomizedBuiltInDefinition(element) orelse return;
+    if (frame.getCustomizedBuiltInDefinition(element) == null) {
+        return;
+    }
 
-    // Check if we've already invoked disconnectedCallback while disconnected
-    const gop = page._customized_builtin_disconnected_callback_invoked.getOrPut(
-        page.arena,
+    const gop = frame._customized_builtin_disconnected_callback_invoked.getOrPut(
+        frame.arena,
         element,
     ) catch return;
     if (gop.found_existing) return;
     gop.value_ptr.* = {};
+    _ = frame._customized_builtin_connected_callback_invoked.remove(element);
 
-    _ = page._customized_builtin_connected_callback_invoked.remove(element);
-
-    invokeCallbackOnElement(element, definition, "disconnectedCallback", .{}, page);
+    frame._ce_reactions.enqueueDisconnected(frame, element) catch |err| {
+        log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+    };
 }
 
-pub fn invokeAttributeChangedCallbackOnElement(element: *Element, name: String, old_value: ?String, new_value: ?String, page: *Page) void {
-    // Autonomous custom element
+pub fn enqueueAdoptedCallbackOnElement(element: *Element, old_document: *Document, new_document: *Document, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
-        custom.invokeAttributeChangedCallback(name, old_value, new_value, page);
-        return;
+        if (custom._definition == null) return;
+    } else {
+        if (frame.getCustomizedBuiltInDefinition(element) == null) return;
     }
-
-    // Customized built-in element - check if attribute is observed
-    const definition = page.getCustomizedBuiltInDefinition(element) orelse return;
-    if (!definition.isAttributeObserved(name)) return;
-    invokeCallbackOnElement(element, definition, "attributeChangedCallback", .{ name, old_value, new_value }, page);
+    frame._ce_reactions.enqueueAdopted(frame, element, old_document, new_document) catch |err| {
+        log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+    };
 }
 
-fn invokeCallbackOnElement(element: *Element, definition: *CustomElementDefinition, comptime callback_name: [:0]const u8, args: anytype, page: *Page) void {
+pub fn enqueueAttributeChangedCallbackOnElement(element: *Element, name: String, old_value: ?String, new_value: ?String, namespace: ?String, frame: *Frame) void {
+    if (element.is(Custom)) |custom| {
+        const definition = custom._definition orelse return;
+        if (!definition.isAttributeObserved(name)) return;
+    } else {
+        const definition = frame.getCustomizedBuiltInDefinition(element) orelse return;
+        if (!definition.isAttributeObserved(name)) return;
+    }
+    frame._ce_reactions.enqueueAttributeChanged(frame, element, name, old_value, new_value, namespace) catch |err| {
+        log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+    };
+}
+
+// Called by CustomElementReactions.popAndInvoke for each queued reaction.
+// Filtering already happened at enqueue time, so just fire unconditionally.
+pub fn fireReaction(reaction: Reaction, frame: *Frame) void {
+    switch (reaction) {
+        .connected => |el| {
+            if (el.is(Custom)) |custom| {
+                custom.invokeCallback("connectedCallback", .{}, frame);
+            } else if (frame.getCustomizedBuiltInDefinition(el)) |definition| {
+                invokeCallbackOnElement(el, definition, "connectedCallback", .{}, frame);
+            }
+        },
+        .disconnected => |el| {
+            if (el.is(Custom)) |custom| {
+                custom.invokeCallback("disconnectedCallback", .{}, frame);
+            } else if (frame.getCustomizedBuiltInDefinition(el)) |definition| {
+                invokeCallbackOnElement(el, definition, "disconnectedCallback", .{}, frame);
+            }
+        },
+        .adopted => |a| {
+            if (a.element.is(Custom)) |custom| {
+                custom.invokeCallback("adoptedCallback", .{ a.old_document, a.new_document }, frame);
+            } else if (frame.getCustomizedBuiltInDefinition(a.element)) |definition| {
+                invokeCallbackOnElement(a.element, definition, "adoptedCallback", .{ a.old_document, a.new_document }, frame);
+            }
+        },
+        .attribute_changed => |a| {
+            if (a.element.is(Custom)) |custom| {
+                custom.invokeCallback("attributeChangedCallback", .{ a.name, a.old_value, a.new_value, a.namespace }, frame);
+            } else if (frame.getCustomizedBuiltInDefinition(a.element)) |definition| {
+                invokeCallbackOnElement(a.element, definition, "attributeChangedCallback", .{ a.name, a.old_value, a.new_value, a.namespace }, frame);
+            }
+        },
+    }
+}
+
+fn invokeCallbackOnElement(element: *Element, definition: *CustomElementDefinition, comptime callback_name: [:0]const u8, args: anytype, frame: *Frame) void {
     _ = definition;
 
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
     // Get the JS element object
@@ -173,10 +207,10 @@ fn invokeCallbackOnElement(element: *Element, definition: *CustomElementDefiniti
 }
 
 // Check if element has "is" attribute and attach customized built-in definition
-pub fn checkAndAttachBuiltIn(element: *Element, page: *Page) !void {
+pub fn checkAndAttachBuiltIn(element: *Element, frame: *Frame) !void {
     const is_value = element.getAttributeSafe(comptime .wrap("is")) orelse return;
 
-    const custom_elements = page.window.getCustomElements();
+    const custom_elements = frame.window.getCustomElements();
     const definition = custom_elements._definitions.get(is_value) orelse return;
 
     const extends_tag = definition.extends orelse return;
@@ -185,17 +219,17 @@ pub fn checkAndAttachBuiltIn(element: *Element, page: *Page) !void {
     }
 
     // Attach the definition
-    try page.setCustomizedBuiltInDefinition(element, definition);
+    try frame.setCustomizedBuiltInDefinition(element, definition);
 
     // Reset callback flags since this is a fresh upgrade
-    _ = page._customized_builtin_connected_callback_invoked.remove(element);
-    _ = page._customized_builtin_disconnected_callback_invoked.remove(element);
+    _ = frame._customized_builtin_connected_callback_invoked.remove(element);
+    _ = frame._customized_builtin_disconnected_callback_invoked.remove(element);
 
     // Invoke constructor
-    const prev_upgrading = page._upgrading_element;
+    const prev_upgrading = frame._upgrading_element;
     const node = element.asNode();
-    page._upgrading_element = node;
-    defer page._upgrading_element = prev_upgrading;
+    frame._upgrading_element = node;
+    defer frame._upgrading_element = prev_upgrading;
 
     // PERFORMANCE OPTIMIZATION: This pattern is discouraged in general code.
     // Used here because: (1) multiple early returns before needing Local,
@@ -204,11 +238,11 @@ pub fn checkAndAttachBuiltIn(element: *Element, page: *Page) !void {
     // Local.Scope upfront.
     var ls: ?js.Local.Scope = null;
     var local = blk: {
-        if (page.js.local) |l| {
+        if (frame.js.local) |l| {
             break :blk l;
         }
         ls = undefined;
-        page.js.localScope(&ls.?);
+        frame.js.localScope(&ls.?);
         break :blk &ls.?.local;
     };
     defer if (ls) |*_ls| {
@@ -222,13 +256,13 @@ pub fn checkAndAttachBuiltIn(element: *Element, page: *Page) !void {
     };
 }
 
-fn invokeCallback(self: *Custom, comptime callback_name: [:0]const u8, args: anytype, page: *Page) void {
+fn invokeCallback(self: *Custom, comptime callback_name: [:0]const u8, args: anytype, frame: *Frame) void {
     if (self._definition == null) {
         return;
     }
 
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
     const js_val = ls.local.zigValueToJs(self, .{}) catch return;

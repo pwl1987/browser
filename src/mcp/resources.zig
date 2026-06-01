@@ -22,12 +22,14 @@ pub const resource_list = [_]protocol.Resource{
 };
 
 pub fn handleList(server: *Server, req: protocol.Request) !void {
-    try server.sendResult(req.id.?, .{ .resources = &resource_list });
+    const id = req.id orelse return;
+    try server.sendResult(id, .{ .resources = &resource_list });
 }
 
 const ReadParams = struct {
     uri: []const u8,
 };
+const Format = enum { html, markdown };
 
 const ResourceStreamingResult = struct {
     contents: []const struct {
@@ -37,19 +39,21 @@ const ResourceStreamingResult = struct {
     },
 
     const StreamingText = struct {
-        page: *lp.Page,
-        format: enum { html, markdown },
+        frame: *lp.Frame,
+        format: Format,
 
         pub fn jsonStringify(self: @This(), jw: *std.json.Stringify) !void {
             try jw.beginWriteRaw();
             try jw.writer.writeByte('"');
             var escaped = protocol.JsonEscapingWriter.init(jw.writer);
             switch (self.format) {
-                .html => lp.dump.root(self.page.document, .{}, &escaped.writer, self.page) catch |err| {
+                .html => lp.dump.root(self.frame.document, .{}, &escaped.writer, self.frame) catch |err| {
                     log.err(.mcp, "html dump failed", .{ .err = err });
+                    return error.WriteFailed;
                 },
-                .markdown => lp.markdown.dump(self.page.document.asNode(), .{}, &escaped.writer, self.page) catch |err| {
+                .markdown => lp.markdown.dump(self.frame.document.asNode(), .{}, &escaped.writer, self.frame) catch |err| {
                     log.err(.mcp, "markdown dump failed", .{ .err = err });
+                    return error.WriteFailed;
                 },
             }
             try jw.writer.writeByte('"');
@@ -82,32 +86,27 @@ pub fn handleRead(server: *Server, arena: std.mem.Allocator, req: protocol.Reque
         return server.sendError(req_id, .InvalidRequest, "Resource not found");
     };
 
-    const page = server.session.currentPage() orelse {
-        return server.sendError(req_id, .PageNotLoaded, "Page not loaded");
+    const frame = server.session.currentFrame() orelse {
+        return server.sendError(req_id, .FrameNotLoaded, "Page not loaded");
     };
 
-    switch (uri) {
-        .@"mcp://page/html" => {
-            const result: ResourceStreamingResult = .{
-                .contents = &.{.{
-                    .uri = params.uri,
-                    .mimeType = "text/html",
-                    .text = .{ .page = page, .format = .html },
-                }},
-            };
-            try server.sendResult(req_id, result);
-        },
-        .@"mcp://page/markdown" => {
-            const result: ResourceStreamingResult = .{
-                .contents = &.{.{
-                    .uri = params.uri,
-                    .mimeType = "text/markdown",
-                    .text = .{ .page = page, .format = .markdown },
-                }},
-            };
-            try server.sendResult(req_id, result);
-        },
-    }
-}
+    const format: Format = switch (uri) {
+        .@"mcp://page/html" => .html,
+        .@"mcp://page/markdown" => .markdown,
+    };
+    const mime_type: []const u8 = switch (uri) {
+        .@"mcp://page/html" => "text/html",
+        .@"mcp://page/markdown" => "text/markdown",
+    };
 
-const testing = @import("../testing.zig");
+    const result: ResourceStreamingResult = .{
+        .contents = &.{.{
+            .uri = params.uri,
+            .mimeType = mime_type,
+            .text = .{ .frame = frame, .format = format },
+        }},
+    };
+    server.sendResult(req_id, result) catch {
+        return server.sendError(req_id, .InternalError, "Failed to serialize resource content");
+    };
+}

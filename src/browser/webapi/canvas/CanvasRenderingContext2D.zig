@@ -21,20 +21,29 @@ const std = @import("std");
 const js = @import("../../js/js.zig");
 
 const color = @import("../../color.zig");
-const Page = @import("../../Page.zig");
 
+const Canvas = @import("../element/html/Canvas.zig");
 const ImageData = @import("../ImageData.zig");
+
+const Execution = js.Execution;
 
 /// This class doesn't implement a `constructor`.
 /// It can be obtained with a call to `HTMLCanvasElement#getContext`.
 /// https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D
 const CanvasRenderingContext2D = @This();
+/// Reference to the parent canvas element.
+/// https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/canvas
+_canvas: *Canvas,
 /// Fill color.
 /// TODO: Add support for `CanvasGradient` and `CanvasPattern`.
 _fill_style: color.RGBA = color.RGBA.Named.black,
 
-pub fn getFillStyle(self: *const CanvasRenderingContext2D, page: *Page) ![]const u8 {
-    var w = std.Io.Writer.Allocating.init(page.call_arena);
+pub fn getCanvas(self: *const CanvasRenderingContext2D) *Canvas {
+    return self._canvas;
+}
+
+pub fn getFillStyle(self: *const CanvasRenderingContext2D, exec: *Execution) ![]const u8 {
+    var w = std.Io.Writer.Allocating.init(exec.call_arena);
     try self._fill_style.format(&w.writer);
     return w.written();
 }
@@ -59,20 +68,24 @@ pub fn createImageData(
     maybe_height: ?u32,
     /// Can be used if width and height provided.
     maybe_settings: ?ImageData.ConstructorSettings,
-    page: *Page,
+    exec: *Execution,
 ) !*ImageData {
     switch (width_or_image_data) {
         .width => |width| {
             const height = maybe_height orelse return error.TypeError;
-            return ImageData.init(width, height, maybe_settings, page);
+            return ImageData.init(width, height, maybe_settings, exec);
         },
         .image_data => |image_data| {
-            return ImageData.init(image_data._width, image_data._height, null, page);
+            return ImageData.init(image_data._width, image_data._height, null, exec);
         },
     }
 }
 
 pub fn putImageData(_: *const CanvasRenderingContext2D, _: *ImageData, _: f64, _: f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64) void {}
+
+// CanvasImageSource (HTMLImageElement, HTMLCanvasElement, ImageBitmap, ...) is
+// just taken as a js.Value for now since we don't use it, and that's much easier.
+pub fn drawImage(_: *const CanvasRenderingContext2D, _: js.Value, _: f64, _: f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64, _: ?f64) void {}
 
 pub fn getImageData(
     _: *const CanvasRenderingContext2D,
@@ -80,12 +93,12 @@ pub fn getImageData(
     _: i32, // sy
     sw: i32,
     sh: i32,
-    page: *Page,
+    exec: *Execution,
 ) !*ImageData {
     if (sw <= 0 or sh <= 0) {
         return error.IndexSizeError;
     }
-    return ImageData.init(@intCast(sw), @intCast(sh), null, page);
+    return ImageData.init(@intCast(sw), @intCast(sh), null, exec);
 }
 
 pub fn save(_: *CanvasRenderingContext2D) void {}
@@ -125,6 +138,7 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
+    pub const canvas = bridge.accessor(CanvasRenderingContext2D.getCanvas, null, .{});
     pub const font = bridge.property("10px sans-serif", .{ .template = false, .readonly = false });
     pub const globalAlpha = bridge.property(1.0, .{ .template = false, .readonly = false });
     pub const globalCompositeOperation = bridge.property("source-over", .{ .template = false, .readonly = false });
@@ -140,6 +154,7 @@ pub const JsApi = struct {
     pub const createImageData = bridge.function(CanvasRenderingContext2D.createImageData, .{ .dom_exception = true });
 
     pub const putImageData = bridge.function(CanvasRenderingContext2D.putImageData, .{ .noop = true });
+    pub const drawImage = bridge.function(CanvasRenderingContext2D.drawImage, .{ .noop = true });
     pub const getImageData = bridge.function(CanvasRenderingContext2D.getImageData, .{ .dom_exception = true });
     pub const save = bridge.function(CanvasRenderingContext2D.save, .{ .noop = true });
     pub const restore = bridge.function(CanvasRenderingContext2D.restore, .{ .noop = true });

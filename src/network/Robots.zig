@@ -16,9 +16,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const builtin = @import("builtin");
 const std = @import("std");
-const log = @import("../log.zig");
+const lp = @import("lightpanda");
+const builtin = @import("builtin");
+
+const log = lp.log;
 
 pub const CompiledPattern = struct {
     pattern: []const u8,
@@ -675,10 +677,10 @@ test "Robots: isAllowed - wildcards in patterns" {
     );
     defer robots.deinit(allocator);
 
-    try std.testing.expect(robots.isAllowed("/page.php") == false);
+    try std.testing.expect(robots.isAllowed("/frame.php") == false);
     try std.testing.expect(robots.isAllowed("/index.php") == true);
-    try std.testing.expect(robots.isAllowed("/page.php?param=1") == true);
-    try std.testing.expect(robots.isAllowed("/page.html") == true);
+    try std.testing.expect(robots.isAllowed("/frame.php?param=1") == true);
+    try std.testing.expect(robots.isAllowed("/frame.html") == true);
 }
 
 test "Robots: isAllowed - empty disallow allows everything" {
@@ -790,7 +792,7 @@ test "Robots: isAllowed - complex real-world example" {
     try std.testing.expect(robots.isAllowed("/admin/dashboard") == false);
     try std.testing.expect(robots.isAllowed("/docs/guide.pdf") == false);
     try std.testing.expect(robots.isAllowed("/public/manual.pdf") == true);
-    try std.testing.expect(robots.isAllowed("/page.html") == true);
+    try std.testing.expect(robots.isAllowed("/frame.html") == true);
     try std.testing.expect(robots.isAllowed("/cgi-bin/script.sh") == true);
 }
 

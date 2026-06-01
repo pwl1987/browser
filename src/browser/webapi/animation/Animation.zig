@@ -17,11 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../../log.zig");
+const lp = @import("lightpanda");
 const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
 
+const log = lp.log;
 const Allocator = std.mem.Allocator;
 
 const Animation = @This();
@@ -33,7 +34,8 @@ const PlayState = enum {
     finished,
 };
 
-_page: *Page,
+_rc: lp.RC(u32) = .{},
+_frame: *Frame,
 _arena: Allocator,
 
 _effect: ?js.Object.Global = null,
@@ -49,24 +51,32 @@ _playState: PlayState = .idle,
 // .running => .finished after 10ms when update() is callback.
 //
 // TODO add support for effect and timeline
-pub fn init(page: *Page) !*Animation {
-    const arena = try page.getArena(.{ .debug = "Animation" });
-    errdefer page.releaseArena(arena);
+pub fn init(frame: *Frame) !*Animation {
+    const arena = try frame.getArena(.tiny, "Animation");
+    errdefer frame.releaseArena(arena);
 
     const self = try arena.create(Animation);
     self.* = .{
-        ._page = page,
+        ._frame = frame,
         ._arena = arena,
     };
 
     return self;
 }
 
-pub fn deinit(self: *Animation, _: bool, session: *Session) void {
-    session.releaseArena(self._arena);
+pub fn deinit(self: *Animation, page: *Page) void {
+    page.releaseArena(self._arena);
 }
 
-pub fn play(self: *Animation, page: *Page) !void {
+pub fn releaseRef(self: *Animation, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *Animation) void {
+    self._rc.acquire();
+}
+
+pub fn play(self: *Animation, frame: *Frame) !void {
     if (self._playState == .running) {
         return;
     }
@@ -75,8 +85,8 @@ pub fn play(self: *Animation, page: *Page) !void {
     self._playState = .running;
 
     // Schedule the transition from .running => .finished in 10ms.
-    page.js.strongRef(self);
-    try page.js.scheduler.add(
+    self.acquireRef();
+    try frame.js.scheduler.add(
         self,
         Animation.update,
         10,
@@ -95,7 +105,7 @@ pub fn cancel(self: *Animation) void {
     self._playState = .idle;
 }
 
-pub fn finish(self: *Animation, page: *Page) void {
+pub fn finish(self: *Animation, frame: *Frame) void {
     if (self._playState == .finished) {
         return;
     }
@@ -104,11 +114,11 @@ pub fn finish(self: *Animation, page: *Page) void {
 
     // resolve finished
     if (self._finished_resolver) |resolver| {
-        page.js.local.?.toLocal(resolver).resolve("Animation.getFinished", self);
+        frame.js.local.?.toLocal(resolver).resolve("Animation.getFinished", self);
     }
     // call onfinish
     if (self._onFinish) |func| {
-        page.js.local.?.toLocal(func).call(void, .{}) catch |err| {
+        frame.js.local.?.toLocal(func).call(void, .{}) catch |err| {
             log.warn(.js, "Animation._onFinish", .{ .err = err });
         };
     }
@@ -118,24 +128,24 @@ pub fn reverse(_: *Animation) void {
     log.warn(.not_implemented, "Animation.reverse", .{});
 }
 
-pub fn getFinished(self: *Animation, page: *Page) !js.Promise {
+pub fn getFinished(self: *Animation, frame: *Frame) !js.Promise {
     if (self._finished_resolver == null) {
-        const resolver = page.js.local.?.createPromiseResolver();
+        const resolver = frame.js.local.?.createPromiseResolver();
         self._finished_resolver = try resolver.persist();
         return resolver.promise();
     }
-    return page.js.toLocal(self._finished_resolver).?.promise();
+    return frame.js.toLocal(self._finished_resolver).?.promise();
 }
 
 // The ready promise is immediately resolved.
-pub fn getReady(self: *Animation, page: *Page) !js.Promise {
+pub fn getReady(self: *Animation, frame: *Frame) !js.Promise {
     if (self._ready_resolver == null) {
-        const resolver = page.js.local.?.createPromiseResolver();
+        const resolver = frame.js.local.?.createPromiseResolver();
         resolver.resolve("Animation.getReady", self);
         self._ready_resolver = try resolver.persist();
         return resolver.promise();
     }
-    return page.js.toLocal(self._ready_resolver).?.promise();
+    return frame.js.toLocal(self._ready_resolver).?.promise();
 }
 
 pub fn getEffect(self: *const Animation) ?js.Object.Global {
@@ -158,7 +168,7 @@ pub fn getStartTime(self: *const Animation) ?f64 {
     return self._startTime;
 }
 
-pub fn setStartTime(self: *Animation, value: ?f64, page: *Page) !void {
+pub fn setStartTime(self: *Animation, value: ?f64, frame: *Frame) !void {
     self._startTime = value;
 
     // if the startTime is null, don't play the animation.
@@ -166,14 +176,14 @@ pub fn setStartTime(self: *Animation, value: ?f64, page: *Page) !void {
         return;
     }
 
-    return self.play(page);
+    return self.play(frame);
 }
 
 pub fn getOnFinish(self: *const Animation) ?js.Function.Temp {
     return self._onFinish;
 }
 
-// callback function transitionning from a state to another
+// callback function transitioning from a state to another
 fn update(ctx: *anyopaque) !?u32 {
     const self: *Animation = @ptrCast(@alignCast(ctx));
 
@@ -183,7 +193,7 @@ fn update(ctx: *anyopaque) !?u32 {
             self._playState = .finished;
 
             var ls: js.Local.Scope = undefined;
-            self._page.js.localScope(&ls);
+            self._frame.js.localScope(&ls);
             defer ls.deinit();
 
             // resolve finished
@@ -201,7 +211,7 @@ fn update(ctx: *anyopaque) !?u32 {
     }
 
     // No future change scheduled, set the object weak for garbage collection.
-    self._page.js.weakRef(self);
+    self.releaseRef(self._frame._page);
     return null;
 }
 
@@ -220,8 +230,6 @@ pub const JsApi = struct {
         pub const name = "Animation";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(Animation.deinit);
     };
 
     pub const play = bridge.function(Animation.play, .{});

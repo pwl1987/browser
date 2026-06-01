@@ -18,29 +18,33 @@
 
 const std = @import("std");
 const id = @import("../id.zig");
+const CDP = @import("../CDP.zig");
+const dom = @import("dom.zig");
 
-pub fn processMessage(cmd: anytype) !void {
+pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         enable,
         disable,
         getFullAXTree,
+        queryAXTree,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
         .enable => return enable(cmd),
         .disable => return disable(cmd),
         .getFullAXTree => return getFullAXTree(cmd),
+        .queryAXTree => return queryAXTree(cmd),
     }
 }
-fn enable(cmd: anytype) !void {
+fn enable(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn disable(cmd: anytype) !void {
+fn disable(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-fn getFullAXTree(cmd: anytype) !void {
+fn getFullAXTree(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         depth: ?i32 = null,
         frameId: ?[]const u8 = null,
@@ -49,18 +53,76 @@ fn getFullAXTree(cmd: anytype) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const session = bc.session;
 
-    const page = blk: {
+    const frame = blk: {
         const frame_id = params.frameId orelse {
-            break :blk session.currentPage() orelse return error.PageNotLoaded;
+            break :blk session.currentFrame() orelse return error.FrameNotLoaded;
         };
-        const page_frame_id = try id.toPageId(.frame_id, frame_id);
-        break :blk session.findPageByFrameId(page_frame_id) orelse {
+        break :blk session.findFrameByFrameId(try id.parseFrameId(frame_id)) orelse {
             return cmd.sendError(-32000, "Frame with the given id does not belong to the target.", .{});
         };
     };
 
-    const doc = page.window._document.asNode();
+    const doc = frame.window._document.asNode();
     const node = try bc.node_registry.register(doc);
 
-    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(node, .{}) }, .{});
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer frame.releaseArena(temp_arena);
+
+    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(temp_arena, node, .{}) }, .{});
+}
+
+fn queryAXTree(cmd: *CDP.Command) !void {
+    const Params = struct {
+        nodeId: ?u32 = null,
+        backendNodeId: ?u32 = null,
+        objectId: ?[]const u8 = null,
+        accessibleName: ?[]const u8 = null,
+        role: ?[]const u8 = null,
+    };
+    const params = (try cmd.params(Params)) orelse return error.InvalidParams;
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const node = try dom.getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+
+    const frame = bc.session.currentFrame() orelse return error.FrameNotLoaded;
+    const temp_arena = try frame.getArena(.medium, "AXNode");
+    defer frame.releaseArena(temp_arena);
+
+    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(temp_arena, node, .{
+        .filter = .{
+            .accessible_name = params.accessibleName,
+            .role = params.role,
+        },
+    }) }, .{});
+}
+
+const testing = @import("../testing.zig");
+
+test "cdp.accessibility: queryAXTree requires nodeId, backendNodeId or objectId" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/ax_tree.html" });
+
+    // Pass filters but no node identifier — dom.getNode returns MissingParams.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Accessibility.queryAXTree",
+        .params = .{ .role = "button" },
+    });
+    try ctx.expectSentError(-31998, "MissingParams", .{ .id = 1 });
+}
+
+test "cdp.accessibility: queryAXTree with unknown nodeId returns error" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/ax_tree.html" });
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Accessibility.queryAXTree",
+        .params = .{ .nodeId = 99999 },
+    });
+    try ctx.expectSentError(-31998, "NodeNotFound", .{ .id = 1 });
 }

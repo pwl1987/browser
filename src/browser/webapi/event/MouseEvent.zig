@@ -17,10 +17,10 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 const EventTarget = @import("../EventTarget.zig");
@@ -28,11 +28,14 @@ const EventTarget = @import("../EventTarget.zig");
 const UIEvent = @import("UIEvent.zig");
 const PointerEvent = @import("PointerEvent.zig");
 
+const String = lp.String;
+const Allocator = std.mem.Allocator;
+
 const MouseEvent = @This();
 
 pub const MouseButton = enum(u8) {
     main = 0,
-    auxillary = 1,
+    auxiliary = 1,
     secondary = 2,
     fourth = 3,
     fifth = 4,
@@ -79,16 +82,25 @@ pub const Options = Event.inheritOptions(
     MouseEventOptions,
 );
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*MouseEvent {
-    const arena = try page.getArena(.{ .debug = "MouseEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*MouseEvent {
+    const arena = try frame.getArena(.tiny, "MouseEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
+    return initWithTrusted(arena, type_string, _opts, false, frame);
+}
 
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*MouseEvent {
+    const arena = try frame.getArena(.tiny, "MouseEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
+}
+
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*MouseEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.uiEvent(
+    const event = try frame._factory.uiEvent(
         arena,
-        type_string,
+        typ,
         MouseEvent{
             ._type = .generic,
             ._proto = undefined,
@@ -106,12 +118,8 @@ pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*MouseEvent {
         },
     );
 
-    Event.populatePrototypes(event, opts, false);
+    Event.populatePrototypes(event, opts, trusted);
     return event;
-}
-
-pub fn deinit(self: *MouseEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *MouseEvent) *Event {
@@ -185,6 +193,65 @@ pub fn getShiftKey(self: *const MouseEvent) bool {
     return self._shift_key;
 }
 
+// Deprecated: tracks the same value as offsetX/clientX in the absence of layout.
+pub fn getLayerX(self: *const MouseEvent) f64 {
+    return self._client_x;
+}
+
+pub fn getLayerY(self: *const MouseEvent) f64 {
+    return self._client_y;
+}
+
+pub fn getModifierState(self: *const MouseEvent, key: []const u8) bool {
+    if (std.mem.eql(u8, key, "Alt") or std.mem.eql(u8, key, "AltGraph")) return self._alt_key;
+    if (std.mem.eql(u8, key, "Control")) return self._ctrl_key;
+    if (std.mem.eql(u8, key, "Shift")) return self._shift_key;
+    if (std.mem.eql(u8, key, "Meta")) return self._meta_key;
+    if (std.mem.eql(u8, key, "Accel")) return self._ctrl_key or self._meta_key;
+    return false;
+}
+
+pub fn initMouseEvent(
+    self: *MouseEvent,
+    typ: []const u8,
+    bubbles: ?bool,
+    cancelable: ?bool,
+    view: ?*@import("../Window.zig"),
+    detail: ?i32,
+    screen_x: ?i32,
+    screen_y: ?i32,
+    client_x: ?i32,
+    client_y: ?i32,
+    ctrl_key: ?bool,
+    alt_key: ?bool,
+    shift_key: ?bool,
+    meta_key: ?bool,
+    button: ?i16,
+    related_target: ?*EventTarget,
+) !void {
+    const ui = self._proto;
+    const event = ui._proto;
+    if (event._event_phase != .none) {
+        return;
+    }
+
+    event._type_string = try String.init(event._arena, typ, .{});
+    event._bubbles = bubbles orelse false;
+    event._cancelable = cancelable orelse false;
+    ui._view = view;
+    ui._detail = if (detail) |d| @intCast(@max(d, 0)) else 0;
+    self._screen_x = @floatFromInt(screen_x orelse 0);
+    self._screen_y = @floatFromInt(screen_y orelse 0);
+    self._client_x = @floatFromInt(client_x orelse 0);
+    self._client_y = @floatFromInt(client_y orelse 0);
+    self._ctrl_key = ctrl_key orelse false;
+    self._alt_key = alt_key orelse false;
+    self._shift_key = shift_key orelse false;
+    self._meta_key = meta_key orelse false;
+    self._button = std.meta.intToEnum(MouseButton, button orelse 0) catch return error.TypeError;
+    self._related_target = related_target;
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(MouseEvent);
 
@@ -192,8 +259,6 @@ pub const JsApi = struct {
         pub const name = "MouseEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(MouseEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(MouseEvent.init, .{});
@@ -212,8 +277,12 @@ pub const JsApi = struct {
     pub const screenX = bridge.accessor(getScreenX, null, .{});
     pub const screenY = bridge.accessor(getScreenY, null, .{});
     pub const shiftKey = bridge.accessor(getShiftKey, null, .{});
+    pub const layerX = bridge.accessor(getLayerX, null, .{});
+    pub const layerY = bridge.accessor(getLayerY, null, .{});
     pub const x = bridge.accessor(getClientX, null, .{});
     pub const y = bridge.accessor(getClientY, null, .{});
+    pub const getModifierState = bridge.function(MouseEvent.getModifierState, .{});
+    pub const initMouseEvent = bridge.function(MouseEvent.initMouseEvent, .{});
 };
 
 const testing = @import("../../../testing.zig");

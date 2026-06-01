@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
 const js = @import("../../../js/js.zig");
-const String = @import("../../../../string.zig").String;
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
+
+const String = lp.String;
 
 const Track = @This();
 
@@ -81,7 +83,7 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const kind = bridge.accessor(Track.getKind, Track.setKind, .{});
+    pub const kind = bridge.accessor(Track.getKind, Track.setKind, .{ .ce_reactions = true });
 
     pub const NONE = bridge.property(@as(u16, @intFromEnum(ReadyState.none)), .{ .template = true });
     pub const LOADING = bridge.property(@as(u16, @intFromEnum(ReadyState.loading)), .{ .template = true });

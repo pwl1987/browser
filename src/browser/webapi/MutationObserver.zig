@@ -17,17 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
+const Frame = @import("../Frame.zig");
+
 const Node = @import("Node.zig");
 const Element = @import("Element.zig");
-const log = @import("../../log.zig");
 
-const IS_DEBUG = @import("builtin").mode == .Debug;
-
+const log = lp.log;
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 pub fn registerTypes() []const type {
@@ -39,12 +39,13 @@ pub fn registerTypes() []const type {
 
 const MutationObserver = @This();
 
+_rc: lp.RC(u8) = .{},
 _arena: Allocator,
 _callback: js.Function.Temp,
 _observing: std.ArrayList(Observing) = .{},
 _pending_records: std.ArrayList(*MutationRecord) = .{},
 
-/// Intrusively linked to next element (see Page.zig).
+/// Intrusively linked to next element (see Frame.zig).
 node: std.DoublyLinkedList.Node = .{},
 
 const Observing = struct {
@@ -73,10 +74,9 @@ pub const ObserveOptions = struct {
     attributeFilter: ?[]const []const u8 = null,
 };
 
-pub fn init(callback: js.Function.Temp, page: *Page) !*MutationObserver {
-    const arena = try page.getArena(.{ .debug = "MutationObserver" });
-    errdefer page.releaseArena(arena);
-
+pub fn init(callback: js.Function.Temp, frame: *Frame) !*MutationObserver {
+    const arena = try frame.getArena(.small, "MutationObserver");
+    errdefer frame.releaseArena(arena);
     const self = try arena.create(MutationObserver);
     self.* = .{
         ._arena = arena,
@@ -85,16 +85,25 @@ pub fn init(callback: js.Function.Temp, page: *Page) !*MutationObserver {
     return self;
 }
 
-pub fn deinit(self: *MutationObserver, shutdown: bool, session: *Session) void {
-    self._callback.release();
-    if ((comptime IS_DEBUG) and !shutdown) {
-        std.debug.assert(self._observing.items.len == 0);
+pub fn deinit(self: *MutationObserver, page: *Page) void {
+    for (self._pending_records.items) |record| {
+        // These were never handed to v8, they do not have a corresponding
+        // FinalizerCallback. We 100% own them.
+        record.deinit(page);
     }
-
-    session.releaseArena(self._arena);
+    self._callback.release();
+    page.releaseArena(self._arena);
 }
 
-pub fn observe(self: *MutationObserver, target: *Node, options: ObserveOptions, page: *Page) !void {
+pub fn releaseRef(self: *MutationObserver, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *MutationObserver) void {
+    self._rc.acquire();
+}
+
+pub fn observe(self: *MutationObserver, target: *Node, options: ObserveOptions, frame: *Frame) !void {
     const arena = self._arena;
 
     // Per spec: if attributeOldValue/attributeFilter present and attributes
@@ -156,30 +165,30 @@ pub fn observe(self: *MutationObserver, target: *Node, options: ObserveOptions, 
         }
     }
 
-    // Register with page if this is our first observation
-    if (self._observing.items.len == 0) {
-        page.js.strongRef(self);
-        try page.registerMutationObserver(self);
-    }
-
     try self._observing.append(arena, .{
         .target = target,
         .options = store_options,
     });
+
+    if (self._observing.items.len == 1) {
+        try frame.registerMutationObserver(self);
+    }
 }
 
-pub fn disconnect(self: *MutationObserver, page: *Page) void {
-    page.unregisterMutationObserver(self);
-    self._observing.clearRetainingCapacity();
+pub fn disconnect(self: *MutationObserver, frame: *Frame) void {
     for (self._pending_records.items) |record| {
-        record.deinit(false, page._session);
+        record.deinit(frame._page);
     }
     self._pending_records.clearRetainingCapacity();
-    page.js.safeWeakRef(self);
+
+    if (self._observing.items.len > 0) {
+        frame.unregisterMutationObserver(self);
+    }
+    self._observing.clearRetainingCapacity();
 }
 
-pub fn takeRecords(self: *MutationObserver, page: *Page) ![]*MutationRecord {
-    const records = try page.call_arena.dupe(*MutationRecord, self._pending_records.items);
+pub fn takeRecords(self: *MutationObserver, frame: *Frame) ![]*MutationRecord {
+    const records = try frame.call_arena.dupe(*MutationRecord, self._pending_records.items);
     self._pending_records.clearRetainingCapacity();
     return records;
 }
@@ -190,7 +199,7 @@ pub fn notifyAttributeChange(
     target: *Element,
     attribute_name: String,
     old_value: ?String,
-    page: *Page,
+    frame: *Frame,
 ) !void {
     const target_node = target.asNode();
 
@@ -216,7 +225,7 @@ pub fn notifyAttributeChange(
             }
         }
 
-        const arena = try page.getArena(.{ .debug = "MutationRecord" });
+        const arena = try frame.getArena(.tiny, "MutationRecord");
         const record = try arena.create(MutationRecord);
         record.* = .{
             ._arena = arena,
@@ -235,7 +244,7 @@ pub fn notifyAttributeChange(
 
         try self._pending_records.append(self._arena, record);
 
-        try page.scheduleMutationDelivery();
+        try frame.scheduleMutationDelivery();
         break;
     }
 }
@@ -245,7 +254,7 @@ pub fn notifyCharacterDataChange(
     self: *MutationObserver,
     target: *Node,
     old_value: ?String,
-    page: *Page,
+    frame: *Frame,
 ) !void {
     for (self._observing.items) |obs| {
         if (obs.target != target) {
@@ -260,7 +269,7 @@ pub fn notifyCharacterDataChange(
             continue;
         }
 
-        const arena = try page.getArena(.{ .debug = "MutationRecord" });
+        const arena = try frame.getArena(.tiny, "MutationRecord");
         const record = try arena.create(MutationRecord);
         record.* = .{
             ._arena = arena,
@@ -279,7 +288,7 @@ pub fn notifyCharacterDataChange(
 
         try self._pending_records.append(self._arena, record);
 
-        try page.scheduleMutationDelivery();
+        try frame.scheduleMutationDelivery();
         break;
     }
 }
@@ -292,7 +301,7 @@ pub fn notifyChildListChange(
     removed_nodes: []const *Node,
     previous_sibling: ?*Node,
     next_sibling: ?*Node,
-    page: *Page,
+    frame: *Frame,
 ) !void {
     for (self._observing.items) |obs| {
         if (obs.target != target) {
@@ -307,7 +316,7 @@ pub fn notifyChildListChange(
             continue;
         }
 
-        const arena = try page.getArena(.{ .debug = "MutationRecord" });
+        const arena = try frame.getArena(.tiny, "MutationRecord");
         const record = try arena.create(MutationRecord);
         record.* = .{
             ._arena = arena,
@@ -323,31 +332,32 @@ pub fn notifyChildListChange(
 
         try self._pending_records.append(self._arena, record);
 
-        try page.scheduleMutationDelivery();
+        try frame.scheduleMutationDelivery();
         break;
     }
 }
 
-pub fn deliverRecords(self: *MutationObserver, page: *Page) !void {
+pub fn deliverRecords(self: *MutationObserver, frame: *Frame) !void {
     if (self._pending_records.items.len == 0) {
         return;
     }
 
     // Take a copy of the records and clear the list before calling callback
     // This ensures mutations triggered during the callback go into a fresh list
-    const records = try self.takeRecords(page);
+    const records = try self.takeRecords(frame);
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
     var caught: js.TryCatch.Caught = undefined;
     ls.toLocal(self._callback).tryCall(void, .{ records, self }, &caught) catch |err| {
-        log.err(.page, "MutObserver.deliverRecords", .{ .err = err, .caught = caught });
+        log.err(.frame, "MutObserver.deliverRecords", .{ .err = err, .caught = caught });
         return err;
     };
 }
 
 pub const MutationRecord = struct {
+    _rc: lp.RC(u8) = .{},
     _type: Type,
     _target: *Node,
     _arena: Allocator,
@@ -364,8 +374,16 @@ pub const MutationRecord = struct {
         characterData,
     };
 
-    pub fn deinit(self: *MutationRecord, _: bool, session: *Session) void {
+    pub fn deinit(self: *MutationRecord, session: *Page) void {
         session.releaseArena(self._arena);
+    }
+
+    pub fn releaseRef(self: *MutationRecord, session: *Page) void {
+        self._rc.release(self, session);
+    }
+
+    pub fn acquireRef(self: *MutationRecord) void {
+        self._rc.acquire();
     }
 
     pub fn getType(self: *const MutationRecord) []const u8 {
@@ -418,8 +436,6 @@ pub const MutationRecord = struct {
             pub const name = "MutationRecord";
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
-            pub const weak = true;
-            pub const finalizer = bridge.finalizer(MutationRecord.deinit);
         };
 
         pub const @"type" = bridge.accessor(MutationRecord.getType, null, .{});
@@ -441,8 +457,6 @@ pub const JsApi = struct {
         pub const name = "MutationObserver";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(MutationObserver.deinit);
     };
 
     pub const constructor = bridge.constructor(MutationObserver.init, .{});

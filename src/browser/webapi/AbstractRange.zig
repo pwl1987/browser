@@ -17,26 +17,27 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("../js/js.zig");
+const lp = @import("lightpanda");
 
-const Session = @import("../Session.zig");
+const js = @import("../js/js.zig");
+const Page = @import("../Page.zig");
 
 const Node = @import("Node.zig");
 const Range = @import("Range.zig");
+const StaticRange = @import("StaticRange.zig");
 
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const AbstractRange = @This();
 
 pub const _prototype_root = true;
 
-_rc: u8,
+_rc: lp.RC(u8) = .{},
 _type: Type,
-_page_id: u32,
 _arena: Allocator,
 _end_offset: u32,
 _start_offset: u32,
+_frame_loader_id: u32,
 _end_container: *Node,
 _start_container: *Node,
 
@@ -44,29 +45,26 @@ _start_container: *Node,
 _range_link: std.DoublyLinkedList.Node = .{},
 
 pub fn acquireRef(self: *AbstractRange) void {
-    self._rc += 1;
+    self._rc.acquire();
 }
 
-pub fn deinit(self: *AbstractRange, shutdown: bool, session: *Session) void {
-    _ = shutdown;
-    const rc = self._rc;
-    if (comptime IS_DEBUG) {
-        std.debug.assert(rc != 0);
-    }
-
-    if (rc == 1) {
-        if (session.findPageById(self._page_id)) |page| {
-            page._live_ranges.remove(&self._range_link);
+pub fn deinit(self: *AbstractRange, page: *Page) void {
+    // StaticRanges are never registered in the live-range list
+    if (self._type != .static_range) {
+        if (page.findFrameByLoaderId(self._frame_loader_id)) |frame| {
+            frame._live_ranges.remove(&self._range_link);
         }
-        session.releaseArena(self._arena);
-        return;
     }
-    self._rc = rc - 1;
+    page.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *AbstractRange, page: *Page) void {
+    self._rc.release(self, page);
 }
 
 pub const Type = union(enum) {
     range: *Range,
-    // TODO: static_range: *StaticRange,
+    static_range: *StaticRange,
 };
 
 pub fn as(self: *AbstractRange, comptime T: type) *T {
@@ -76,6 +74,7 @@ pub fn as(self: *AbstractRange, comptime T: type) *T {
 pub fn is(self: *AbstractRange, comptime T: type) ?*T {
     switch (self._type) {
         .range => |r| return if (T == Range) r else null,
+        .static_range => |sr| return if (T == StaticRange) sr else null,
     }
 }
 
@@ -338,8 +337,6 @@ pub const JsApi = struct {
         pub const name = "AbstractRange";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(AbstractRange.deinit);
     };
 
     pub const startContainer = bridge.accessor(AbstractRange.getStartContainer, null, .{});
@@ -347,5 +344,4 @@ pub const JsApi = struct {
     pub const endContainer = bridge.accessor(AbstractRange.getEndContainer, null, .{});
     pub const endOffset = bridge.accessor(AbstractRange.getEndOffset, null, .{});
     pub const collapsed = bridge.accessor(AbstractRange.getCollapsed, null, .{});
-    pub const commonAncestorContainer = bridge.accessor(AbstractRange.getCommonAncestorContainer, null, .{});
 };

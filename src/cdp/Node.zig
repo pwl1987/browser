@@ -17,11 +17,13 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
+const lp = @import("lightpanda");
 
-const log = @import("../log.zig");
-const Page = @import("../browser/Page.zig");
+const Frame = @import("../browser/Frame.zig");
 const DOMNode = @import("../browser/webapi/Node.zig");
+
+const log = lp.log;
+const Allocator = std.mem.Allocator;
 
 pub const Id = u32;
 
@@ -197,7 +199,7 @@ pub const Search = struct {
 };
 
 // Need a custom writer, because we can't just serialize the node as-is.
-// Sometimes we want to serializ the node without chidren, sometimes with just
+// Sometimes we want to serialize the node without children, sometimes with just
 // its direct children, and sometimes the entire tree.
 // (For now, we only support direct children)
 
@@ -303,7 +305,7 @@ pub const Writer = struct {
         try w.write(dom_node.getNodeType());
 
         try w.objectField("nodeName");
-        var name_buf: [Page.BUF_SIZE]u8 = undefined;
+        var name_buf: [Frame.BUF_SIZE]u8 = undefined;
         try w.write(dom_node.getNodeName(&name_buf));
 
         try w.objectField("nodeValue");
@@ -343,12 +345,12 @@ test "cdp Node: Registry register" {
     try testing.expectEqual(0, registry.lookup_by_id.count());
     try testing.expectEqual(0, registry.lookup_by_node.count());
 
-    var page = try testing.pageTest("cdp/registry1.html");
-    defer page._session.removePage();
-    var doc = page.window._document;
+    var frame = try testing.pageTest("cdp/registry1.html", .{});
+    defer frame._session.removePage();
+    var doc = frame.window._document;
 
     {
-        const dom_node = (try doc.querySelector(.wrap("#a1"), page)).?.asNode();
+        const dom_node = (try doc.querySelector(.wrap("#a1"), frame)).?.asNode();
         const node = try registry.register(dom_node);
         const n1b = registry.lookup_by_id.get(1).?;
         const n1c = registry.lookup_by_node.get(node.dom).?;
@@ -360,7 +362,7 @@ test "cdp Node: Registry register" {
     }
 
     {
-        const dom_node = (try doc.querySelector(.wrap("p"), page)).?.asNode();
+        const dom_node = (try doc.querySelector(.wrap("p"), frame)).?.asNode();
         const node = try registry.register(dom_node);
         const n1b = registry.lookup_by_id.get(2).?;
         const n1c = registry.lookup_by_node.get(node.dom).?;
@@ -400,13 +402,13 @@ test "cdp Node: search list" {
     }
 
     {
-        var page = try testing.pageTest("cdp/registry2.html");
-        defer page._session.removePage();
-        var doc = page.window._document;
+        var frame = try testing.pageTest("cdp/registry2.html", .{});
+        defer frame._session.removePage();
+        var doc = frame.window._document;
 
         {
-            const l1 = try doc.querySelectorAll(.wrap("a"), page);
-            defer l1.deinit(page._session);
+            const l1 = try doc.querySelectorAll(.wrap("a"), frame);
+            defer l1.deinit(frame._page);
             const s1 = try search_list.create(l1._nodes);
             try testing.expectEqual("1", s1.name);
             try testing.expectEqualSlices(u32, &.{ 1, 2 }, s1.node_ids);
@@ -416,16 +418,16 @@ test "cdp Node: search list" {
         try testing.expectEqual(2, registry.lookup_by_node.count());
 
         {
-            const l2 = try doc.querySelectorAll(.wrap("#a1"), page);
-            defer l2.deinit(page._session);
+            const l2 = try doc.querySelectorAll(.wrap("#a1"), frame);
+            defer l2.deinit(frame._page);
             const s2 = try search_list.create(l2._nodes);
             try testing.expectEqual("2", s2.name);
             try testing.expectEqualSlices(u32, &.{1}, s2.node_ids);
         }
 
         {
-            const l3 = try doc.querySelectorAll(.wrap("#a2"), page);
-            defer l3.deinit(page._session);
+            const l3 = try doc.querySelectorAll(.wrap("#a2"), frame);
+            defer l3.deinit(frame._page);
             const s3 = try search_list.create(l3._nodes);
             try testing.expectEqual("3", s3.name);
             try testing.expectEqualSlices(u32, &.{2}, s3.node_ids);
@@ -440,9 +442,9 @@ test "cdp Node: Writer" {
     var registry = Registry.init(testing.allocator);
     defer registry.deinit();
 
-    var page = try testing.pageTest("cdp/registry3.html");
-    defer page._session.removePage();
-    var doc = page.window._document;
+    var frame = try testing.pageTest("cdp/registry3.html", .{});
+    defer frame._session.removePage();
+    var doc = frame.window._document;
 
     {
         const node = try registry.register(doc.asNode());

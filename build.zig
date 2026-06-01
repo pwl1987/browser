@@ -17,23 +17,44 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-const Build = std.Build;
+const lightpanda_version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch unreachable;
+const min_zig_version = std.SemanticVersion.parse(@import("build.zig.zon").minimum_zig_version) catch unreachable;
+
+const Build = blk: {
+    if (builtin.zig_version.order(min_zig_version) == .lt) {
+        const message = std.fmt.comptimePrint(
+            \\Zig version is too old:
+            \\  current Zig version: {f}
+            \\  minimum Zig version: {f}
+        , .{ builtin.zig_version, min_zig_version });
+        @compileError(message);
+    } else {
+        break :blk std.Build;
+    }
+};
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const manifest = Manifest.init(b);
-
-    const git_commit = b.option([]const u8, "git_commit", "Current git commit");
     const prebuilt_v8_path = b.option([]const u8, "prebuilt_v8_path", "Path to prebuilt libc_v8.a");
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
+    const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
+
+    const version = resolveVersion(b);
+    var stderr = std.fs.File.stderr().writer(&.{});
+    try stderr.interface.print("Lightpanda {f}\n", .{version});
+
+    const version_string = b.fmt("{f}", .{version});
+    const version_encoded = std.mem.replaceOwned(u8, b.allocator, version_string, "+", "%2B") catch @panic("OOM");
 
     var opts = b.addOptions();
-    opts.addOption([]const u8, "version", manifest.version);
-    opts.addOption([]const u8, "git_commit", git_commit orelse "dev");
+    opts.addOption([]const u8, "version", version_string);
+    opts.addOption([]const u8, "version_encoded", version_encoded);
     opts.addOption(?[]const u8, "snapshot_path", snapshot_path);
+    opts.addOption(bool, "wpt_extensions", wpt_extensions);
 
     const enable_tsan = b.option(bool, "tsan", "Enable Thread Sanitizer") orelse false;
     const enable_asan = b.option(bool, "asan", "Enable Address Sanitizer") orelse false;
@@ -70,6 +91,22 @@ pub fn build(b: *Build) !void {
         break :blk mod;
     };
 
+    linkSqlite(b, lightpanda_module, enable_csan, enable_tsan);
+
+    // Check compilation
+    const check = b.step("check", "Check if lightpanda compiles");
+
+    const check_lib = b.addLibrary(.{
+        .name = "lightpanda_check",
+        .root_module = lightpanda_module,
+    });
+    check.dependOn(&check_lib.step);
+
+    // Extras (snapshot_creator) are off the default install to
+    // avoid paying for three exe compiles on every edit. Build explicitly
+    // with `zig build extras`.
+    const extras_step = b.step("extras", "Build snapshot_creator");
+
     {
         // browser
         const exe = b.addExecutable(.{
@@ -88,12 +125,23 @@ pub fn build(b: *Build) !void {
         });
         b.installArtifact(exe);
 
+        const exe_check = b.addLibrary(.{
+            .name = "lightpanda_exe_check",
+            .root_module = exe.root_module,
+        });
+        check.dependOn(&exe_check.step);
+
         const run_cmd = b.addRunArtifact(exe);
         if (b.args) |args| {
             run_cmd.addArgs(args);
         }
         const run_step = b.step("run", "Run the app");
         run_step.dependOn(&run_cmd.step);
+
+        const version_info_step = b.step("version", "Print the resolved version information");
+        const version_info_run = b.addRunArtifact(exe);
+        version_info_run.addArg("version");
+        version_info_step.dependOn(&version_info_run.step);
     }
 
     {
@@ -110,7 +158,13 @@ pub fn build(b: *Build) !void {
                 },
             }),
         });
-        b.installArtifact(exe);
+        extras_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+
+        const exe_check = b.addLibrary(.{
+            .name = "snapshot_creator_check",
+            .root_module = exe.root_module,
+        });
+        check.dependOn(&exe_check.step);
 
         const run_cmd = b.addRunArtifact(exe);
         if (b.args) |args| {
@@ -130,32 +184,6 @@ pub fn build(b: *Build) !void {
         const run_tests = b.addRunArtifact(tests);
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_tests.step);
-    }
-
-    {
-        // browser
-        const exe = b.addExecutable(.{
-            .name = "legacy_test",
-            .use_llvm = true,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/main_legacy_test.zig"),
-                .target = target,
-                .optimize = optimize,
-                .sanitize_c = enable_csan,
-                .sanitize_thread = enable_tsan,
-                .imports = &.{
-                    .{ .name = "lightpanda", .module = lightpanda_module },
-                },
-            }),
-        });
-        b.installArtifact(exe);
-
-        const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-        const run_step = b.step("legacy_test", "Run the app");
-        run_step.dependOn(&run_cmd.step);
     }
 }
 
@@ -190,6 +218,20 @@ fn linkHtml5Ever(b: *Build, mod: *Build.Module) !void {
         "--manifest-path", "src/html5ever/Cargo.toml",
     });
 
+    // Track Rust sources so edits invalidate the cargo step's cache.
+    // Without this, Zig keys the step on argv only and won't re-run cargo
+    // when lib.rs/Cargo.toml change.
+    for ([_][]const u8{
+        "src/html5ever/Cargo.toml",
+        "src/html5ever/Cargo.lock",
+        "src/html5ever/lib.rs",
+        "src/html5ever/sink.rs",
+        "src/html5ever/types.rs",
+        "src/html5ever/url.rs",
+    }) |path| {
+        exec_cargo.addFileInput(b.path(path));
+    }
+
     // TODO: We can prefer `--artifact-dir` once it become stable.
     const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "html5ever");
 
@@ -198,6 +240,57 @@ fn linkHtml5Ever(b: *Build, mod: *Build.Module) !void {
 
     const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblitefetch_html5ever.a");
     mod.addObjectFile(obj);
+}
+
+fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool) void {
+    const dep = b.dependency("sqlite3", .{
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize.?,
+    });
+
+    const lib = dep.artifact("sqlite3");
+    lib.root_module.sanitize_c = enable_csan;
+    lib.root_module.sanitize_thread = is_tsan;
+
+    const macros = [_]struct { []const u8, []const u8 }{
+        .{ "SQLITE_DEFAULT_FILE_PERMISSIONS", "0600" },
+        .{ "SQLITE_DEFAULT_MEMSTATUS", "0" },
+        .{ "SQLITE_DEFAULT_WAL_SYNCHRONOUS", "1" },
+        .{ "SQLITE_DQS", "0" },
+        .{ "SQLITE_ENABLE_API_ARMOR", "1" },
+        .{ "SQLITE_ENABLE_UNLOCK_NOTIFY", "1" },
+        .{ "SQLITE_TEMP_STORE", "3" },
+        .{ "SQLITE_THREADSAFE", "1" },
+        .{ "SQLITE_UNTESTABLE", "1" },
+        .{ "SQLITE_USE_ALLOCA", "1" },
+        .{ "SQLITE_OMIT_AUTHORIZATION", "1" },
+        .{ "SQLITE_OMIT_AUTOMATIC_INDEX", "1" },
+        .{ "SQLITE_OMIT_AUTORESET", "1" },
+        .{ "SQLITE_OMIT_AUTOVACUUM", "1" },
+        .{ "SQLITE_OMIT_BETWEEN_OPTIMIZATION", "1" },
+        .{ "SQLITE_OMIT_CASE_SENSITIVE_LIKE_PRAGMA", "1" },
+        .{ "SQLITE_OMIT_COMPLETE", "1" },
+        .{ "SQLITE_OMIT_DECLTYPE", "1" },
+        .{ "SQLITE_OMIT_DEPRECATED", "1" },
+        .{ "SQLITE_OMIT_DESERIALIZE", "1" },
+        .{ "SQLITE_OMIT_GET_TABLE", "1" },
+        .{ "SQLITE_OMIT_INCRBLOB", "1" },
+        .{ "SQLITE_OMIT_JSON", "1" },
+        .{ "SQLITE_OMIT_LIKE_OPTIMIZATION", "1" },
+        .{ "SQLITE_OMIT_LOAD_EXTENSION", "1" },
+        .{ "SQLITE_OMIT_PROGRESS_CALLBACK", "1" },
+        .{ "SQLITE_OMIT_SHARED_CACHE", "1" },
+        .{ "SQLITE_OMIT_TCL_VARIABLE", "1" },
+        .{ "SQLITE_OMIT_TEMPDB", "1" },
+        .{ "SQLITE_OMIT_TRACE", "1" },
+        .{ "SQLITE_OMIT_UTF16", "1" },
+        .{ "SQLITE_OMIT_XFER_OPT", "1" },
+    };
+    for (macros) |m| {
+        lib.root_module.addCMacro(m[0], m[1]);
+    }
+
+    mod.linkLibrary(lib);
 }
 
 fn linkCurl(b: *Build, mod: *Build.Module, is_tsan: bool) !void {
@@ -442,11 +535,17 @@ fn buildCurl(
         .CURL_DISABLE_SMTP = true,
         .CURL_DISABLE_TELNET = true,
         .CURL_DISABLE_TFTP = true,
+        .CURL_DISABLE_WEBSOCKETS = false, // Enable WebSocket support
 
         .ssize_t = null,
         ._FILE_OFFSET_BITS = 64,
 
         .USE_IPV6 = true,
+        // IDN is handled before libcurl (HttpClient calls URL.ensureHostAscii,
+        // backed by rust-url), so libcurl always receives an ASCII host and
+        // does not link libidn2.
+        .HAVE_LIBIDN2 = false,
+        .HAVE_IDN2_H = false,
         .CURL_OS = switch (os) {
             .linux => if (is_android) "\"android\"" else "\"linux\"",
             else => std.fmt.allocPrint(b.allocator, "\"{s}\"", .{@tagName(os)}) catch @panic("OOM"),
@@ -699,27 +798,56 @@ fn buildCurl(
     return lib;
 }
 
-const Manifest = struct {
-    version: []const u8,
-    minimum_zig_version: []const u8,
+/// Resolves the semantic version of the build.
+///
+/// The base version is read from `build.zig.zon`. This can be overridden
+/// using the `-Dversion` command-line flag:
+/// - If the flag contains a full semantic version (e.g., `1.2.3`), it replaces
+///   the base version entirely.
+/// - If the flag contains a simple string (e.g., `nightly`), it replaces only
+///   the pre-release tag of the base version (e.g., `1.0.0-dev` -> `1.0.0-nightly`).
+///
+/// For versions that have a pre-release tag and no explicit build metadata,
+/// this function automatically enriches the version with the git commit count
+/// and short hash (e.g., `1.0.0-dev.5243+dbe45229`).
+fn resolveVersion(b: *std.Build) std.SemanticVersion {
+    const opt_version = b.option([]const u8, "version", "Override the version of this build");
 
-    fn init(b: *std.Build) Manifest {
-        const input = @embedFile("build.zig.zon");
+    const version = if (opt_version) |v|
+        std.SemanticVersion.parse(v) catch blk: {
+            var fallback = lightpanda_version;
+            fallback.pre = v;
+            break :blk fallback;
+        }
+    else
+        lightpanda_version;
 
-        var diagnostics: std.zon.parse.Diagnostics = .{};
-        defer diagnostics.deinit(b.allocator);
+    // Only enrich versions that have a pre-release field and no explicit build metadata.
+    if (version.pre == null or version.build != null) return version;
 
-        return std.zon.parse.fromSlice(Manifest, b.allocator, input, &diagnostics, .{
-            .free_on_error = true,
-            .ignore_unknown_fields = true,
-        }) catch |err| {
-            switch (err) {
-                error.OutOfMemory => @panic("OOM"),
-                error.ParseZon => {
-                    std.debug.print("Parse diagnostics:\n{f}\n", .{diagnostics});
-                    std.process.exit(1);
-                },
-            }
-        };
-    }
-};
+    // For dev/nightly versions, calculate the commit count and hash
+    const git_hash_raw = runGit(b, &.{ "rev-parse", "--short", "HEAD" }) catch return version;
+    const commit_hash = std.mem.trim(u8, git_hash_raw, " \n\r");
+
+    const git_count_raw = runGit(b, &.{ "rev-list", "--count", "HEAD" }) catch return version;
+    const commit_count = std.mem.trim(u8, git_count_raw, " \n\r");
+
+    return .{
+        .major = version.major,
+        .minor = version.minor,
+        .patch = version.patch,
+        .pre = b.fmt("{s}.{s}", .{ version.pre.?, commit_count }),
+        .build = commit_hash,
+    };
+}
+
+/// Helper function to run git commands and return stdout
+fn runGit(b: *std.Build, args: []const []const u8) ![]const u8 {
+    var code: u8 = undefined;
+    const dir = b.pathFromRoot(".");
+    var command: std.ArrayList([]const u8) = .empty;
+    defer command.deinit(b.allocator);
+    try command.appendSlice(b.allocator, &.{ "git", "-C", dir });
+    try command.appendSlice(b.allocator, args);
+    return b.runAllowFail(command.items, &code, .Ignore);
+}

@@ -16,10 +16,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
 const js = @import("../../js/js.zig");
 
-const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
 const EventTarget = @import("../EventTarget.zig");
 
 const TextTrackCue = @This();
@@ -45,8 +44,8 @@ pub fn getId(self: *const TextTrackCue) []const u8 {
     return self._id;
 }
 
-pub fn setId(self: *TextTrackCue, value: []const u8, page: *Page) !void {
-    self._id = try page.dupeString(value);
+pub fn setId(self: *TextTrackCue, value: []const u8, frame: *Frame) !void {
+    self._id = try frame.dupeString(value);
 }
 
 pub fn getStartTime(self: *const TextTrackCue) f64 {

@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -17,23 +17,39 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("js.zig");
 const bridge = @import("bridge.zig");
-const log = @import("../../log.zig");
-
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const v8 = js.v8;
+const log = lp.log;
 const JsApis = bridge.JsApis;
-const Allocator = std.mem.Allocator;
+const PageJsApis = bridge.PageJsApis;
+const WorkerJsApis = bridge.WorkerJsApis;
+const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Snapshot = @This();
 
-const embedded_snapshot_blob = if (@import("build_config").snapshot_path) |path| @embedFile(path) else "";
+const Caller = @import("Caller.zig");
+
+const Realm = enum {
+    window,
+    worker,
+
+    fn asExposed(comptime self: Realm) Caller.Function.Opts.Exposed {
+        return switch (self) {
+            .window => .window,
+            .worker => .worker,
+        };
+    }
+};
+
+const embedded_snapshot_blob = if (lp.build_config.snapshot_path) |path| @embedFile(path) else "";
 
 // When creating our Snapshot, we use local function templates for every Zig type.
 // You cannot, from what I can tell, create persisted FunctionTemplates at
-// snapshot creation time. But you can embedd those templates (or any other v8
+// snapshot creation time. But you can embed those templates (or any other v8
 // Data) so that it's available to contexts created from the snapshot. This is
 // the starting index of those function templates, which we can extract. At
 // creation time, in debug, we assert that this is actually a consecutive integer
@@ -127,6 +143,7 @@ pub fn create() !Snapshot {
 
     var data_start: usize = 0;
     const isolate = v8.v8__SnapshotCreator__getIsolate(snapshot_creator).?;
+    defer v8.v8__Isolate__LowMemoryNotification(isolate);
 
     {
         // CreateBlob, which we'll call once everything is setup, MUST NOT
@@ -136,123 +153,60 @@ pub fn create() !Snapshot {
         v8.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
         defer v8.v8__HandleScope__DESTRUCT(&handle_scope);
 
-        // Create templates (constructors only) FIRST
-        var templates: [JsApis.len]*v8.FunctionTemplate = undefined;
+        // Create templates for ALL types (JsApis)
+        var templates: [JsApis.len]*const v8.FunctionTemplate = undefined;
         inline for (JsApis, 0..) |JsApi, i| {
             @setEvalBranchQuota(10_000);
             templates[i] = generateConstructor(JsApi, isolate);
-            attachClass(JsApi, isolate, templates[i]);
+            attachClass(JsApi, false, isolate, templates[i], null);
         }
 
         // Set up prototype chains BEFORE attaching properties
-        // This must come before attachClass so inheritance is set up first
         inline for (JsApis, 0..) |JsApi, i| {
             if (comptime protoIndexLookup(JsApi)) |proto_index| {
                 v8.v8__FunctionTemplate__Inherit(templates[i], templates[proto_index]);
             }
         }
 
-        // Set up the global template to inherit from Window's template
-        // This way the global object gets all Window properties through inheritance
-        const context = v8.v8__Context__New(isolate, null, null);
-        v8.v8__Context__Enter(context);
-        defer v8.v8__Context__Exit(context);
+        // Add ALL templates to snapshot (done once, in any context)
+        // We need a context to call AddData, so create a temporary one
+        {
+            const temp_context = v8.v8__Context__New(isolate, null, null);
+            v8.v8__Context__Enter(temp_context);
+            defer v8.v8__Context__Exit(temp_context);
 
-        // Add templates to context snapshot
-        var last_data_index: usize = 0;
-        inline for (JsApis, 0..) |_, i| {
-            @setEvalBranchQuota(10_000);
-            const data_index = v8.v8__SnapshotCreator__AddData(snapshot_creator, @ptrCast(templates[i]));
-            if (i == 0) {
-                data_start = data_index;
-                last_data_index = data_index;
-            } else {
-                // This isn't strictly required, but it means we only need to keep
-                // the first data_index. This is based on the assumption that
-                // addDataWithContext always increases by 1. If we ever hit this
-                // error, then that assumption is wrong and we should capture
-                // all the indexes explicitly in an array.
-                if (data_index != last_data_index + 1) {
-                    return error.InvalidDataIndex;
-                }
-                last_data_index = data_index;
-            }
-        }
-
-        // Realize all templates by getting their functions and attaching to global
-        const global_obj = v8.v8__Context__Global(context);
-
-        inline for (JsApis, 0..) |JsApi, i| {
-            const func = v8.v8__FunctionTemplate__GetFunction(templates[i], context);
-
-            // Attach to global if it has a name
-            if (@hasDecl(JsApi.Meta, "name")) {
-                if (@hasDecl(JsApi.Meta, "constructor_alias")) {
-                    const alias = JsApi.Meta.constructor_alias;
-                    const v8_class_name = v8.v8__String__NewFromUtf8(isolate, alias.ptr, v8.kNormal, @intCast(alias.len));
-                    var maybe_result: v8.MaybeBool = undefined;
-                    v8.v8__Object__Set(global_obj, context, v8_class_name, func, &maybe_result);
-
-                    // @TODO: This is wrong. This name should be registered with the
-                    // illegalConstructorCallback. I.e. new Image() is OK, but
-                    // new HTMLImageElement() isn't.
-                    // But we _have_ to register the name, i.e. HTMLImageElement
-                    // has to be registered so, for now, instead of creating another
-                    // template, we just hook it into the constructor.
-                    const name = JsApi.Meta.name;
-                    const illegal_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                    var maybe_result2: v8.MaybeBool = undefined;
-                    v8.v8__Object__DefineOwnProperty(global_obj, context, illegal_class_name, func, 0, &maybe_result2);
+            var last_data_index: usize = 0;
+            inline for (JsApis, 0..) |_, i| {
+                @setEvalBranchQuota(10_000);
+                const data_index = v8.v8__SnapshotCreator__AddData(snapshot_creator, @ptrCast(templates[i]));
+                if (i == 0) {
+                    data_start = data_index;
+                    last_data_index = data_index;
                 } else {
-                    const name = JsApi.Meta.name;
-                    const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                    var maybe_result: v8.MaybeBool = undefined;
-                    var properties: v8.PropertyAttribute = v8.None;
-                    if (@hasDecl(JsApi.Meta, "enumerable") and JsApi.Meta.enumerable == false) {
-                        properties |= v8.DontEnum;
+                    if (data_index != last_data_index + 1) {
+                        return error.InvalidDataIndex;
                     }
-                    v8.v8__Object__DefineOwnProperty(global_obj, context, v8_class_name, func, properties, &maybe_result);
+                    last_data_index = data_index;
                 }
             }
+
+            // V8 requires a default context. We could probably make this our
+            // Page context, but having both the Page and Worker context be
+            // added via addContext makes things a little more consistent.
+            v8.v8__SnapshotCreator__setDefaultContext(snapshot_creator, temp_context);
         }
 
         {
-            // If we want to overwrite the built-in console, we have to
-            // delete the built-in one.
-            const console_key = v8.v8__String__NewFromUtf8(isolate, "console", v8.kNormal, 7);
-            var maybe_deleted: v8.MaybeBool = undefined;
-            v8.v8__Object__Delete(global_obj, context, console_key, &maybe_deleted);
-            if (maybe_deleted.value == false) {
-                return error.ConsoleDeleteError;
-            }
-        }
-
-        // This shouldn't be necessary, but it is:
-        // https://groups.google.com/g/v8-users/c/qAQQBmbi--8
-        // TODO: see if newer V8 engines have a way around this.
-        inline for (JsApis, 0..) |JsApi, i| {
-            if (comptime protoIndexLookup(JsApi)) |proto_index| {
-                const proto_func = v8.v8__FunctionTemplate__GetFunction(templates[proto_index], context);
-                const proto_obj: *const v8.Object = @ptrCast(proto_func);
-
-                const self_func = v8.v8__FunctionTemplate__GetFunction(templates[i], context);
-                const self_obj: *const v8.Object = @ptrCast(self_func);
-
-                var maybe_result: v8.MaybeBool = undefined;
-                v8.v8__Object__SetPrototype(self_obj, context, proto_obj, &maybe_result);
-            }
+            const Window = @import("../webapi/Window.zig");
+            const index = try createSnapshotContext(.window, &PageJsApis, Window.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 0);
         }
 
         {
-            // Custom exception
-            // TODO: this is an horrible hack, I can't figure out how to do this cleanly.
-            const code_str = "DOMException.prototype.__proto__ = Error.prototype";
-            const code = v8.v8__String__NewFromUtf8(isolate, code_str.ptr, v8.kNormal, @intCast(code_str.len));
-            const script = v8.v8__Script__Compile(context, code, null) orelse return error.ScriptCompileFailed;
-            _ = v8.v8__Script__Run(script, context) orelse return error.ScriptRunFailed;
+            const WorkerGlobalScope = @import("../webapi/WorkerGlobalScope.zig");
+            const index = try createSnapshotContext(.worker, &WorkerJsApis, WorkerGlobalScope.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 1);
         }
-
-        v8.v8__SnapshotCreator__setDefaultContext(snapshot_creator, context);
     }
 
     const blob = v8.v8__SnapshotCreator__createBlob(snapshot_creator, v8.kKeep);
@@ -260,25 +214,191 @@ pub fn create() !Snapshot {
     return .{
         .owns_data = true,
         .data_start = data_start,
-        .external_references = external_references,
         .startup_data = blob,
+        .external_references = external_references,
     };
 }
 
-// Helper to check if a JsApi has a NamedIndexed handler
-fn hasNamedIndexedGetter(comptime JsApi: type) bool {
-    const declarations = @typeInfo(JsApi).@"struct".decls;
-    inline for (declarations) |d| {
-        const value = @field(JsApi, d.name);
-        const T = @TypeOf(value);
-        if (T == bridge.NamedIndexed) {
-            return true;
+fn createSnapshotContext(
+    comptime realm: Realm,
+    comptime ContextApis: []const type,
+    comptime GlobalScopeApi: type,
+    isolate: *v8.Isolate,
+    snapshot_creator: *v8.SnapshotCreator,
+    templates: []*const v8.FunctionTemplate,
+) !usize {
+    // Create a global template that inherits from the GlobalScopeApi (Window or WorkerGlobalScope)
+    const global_scope_index = comptime bridge.JsApiLookup.getId(GlobalScopeApi);
+    const js_global = v8.v8__FunctionTemplate__New__DEFAULT(isolate);
+    const class_name = v8.v8__String__NewFromUtf8(isolate, GlobalScopeApi.Meta.name.ptr, v8.kNormal, @intCast(GlobalScopeApi.Meta.name.len));
+    v8.v8__FunctionTemplate__SetClassName(js_global, class_name);
+    v8.v8__FunctionTemplate__Inherit(js_global, templates[global_scope_index]);
+
+    const global_template = v8.v8__FunctionTemplate__InstanceTemplate(js_global).?;
+    v8.v8__ObjectTemplate__SetInternalFieldCount(global_template, comptime countInternalFields(GlobalScopeApi));
+
+    // Set up named/indexed handlers for Window's global object (for named element access like window.myDiv)
+    if (comptime std.mem.eql(u8, GlobalScopeApi.Meta.name, "Window")) {
+        v8.v8__ObjectTemplate__SetNamedHandler(global_template, &.{
+            .getter = bridge.unknownWindowPropertyCallback,
+            .setter = null,
+            .query = null,
+            .deleter = null,
+            .enumerator = null,
+            .definer = null,
+            .descriptor = null,
+            .data = null,
+            .flags = v8.kOnlyInterceptStrings | v8.kNonMasking,
+        });
+        v8.v8__ObjectTemplate__SetIndexedHandler(global_template, &.{
+            .getter = @import("../webapi/Window.zig").JsApi.index.getter,
+            .setter = null,
+            .query = null,
+            .deleter = null,
+            .enumerator = null,
+            .definer = null,
+            .descriptor = null,
+            .data = null,
+            .flags = 0,
+        });
+    }
+
+    // Re-run attachClass, but specifically targetting the global (Window or WGS)
+    // templates, so that all of these getters/functions which are already defined
+    // on their prototype will now be defined directly on the object.
+    inline for (comptime globalScopeChain(GlobalScopeApi)) |ScopeApi| {
+        // ScopeApi is going to be Window, EventTarget
+        // Or WorkerGlobalState, EventTarget
+        comptime {
+            //
+            if (hasGatedMember(ScopeApi)) {
+                @compileError("[Global] scope interface " ++ @typeName(ScopeApi) ++ " has [Exposed]-gated members. This is not supported");
+            }
+        }
+        const scope_index = comptime bridge.JsApiLookup.getId(ScopeApi);
+        // So we're attaching the Window/EventTarget members (which were already attached
+        // to it's prototype), directly on the global_template.
+        attachClass(ScopeApi, true, isolate, templates[scope_index], global_template);
+    }
+
+    const context = v8.v8__Context__New(isolate, global_template, null);
+    v8.v8__Context__Enter(context);
+    defer v8.v8__Context__Exit(context);
+
+    // Initialize embedder data to null so callbacks can detect snapshot creation
+    v8.v8__Context__SetAlignedPointerInEmbedderData(context, 1, null);
+
+    const global_obj = v8.v8__Context__Global(context);
+
+    // Attach constructors for this context's APIs to the global, and for any
+    // type with members tagged [Exposed=Window]/[Exposed=Worker], prune the
+    // ones that don't match this realm from the per-context Func.prototype.
+    const prototype_key = v8.v8__String__NewFromUtf8(isolate, "prototype", v8.kNormal, 9);
+
+    inline for (ContextApis) |JsApi| {
+        @setEvalBranchQuota(10_000);
+        const template_index = comptime bridge.JsApiLookup.getId(JsApi);
+        const func = v8.v8__FunctionTemplate__GetFunction(templates[template_index], context);
+        if (@hasDecl(JsApi.Meta, "name")) {
+            if (@hasDecl(JsApi.Meta, "constructor_alias")) {
+                const alias = JsApi.Meta.constructor_alias;
+                const v8_class_name = v8.v8__String__NewFromUtf8(isolate, alias.ptr, v8.kNormal, @intCast(alias.len));
+                var maybe_result: v8.MaybeBool = undefined;
+                v8.v8__Object__Set(global_obj, context, v8_class_name, func, &maybe_result);
+
+                const name = JsApi.Meta.name;
+                const illegal_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+                var maybe_result2: v8.MaybeBool = undefined;
+                v8.v8__Object__DefineOwnProperty(global_obj, context, illegal_class_name, func, 0, &maybe_result2);
+            } else {
+                const name = JsApi.Meta.name;
+                const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+                var maybe_result: v8.MaybeBool = undefined;
+                // Web IDL: interface objects on the global are non-enumerable
+                // by default. Opt back in via JsApi.Meta.enumerable = true.
+                var properties: v8.PropertyAttribute = v8.DontEnum;
+                if (@hasDecl(JsApi.Meta, "enumerable") and JsApi.Meta.enumerable == true) {
+                    properties = v8.None;
+                }
+                v8.v8__Object__DefineOwnProperty(global_obj, context, v8_class_name, func, properties, &maybe_result);
+            }
+        }
+
+        // WebIDL [Exposed=...] gating. Members are installed on the shared
+        // FunctionTemplate by attachClass; here we delete the ones that don't
+        // match this realm from the per-context Func.prototype.
+        if (comptime hasGatedMember(JsApi)) {
+            const func_obj: *const v8.Object = @ptrCast(func);
+            if (v8.v8__Object__Get(func_obj, context, prototype_key)) |proto_handle| {
+                const proto_obj: *const v8.Object = @ptrCast(proto_handle);
+                inline for (@typeInfo(JsApi).@"struct".decls) |d| {
+                    const exposed = comptime memberExposed(@field(JsApi, d.name));
+                    if (comptime exposed != .both and exposed != realm.asExposed()) {
+                        const name: [:0]const u8 = d.name;
+                        const name_v8 = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
+                        var maybe_deleted: v8.MaybeBool = undefined;
+                        v8.v8__Object__Delete(proto_obj, context, name_v8, &maybe_deleted);
+                    }
+                }
+            }
         }
     }
-    return false;
+
+    {
+        // Delete built-in console so we can inject our own
+        const console_key = v8.v8__String__NewFromUtf8(isolate, "console", v8.kNormal, 7);
+        var maybe_deleted: v8.MaybeBool = undefined;
+        v8.v8__Object__Delete(global_obj, context, console_key, &maybe_deleted);
+        if (maybe_deleted.value == false) {
+            return error.ConsoleDeleteError;
+        }
+    }
+
+    // Set prototype chains on function objects
+    // https://groups.google.com/g/v8-users/c/qAQQBmbi--8
+    inline for (JsApis, 0..) |JsApi, i| {
+        if (comptime protoIndexLookup(JsApi)) |proto_index| {
+            const proto_func = v8.v8__FunctionTemplate__GetFunction(templates[proto_index], context);
+            const proto_obj: *const v8.Object = @ptrCast(proto_func);
+
+            const self_func = v8.v8__FunctionTemplate__GetFunction(templates[i], context);
+            const self_obj: *const v8.Object = @ptrCast(self_func);
+
+            var maybe_result: v8.MaybeBool = undefined;
+            v8.v8__Object__SetPrototype(self_obj, context, proto_obj, &maybe_result);
+        }
+    }
+
+    {
+        // DOMException prototype setup
+        const code_str = "DOMException.prototype.__proto__ = Error.prototype";
+        const code = v8.v8__String__NewFromUtf8(isolate, code_str.ptr, v8.kNormal, @intCast(code_str.len));
+        const script = v8.v8__Script__Compile(context, code, null) orelse return error.ScriptCompileFailed;
+        _ = v8.v8__Script__Run(script, context) orelse return error.ScriptRunFailed;
+    }
+
+    return v8.v8__SnapshotCreator__AddContext(snapshot_creator, context);
 }
 
-// Count total callbacks needed for external_references array
+fn hasGatedMember(comptime JsApi: type) bool {
+    comptime {
+        for (@typeInfo(JsApi).@"struct".decls) |d| {
+            if (memberExposed(@field(JsApi, d.name)) != .both) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+fn memberExposed(value: anytype) Caller.Function.Opts.Exposed {
+    const T = @TypeOf(value);
+    if (T == bridge.Accessor or T == bridge.Function) {
+        return value.exposed;
+    }
+    return .both;
+}
+
 fn countExternalReferences() comptime_int {
     @setEvalBranchQuota(100_000);
 
@@ -290,28 +410,36 @@ fn countExternalReferences() comptime_int {
     // +1 for the noop function shared by various types
     count += 1;
 
+    // +1 for unknownWindowPropertyCallback used on Window's global template
+    count += 1;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
     inline for (JsApis) |JsApi| {
-        // Constructor (only if explicit)
         if (@hasDecl(JsApi, "constructor")) {
             count += 1;
         }
 
-        // Callable (htmldda)
         if (@hasDecl(JsApi, "callable")) {
             count += 1;
         }
 
-        // All other callbacks
         const declarations = @typeInfo(JsApi).@"struct".decls;
         inline for (declarations) |d| {
             const value = @field(JsApi, d.name);
             const T = @TypeOf(value);
             if (T == bridge.Accessor) {
-                count += 1; // getter
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+                count += 1;
                 if (value.setter != null) {
                     count += 1;
                 }
             } else if (T == bridge.Function) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
                 count += 1;
             } else if (T == bridge.Iterator) {
                 count += 1;
@@ -321,14 +449,13 @@ fn countExternalReferences() comptime_int {
                     count += 1;
                 }
             } else if (T == bridge.NamedIndexed) {
-                count += 1; // getter
+                count += 1;
                 if (value.setter != null) count += 1;
                 if (value.deleter != null) count += 1;
             }
         }
     }
 
-    // In debug mode, add unknown property callbacks for types without NamedIndexed
     if (comptime IS_DEBUG) {
         inline for (JsApis) |JsApi| {
             if (!hasNamedIndexedGetter(JsApi)) {
@@ -350,6 +477,11 @@ fn collectExternalReferences() [countExternalReferences()]isize {
     references[idx] = @bitCast(@intFromPtr(&bridge.Function.noopFunction));
     idx += 1;
 
+    references[idx] = @bitCast(@intFromPtr(&bridge.unknownWindowPropertyCallback));
+    idx += 1;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
     inline for (JsApis) |JsApi| {
         if (@hasDecl(JsApi, "constructor")) {
             references[idx] = @bitCast(@intFromPtr(JsApi.constructor.func));
@@ -366,6 +498,10 @@ fn collectExternalReferences() [countExternalReferences()]isize {
             const value = @field(JsApi, d.name);
             const T = @TypeOf(value);
             if (T == bridge.Accessor) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
                 references[idx] = @bitCast(@intFromPtr(value.getter));
                 idx += 1;
                 if (value.setter) |setter| {
@@ -373,6 +509,9 @@ fn collectExternalReferences() [countExternalReferences()]isize {
                     idx += 1;
                 }
             } else if (T == bridge.Function) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
                 references[idx] = @bitCast(@intFromPtr(value.func));
                 idx += 1;
             } else if (T == bridge.Iterator) {
@@ -400,7 +539,6 @@ fn collectExternalReferences() [countExternalReferences()]isize {
         }
     }
 
-    // In debug mode, collect unknown property callbacks for types without NamedIndexed
     if (comptime IS_DEBUG) {
         inline for (JsApis) |JsApi| {
             if (!hasNamedIndexedGetter(JsApi)) {
@@ -413,37 +551,7 @@ fn collectExternalReferences() [countExternalReferences()]isize {
     return references;
 }
 
-// Even if a struct doesn't have a `constructor` function, we still
-// `generateConstructor`, because this is how we create our
-// FunctionTemplate. Such classes exist, but they can't be instantiated
-// via `new ClassName()` - but they could, for example, be created in
-// Zig and returned from a function call, which is why we need the
-// FunctionTemplate.
-fn generateConstructor(comptime JsApi: type, isolate: *v8.Isolate) *v8.FunctionTemplate {
-    const callback = blk: {
-        if (@hasDecl(JsApi, "constructor")) {
-            break :blk JsApi.constructor.func;
-        }
-
-        // Use shared illegal constructor callback
-        break :blk illegalConstructorCallback;
-    };
-
-    const template = @constCast(v8.v8__FunctionTemplate__New__DEFAULT2(isolate, callback).?);
-    {
-        const internal_field_count = comptime countInternalFields(JsApi);
-        if (internal_field_count > 0) {
-            const instance_template = v8.v8__FunctionTemplate__InstanceTemplate(template);
-            v8.v8__ObjectTemplate__SetInternalFieldCount(instance_template, internal_field_count);
-        }
-    }
-    const name_str = if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi);
-    const class_name = v8.v8__String__NewFromUtf8(isolate, name_str.ptr, v8.kNormal, @intCast(name_str.len));
-    v8.v8__FunctionTemplate__SetClassName(template, class_name);
-    return template;
-}
-
-pub fn countInternalFields(comptime JsApi: type) u8 {
+fn countInternalFields(comptime JsApi: type) u8 {
     var last_used_id = 0;
     var cache_count: u8 = 0;
 
@@ -481,44 +589,204 @@ pub fn countInternalFields(comptime JsApi: type) u8 {
     return cache_count + 1;
 }
 
-// Attaches JsApi members to the prototype template (normal case)
-fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *v8.FunctionTemplate) void {
+// Shared illegal constructor callback for types without explicit constructors
+fn illegalConstructorCallback(raw_info: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(raw_info);
+
+    // Recover the constructor's name via NewTarget, whose .name property was
+    // set via SetClassName when the FunctionTemplate was built. Lets us tell
+    // `new DOMException()` apart from `new MutationRecord()` in the warning.
+    var name_buf: [128]u8 = undefined;
+    var name: []const u8 = "<unknown>";
+    if (v8.v8__FunctionCallbackInfo__NewTarget(raw_info)) |new_target| {
+        if (v8.v8__Value__IsFunction(new_target)) {
+            const func: *const v8.Function = @ptrCast(new_target);
+            if (v8.v8__Function__GetName(func)) |name_value| {
+                if (v8.v8__Value__IsString(name_value)) {
+                    const str: *const v8.String = @ptrCast(name_value);
+                    const n = v8.v8__String__WriteUtf8(str, isolate, &name_buf, name_buf.len, v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8);
+                    name = name_buf[0..@intCast(n)];
+                }
+            }
+        }
+    }
+    log.info(.js, "Illegal constructor call", .{ .name = name });
+
+    const message = v8.v8__String__NewFromUtf8(isolate, "Illegal Constructor", v8.kNormal, 19);
+    const js_exception = v8.v8__Exception__TypeError(message);
+
+    _ = v8.v8__Isolate__ThrowException(isolate, js_exception);
+    var return_value: v8.ReturnValue = undefined;
+    v8.v8__FunctionCallbackInfo__GetReturnValue(raw_info, &return_value);
+    v8.v8__ReturnValue__Set(return_value, js_exception);
+}
+
+// Helper to check if a JsApi has a NamedIndexed handler (public for reuse)
+fn hasNamedIndexedGetter(comptime JsApi: type) bool {
+    const declarations = @typeInfo(JsApi).@"struct".decls;
+    inline for (declarations) |d| {
+        const value = @field(JsApi, d.name);
+        const T = @TypeOf(value);
+        if (T == bridge.NamedIndexed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Generic prototype index lookup for a given API list
+fn protoIndexLookup(comptime JsApi: type) ?u16 {
+    @setEvalBranchQuota(100_000);
+    comptime {
+        const T = JsApi.bridge.type;
+        if (!@hasField(T, "_proto")) {
+            return null;
+        }
+        const Ptr = std.meta.fieldInfo(T, ._proto).type;
+        const F = @typeInfo(Ptr).pointer.child;
+        // Look up in the provided API list
+        for (JsApis, 0..) |Api, i| {
+            if (Api == F.JsApi) {
+                return i;
+            }
+        }
+        @compileError("Prototype " ++ @typeName(F.JsApi) ++ " not found in API list");
+    }
+}
+
+// Generate a constructor template for a JsApi type (public for reuse)
+pub fn generateConstructor(comptime JsApi: type, isolate: *v8.Isolate) *const v8.FunctionTemplate {
+    const callback = blk: {
+        if (@hasDecl(JsApi, "constructor")) {
+            break :blk JsApi.constructor.func;
+        }
+        break :blk illegalConstructorCallback;
+    };
+
+    const arity: c_int = if (@hasDecl(JsApi, "constructor")) JsApi.constructor.arity else 0;
+    const template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+        .length = arity,
+        .callback = callback,
+        .behavior = v8.kConstructorBehavior_Allow,
+    }).?;
+    {
+        const internal_field_count = comptime countInternalFields(JsApi);
+        if (internal_field_count > 0) {
+            const instance_template = v8.v8__FunctionTemplate__InstanceTemplate(template);
+            v8.v8__ObjectTemplate__SetInternalFieldCount(instance_template, internal_field_count);
+        }
+    }
+    const name_str = if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi);
+    const class_name = v8.v8__String__NewFromUtf8(isolate, name_str.ptr, v8.kNormal, @intCast(name_str.len));
+    v8.v8__FunctionTemplate__SetClassName(template, class_name);
+    // Web IDL: interface object's `prototype` property is non-writable/non-configurable.
+    v8.v8__FunctionTemplate__ReadOnlyPrototype(template);
+    return template;
+}
+
+// Attach JsApi members to a template (public for reuse). This is called on all
+// types. But, for globals (window, WGS) it's called twice. The first time, it's
+// called like any other interface. The 2nd time, it's called with flatten == true
+// and define_on != null. This is the "flattening" pass, and it defines all of
+// the functions/accessors on directly on the global instance. Thus, globals have
+// it defined on both their prototype (first pass) and their own instance (2nd pass).
+fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolate, template: *const v8.FunctionTemplate, define_on: ?*const v8.ObjectTemplate) void {
     const instance = v8.v8__FunctionTemplate__InstanceTemplate(template);
     const prototype = v8.v8__FunctionTemplate__PrototypeTemplate(template);
+    const signature = v8.v8__Signature__New(isolate, template);
+
+    // Namespace objects (e.g. console) expose their members as own properties
+    // of each instance rather than via the prototype, so Object.entries(...)
+    // returns them. See https://console.spec.whatwg.org/#console-namespace.
+    const own_properties = @hasDecl(JsApi.Meta, "own_properties") and JsApi.Meta.own_properties;
+    const member_template = if (own_properties) instance else prototype;
 
     const declarations = @typeInfo(JsApi).@"struct".decls;
     var has_named_index_getter = false;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
 
     inline for (declarations) |d| {
         const name: [:0]const u8 = d.name;
         const value = @field(JsApi, name);
         const definition = @TypeOf(value);
 
+        if (comptime flatten) {
+            // [Global] flattening only mirrors non-static accessors/methods onto itself
+            switch (definition) {
+                bridge.Accessor, bridge.Function => if (value.static) continue,
+                else => continue,
+            }
+        }
+
         switch (definition) {
             bridge.Accessor => {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
                 const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                const getter_callback = @constCast(v8.v8__FunctionTemplate__New__Config(isolate, &.{ .callback = value.getter }).?);
+                const getter_signature = if (value.static) null else signature;
+                const getter_callback = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+                    .callback = value.getter,
+                    .signature = getter_signature,
+                }).?;
+                // WebIDL: getter function's .name should be "get X"
+                const getter_name_str = "get " ++ name;
+                const getter_name_v8 = v8.v8__String__NewFromUtf8(isolate, getter_name_str.ptr, v8.kNormal, @intCast(getter_name_str.len));
+                v8.v8__FunctionTemplate__SetClassName(getter_callback, getter_name_v8);
+
+                const setter_callback = if (value.setter) |setter| blk: {
+                    const cb = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+                        .callback = setter,
+                        .signature = getter_signature,
+                        .length = 1,
+                    }).?;
+                    const setter_name_str = "set " ++ name;
+                    const setter_name_v8 = v8.v8__String__NewFromUtf8(isolate, setter_name_str.ptr, v8.kNormal, @intCast(setter_name_str.len));
+                    v8.v8__FunctionTemplate__SetClassName(cb, setter_name_v8);
+                    break :blk cb;
+                } else null;
+
+                var attribute: v8.PropertyAttribute = 0;
                 if (value.setter == null) {
-                    if (value.static) {
-                        v8.v8__Template__SetAccessorProperty__DEFAULT(@ptrCast(template), js_name, getter_callback);
-                    } else {
-                        v8.v8__ObjectTemplate__SetAccessorProperty__DEFAULT(prototype, js_name, getter_callback);
-                    }
+                    attribute |= v8.ReadOnly;
+                }
+                if (value.deletable == false) {
+                    attribute |= v8.DontDelete;
+                }
+
+                if (value.static) {
+                    v8.v8__Template__SetAccessorProperty(@ptrCast(template), js_name, getter_callback, setter_callback, attribute);
                 } else {
-                    if (comptime IS_DEBUG) {
-                        std.debug.assert(value.static == false);
-                    }
-                    const setter_callback = @constCast(v8.v8__FunctionTemplate__New__Config(isolate, &.{ .callback = value.setter.? }).?);
-                    v8.v8__ObjectTemplate__SetAccessorProperty__DEFAULT2(prototype, js_name, getter_callback, setter_callback);
+                    const accessor_attr = if (own_properties) attribute else attribute | v8.DontEnum;
+                    v8.v8__ObjectTemplate__SetAccessorProperty__Config(define_on orelse prototype, &.{
+                        .key = js_name,
+                        .getter = getter_callback,
+                        .setter = setter_callback,
+                        .attribute = accessor_attr,
+                    });
                 }
             },
             bridge.Function => {
-                const function_template = @constCast(v8.v8__FunctionTemplate__New__Config(isolate, &.{ .callback = value.func, .length = value.arity }).?);
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
+                // For non-static functions, use the signature to validate the receiver
+                const func_signature = if (value.static) null else signature;
+                const function_template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+                    .callback = value.func,
+                    .length = value.arity,
+                    .signature = func_signature,
+                }).?;
                 const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                if (value.static) {
+                v8.v8__FunctionTemplate__SetClassName(function_template, js_name);
+                if (value.static and !own_properties) {
                     v8.v8__Template__Set(@ptrCast(template), js_name, @ptrCast(function_template), v8.None);
                 } else {
-                    v8.v8__Template__Set(@ptrCast(prototype), js_name, @ptrCast(function_template), v8.None);
+                    const fn_attr: v8.PropertyAttribute = if (own_properties) v8.None else v8.DontEnum;
+                    v8.v8__Template__Set(@ptrCast(define_on orelse member_template), js_name, @ptrCast(function_template), fn_attr);
                 }
             },
             bridge.Indexed => {
@@ -551,7 +819,7 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *v8.Functio
                 has_named_index_getter = true;
             },
             bridge.Iterator => {
-                const function_template = @constCast(v8.v8__FunctionTemplate__New__Config(isolate, &.{ .callback = value.func }).?);
+                const function_template = v8.v8__FunctionTemplate__New__Config(isolate, &.{ .callback = value.func }).?;
                 const js_name = if (value.async)
                     v8.v8__Symbol__GetAsyncIterator(isolate)
                 else
@@ -571,13 +839,19 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *v8.Functio
                 }
 
                 if (value.template) {
-                    // apply it both to the type itself (e.g. Node.Elem)
                     v8.v8__Template__Set(@ptrCast(template), js_name, js_value, v8.ReadOnly + v8.DontDelete);
                 }
             },
-            bridge.Constructor => {}, // already handled in generateConstructor
+            bridge.Constructor => {},
             else => {},
         }
+    }
+
+    // The remaining per-class setup targets the class's own instance template;
+    // in [Global] flattening mode the global already has these (or doesn't need
+    // them), so skip it.
+    if (comptime flatten) {
+        return;
     }
 
     if (@hasDecl(JsApi.Meta, "htmldda")) {
@@ -609,29 +883,17 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *v8.Functio
     }
 }
 
-fn protoIndexLookup(comptime JsApi: type) ?bridge.JsApiLookup.BackingInt {
-    @setEvalBranchQuota(2000);
+// The chain of interface types reachable from a [Global] interface via WebIDL
+// inheritance, e.g. Window -> [Window.JsApi, EventTarget.JsApi].
+fn globalScopeChain(comptime GlobalScopeApi: type) []const type {
     comptime {
-        const T = JsApi.bridge.type;
-        if (!@hasField(T, "_proto")) {
-            return null;
+        var chain: []const type = &[_]type{};
+        var JsApi = GlobalScopeApi;
+        while (true) {
+            chain = chain ++ &[_]type{JsApi};
+            const proto_index = protoIndexLookup(JsApi) orelse break;
+            JsApi = JsApis[proto_index];
         }
-        const Ptr = std.meta.fieldInfo(T, ._proto).type;
-        const F = @typeInfo(Ptr).pointer.child;
-        return bridge.JsApiLookup.getId(F.JsApi);
+        return chain;
     }
-}
-
-// Shared illegal constructor callback for types without explicit constructors
-fn illegalConstructorCallback(raw_info: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(raw_info);
-    log.warn(.js, "Illegal constructor call", .{});
-
-    const message = v8.v8__String__NewFromUtf8(isolate, "Illegal Constructor", v8.kNormal, 19);
-    const js_exception = v8.v8__Exception__TypeError(message);
-
-    _ = v8.v8__Isolate__ThrowException(isolate, js_exception);
-    var return_value: v8.ReturnValue = undefined;
-    v8.v8__FunctionCallbackInfo__GetReturnValue(raw_info, &return_value);
-    v8.v8__ReturnValue__Set(return_value, js_exception);
 }

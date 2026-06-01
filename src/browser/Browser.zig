@@ -18,20 +18,17 @@
 
 const std = @import("std");
 
-const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
+const App = @import("../App.zig");
+const CDP = @import("../cdp/CDP.zig");
+const Notification = @import("../Notification.zig");
 
 const js = @import("js/js.zig");
-const log = @import("../log.zig");
-const App = @import("../App.zig");
+const Page = @import("Page.zig");
+const Session = @import("Session.zig");
 const HttpClient = @import("HttpClient.zig");
 
 const ArenaPool = App.ArenaPool;
-
-const IS_DEBUG = @import("builtin").mode == .Debug;
-
-const Session = @import("Session.zig");
-const Notification = @import("../Notification.zig");
+const Allocator = std.mem.Allocator;
 
 // Browser is an instance of the browser.
 // You can create multiple browser instances.
@@ -43,32 +40,70 @@ app: *App,
 session: ?Session,
 allocator: Allocator,
 arena_pool: *ArenaPool,
-http_client: *HttpClient,
+http_client: HttpClient,
+
+// used by sessions to allocate pages.
+page_pool: std.heap.MemoryPool(Page),
+
+// Pool for FinalizerCallback.Identity structs — the records V8 weak-callback
+// parameters point at. Scoped to the Browser (i.e. the V8 Isolate's lifetime)
+// rather than the Session: V8 can run a weak finalizer arbitrarily late, any
+// time up until the Isolate is torn down, so these must outlive every Session.
+// Freed in deinit *after* env.deinit() tears down the Isolate — the point past
+// which no finalizer can fire.
+fc_identity_pool: std.heap.MemoryPool(js.FinalizerCallback.Identity),
+
+// Monotonic frame-ID generator scoped to this Browser (one per CDP
+// connection). Lives here, not on Session, because CDP target IDs
+// (encoded as `FID-{d:0>10}`) must be unique for the lifetime of the
+// connection -- a Session-scoped counter would re-issue the same
+// `FID-0000000001` for every fresh BrowserContext on the connection,
+// which Playwright rejects with `Duplicate target FID-...` (issue
+// #2472).
+frame_id_gen: u32 = 0,
 
 const InitOpts = struct {
     env: js.Env.InitOpts = .{},
-    http_client: *HttpClient,
 };
 
-pub fn init(app: *App, opts: InitOpts) !Browser {
+// Allocate the next frame ID. Wrapping `+%` keeps this safe past 2^32
+// allocations on a single connection (which would take days of
+// continuous navigation; in practice we wrap the connection long
+// before that). Callers must format with `FID-{d:0>10}` to match the
+// existing CDP target-ID encoding (`src/cdp/id.zig`).
+pub fn nextFrameId(self: *Browser) u32 {
+    const id = self.frame_id_gen +% 1;
+    self.frame_id_gen = id;
+    return id;
+}
+
+pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp: ?*CDP) !void {
     const allocator = app.allocator;
 
     var env = try js.Env.init(app, opts.env);
     errdefer env.deinit();
 
-    return .{
+    self.* = .{
         .app = app,
         .env = env,
         .session = null,
         .allocator = allocator,
         .arena_pool = &app.arena_pool,
-        .http_client = opts.http_client,
+        .http_client = undefined,
+        .page_pool = std.heap.MemoryPool(Page).init(allocator),
+        .fc_identity_pool = .init(allocator),
     };
+    try self.http_client.init(allocator, &app.network, cdp);
 }
 
 pub fn deinit(self: *Browser) void {
     self.closeSession();
     self.env.deinit();
+    // After env.deinit() the Isolate is gone, so no further weak finalizer can
+    // fire — only now is it safe to free the pool backing their parameters.
+    self.fc_identity_pool.deinit();
+    self.page_pool.deinit();
+    self.http_client.deinit();
 }
 
 pub fn newSession(self: *Browser, notification: *Notification) !*Session {
@@ -83,7 +118,6 @@ pub fn closeSession(self: *Browser) void {
     if (self.session) |*session| {
         session.deinit();
         self.session = null;
-        self.env.memoryPressureNotification(.critical);
     }
 }
 
@@ -91,23 +125,30 @@ pub fn runMicrotasks(self: *Browser) void {
     self.env.runMicrotasks();
 }
 
-pub fn runMacrotasks(self: *Browser) !?u64 {
+pub fn runMacrotasks(self: *Browser) !void {
     const env = &self.env;
 
-    const time_to_next = try self.env.runMacrotasks();
+    try self.env.runMacrotasks();
     env.pumpMessageLoop();
 
     // either of the above could have queued more microtasks
     env.runMicrotasks();
-
-    return time_to_next;
 }
 
 pub fn hasBackgroundTasks(self: *Browser) bool {
     return self.env.hasBackgroundTasks();
 }
+
 pub fn waitForBackgroundTasks(self: *Browser) void {
     self.env.waitForBackgroundTasks();
+}
+
+pub fn msToNextMacrotask(self: *Browser) ?u64 {
+    return self.env.msToNextMacrotask();
+}
+
+pub fn msTo(self: *Browser) bool {
+    return self.env.hasBackgroundTasks();
 }
 
 pub fn runIdleTasks(self: *const Browser) void {

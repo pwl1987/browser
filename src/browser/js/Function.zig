@@ -17,10 +17,13 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("js.zig");
-const v8 = js.v8;
+const lp = @import("lightpanda");
 
-const log = @import("../../log.zig");
+const js = @import("js.zig");
+
+const v8 = js.v8;
+const log = lp.log;
+const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Function = @This();
 
@@ -49,6 +52,20 @@ pub fn withThis(self: *const Function, value: anytype) !Function {
 
 pub fn newInstance(self: *const Function, caught: *js.TryCatch.Caught) !js.Object {
     const local = self.local;
+
+    if (comptime IS_DEBUG == false) {
+        // This should not be possible, yet it happens. In Release, we'll log an
+        // error and hope for the best. In Debug, we'll let the code execute
+        // and v8 will crash on the null reference. This null value almost
+        // certainly comes from a Global that was reset and thus gets unwrapped
+        // to null (but I haven't figured out the flow that can cause that). This
+        // does indicate that we might be in some shutdown state, so just
+        // return an error might not be too bad.
+        if (@intFromPtr(self.handle) == 0) {
+            log.err(.browser, "newInstance on dead handle", .{});
+            return error.DeadFunctionHandle;
+        }
+    }
 
     var try_catch: js.TryCatch = undefined;
     try_catch.init(local);
@@ -106,6 +123,20 @@ fn _tryCallWithThis(self: *const Function, comptime T: type, this: anytype, args
     caught.* = .{};
     const local = self.local;
 
+    if (comptime IS_DEBUG == false) {
+        // This should not be possible, yet it happens. In Release, we'll log an
+        // error and hope for the best. In Debug, we'll let the code execute
+        // and v8 will crash on the null reference. This null value almost
+        // certainly comes from a Global that was reset and thus gets unwrapped
+        // to null (but I haven't figured out the flow that can cause that). This
+        // does indicate that we might be in some shutdown state, so just
+        // return an error might not be too bad.
+        if (@intFromPtr(self.handle) == 0) {
+            log.err(.browser, "call on dead handle", .{});
+            return error.DeadFunctionHandle;
+        }
+    }
+
     // When we're calling a function from within JavaScript itself, this isn't
     // necessary. We're within a Caller instantiation, which will already have
     // incremented the call_depth and it won't decrement it until the Caller is
@@ -146,7 +177,7 @@ fn _tryCallWithThis(self: *const Function, comptime T: type, this: anytype, args
             }
             break :blk values;
         },
-        else => @compileError("JS Function called with invalid paremter type"),
+        else => @compileError("JS Function called with invalid parameter type"),
     };
 
     const c_args = @as(?[*]const ?*v8.Value, @ptrCast(js_args.ptr));
@@ -179,7 +210,7 @@ fn getThis(self: *const Function) js.Object {
 }
 
 pub fn src(self: *const Function) ![]const u8 {
-    return self.local.valueToString(.{ .local = self.local, .handle = @ptrCast(self.handle) }, .{});
+    return js.Value.toStringSlice(.{ .local = self.local, .handle = @ptrCast(self.handle) });
 }
 
 pub fn getPropertyValue(self: *const Function, name: []const u8) !?js.Value {
@@ -210,10 +241,10 @@ fn _persist(self: *const Function, comptime is_global: bool) !(if (is_global) Gl
     v8.v8__Global__New(ctx.isolate.handle, self.handle, &global);
     if (comptime is_global) {
         try ctx.trackGlobal(global);
-        return .{ .handle = global, .origin = {} };
+        return .{ .handle = global, .temps = {} };
     }
     try ctx.trackTemp(global);
-    return .{ .handle = global, .origin = ctx.origin };
+    return .{ .handle = global, .temps = &ctx.page.temps };
 }
 
 pub fn tempWithThis(self: *const Function, value: anytype) !Temp {
@@ -237,7 +268,7 @@ const GlobalType = enum(u8) {
 fn G(comptime global_type: GlobalType) type {
     return struct {
         handle: v8.Global,
-        origin: if (global_type == .temp) *js.Origin else void,
+        temps: if (global_type == .temp) *std.AutoHashMapUnmanaged(usize, v8.Global) else void,
 
         const Self = @This();
 
@@ -257,7 +288,10 @@ fn G(comptime global_type: GlobalType) type {
         }
 
         pub fn release(self: *const Self) void {
-            self.origin.releaseTemp(self.handle);
+            if (self.temps.fetchRemove(self.handle.data_ptr)) |kv| {
+                var g = kv.value;
+                v8.v8__Global__Reset(&g);
+            }
         }
     };
 }

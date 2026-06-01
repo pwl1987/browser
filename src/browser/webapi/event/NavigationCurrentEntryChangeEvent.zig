@@ -17,15 +17,16 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 const NavigationHistoryEntry = @import("../navigation/NavigationHistoryEntry.zig");
 const NavigationType = @import("../navigation/root.zig").NavigationType;
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 const NavigationCurrentEntryChangeEvent = @This();
@@ -44,17 +45,17 @@ const Options = Event.inheritOptions(
     NavigationCurrentEntryChangeEventOptions,
 );
 
-pub fn init(typ: []const u8, opts: Options, page: *Page) !*NavigationCurrentEntryChangeEvent {
-    const arena = try page.getArena(.{ .debug = "NavigationCurrentEntryChangeEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, opts: Options, frame: *Frame) !*NavigationCurrentEntryChangeEvent {
+    const arena = try frame.getArena(.tiny, "NavigationCurrentEntryChangeEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, opts, false, page);
+    return initWithTrusted(arena, type_string, opts, false, frame);
 }
 
-pub fn initTrusted(typ: String, opts: Options, page: *Page) !*NavigationCurrentEntryChangeEvent {
-    const arena = try page.getArena(.{ .debug = "NavigationCurrentEntryChangeEvent.trusted" });
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, opts, true, page);
+pub fn initTrusted(typ: String, opts: Options, frame: *Frame) !*NavigationCurrentEntryChangeEvent {
+    const arena = try frame.getArena(.tiny, "NavigationCurrentEntryChangeEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, opts, true, frame);
 }
 
 fn initWithTrusted(
@@ -62,14 +63,14 @@ fn initWithTrusted(
     typ: String,
     opts: Options,
     trusted: bool,
-    page: *Page,
+    frame: *Frame,
 ) !*NavigationCurrentEntryChangeEvent {
     const navigation_type = if (opts.navigationType) |nav_type_str|
         std.meta.stringToEnum(NavigationType, nav_type_str)
     else
         null;
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         NavigationCurrentEntryChangeEvent{
@@ -81,10 +82,6 @@ fn initWithTrusted(
 
     Event.populatePrototypes(event, opts, trusted);
     return event;
-}
-
-pub fn deinit(self: *NavigationCurrentEntryChangeEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *NavigationCurrentEntryChangeEvent) *Event {
@@ -106,8 +103,6 @@ pub const JsApi = struct {
         pub const name = "NavigationCurrentEntryChangeEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(NavigationCurrentEntryChangeEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(NavigationCurrentEntryChangeEvent.init, .{});

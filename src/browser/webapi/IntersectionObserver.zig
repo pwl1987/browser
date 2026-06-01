@@ -16,17 +16,19 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../js/js.zig");
-const log = @import("../../log.zig");
-
-const IS_DEBUG = @import("builtin").mode == .Debug;
-
-const Allocator = std.mem.Allocator;
 
 const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
+const Frame = @import("../Frame.zig");
+
+const Node = @import("Node.zig");
 const Element = @import("Element.zig");
 const DOMRect = @import("DOMRect.zig");
+
+const log = lp.log;
+const Allocator = std.mem.Allocator;
 
 pub fn registerTypes() []const type {
     return &.{
@@ -37,6 +39,7 @@ pub fn registerTypes() []const type {
 
 const IntersectionObserver = @This();
 
+_rc: lp.RC(u8) = .{},
 _arena: Allocator,
 _callback: js.Function.Temp,
 _observing: std.ArrayList(*Element) = .{},
@@ -55,7 +58,7 @@ var zero_rect: DOMRect = .{
 };
 
 pub const ObserverInit = struct {
-    root: ?*Element = null,
+    root: ?*Node = null,
     rootMargin: ?[]const u8 = null,
     threshold: Threshold = .{ .scalar = 0.0 },
 
@@ -65,9 +68,9 @@ pub const ObserverInit = struct {
     };
 };
 
-pub fn init(callback: js.Function.Temp, options: ?ObserverInit, page: *Page) !*IntersectionObserver {
-    const arena = try page.getArena(.{ .debug = "IntersectionObserver" });
-    errdefer page.releaseArena(arena);
+pub fn init(callback: js.Function.Temp, options: ?ObserverInit, frame: *Frame) !*IntersectionObserver {
+    const arena = try frame.getArena(.small, "IntersectionObserver");
+    errdefer frame.releaseArena(arena);
 
     const opts = options orelse ObserverInit{};
     const root_margin = if (opts.rootMargin) |rm| try arena.dupe(u8, rm) else "0px";
@@ -81,27 +84,50 @@ pub fn init(callback: js.Function.Temp, options: ?ObserverInit, page: *Page) !*I
         .array => |arr| try arena.dupe(f64, arr),
     };
 
+    const root: ?*Element = blk: {
+        const root_opt = opts.root orelse break :blk null;
+        switch (root_opt._type) {
+            .element => |el| break :blk el,
+            .document => {
+                // not strictly correct, `null` means the viewport, not the
+                // entire document, but since we don't render anything, this
+                // should be fine.
+                break :blk null;
+            },
+            else => return error.TypeError,
+        }
+    };
+
     const self = try arena.create(IntersectionObserver);
     self.* = .{
         ._arena = arena,
         ._callback = callback,
-        ._root = opts.root,
+        ._root = root,
         ._root_margin = root_margin,
         ._threshold = threshold,
     };
     return self;
 }
 
-pub fn deinit(self: *IntersectionObserver, shutdown: bool, session: *Session) void {
+pub fn deinit(self: *IntersectionObserver, page: *Page) void {
     self._callback.release();
-    if ((comptime IS_DEBUG) and !shutdown) {
-        std.debug.assert(self._observing.items.len == 0);
+    for (self._pending_entries.items) |entry| {
+        // These were never handed to v8, they do not have a corresponding
+        // FinalizerCallback. We 100% own them.
+        entry.deinit(page);
     }
-
-    session.releaseArena(self._arena);
+    page.releaseArena(self._arena);
 }
 
-pub fn observe(self: *IntersectionObserver, target: *Element, page: *Page) !void {
+pub fn releaseRef(self: *IntersectionObserver, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *IntersectionObserver) void {
+    self._rc.acquire();
+}
+
+pub fn observe(self: *IntersectionObserver, target: *Element, frame: *Frame) !void {
     // Check if already observing this target
     for (self._observing.items) |elem| {
         if (elem == target) {
@@ -109,36 +135,35 @@ pub fn observe(self: *IntersectionObserver, target: *Element, page: *Page) !void
         }
     }
 
-    // Register with page if this is our first observation
-    if (self._observing.items.len == 0) {
-        page.js.strongRef(self);
-        try page.registerIntersectionObserver(self);
-    }
-
     try self._observing.append(self._arena, target);
+    if (self._observing.items.len == 1) {
+        try frame.registerIntersectionObserver(self);
+    }
 
     // Don't initialize previous state yet - let checkIntersection do it
     // This ensures we get an entry on first observation
 
     // Check intersection for this new target and schedule delivery
-    try self.checkIntersection(target, page);
+    try self.checkIntersection(target, frame);
     if (self._pending_entries.items.len > 0) {
-        try page.scheduleIntersectionDelivery();
+        try frame.scheduleIntersectionDelivery();
     }
 }
 
-pub fn unobserve(self: *IntersectionObserver, target: *Element, page: *Page) void {
+pub fn unobserve(self: *IntersectionObserver, target: *Element, frame: *Frame) void {
+    const original_length = self._observing.items.len;
     for (self._observing.items, 0..) |elem, i| {
         if (elem == target) {
             _ = self._observing.swapRemove(i);
             _ = self._previous_states.remove(target);
 
-            // Remove any pending entries for this target
+            // Remove any pending entries for this target.
+            // Entries will be cleaned up by V8 GC via the finalizer.
             var j: usize = 0;
             while (j < self._pending_entries.items.len) {
                 if (self._pending_entries.items[j]._target == target) {
                     const entry = self._pending_entries.swapRemove(j);
-                    entry.deinit(false, page._session);
+                    entry.deinit(frame._page);
                 } else {
                     j += 1;
                 }
@@ -147,25 +172,26 @@ pub fn unobserve(self: *IntersectionObserver, target: *Element, page: *Page) voi
         }
     }
 
-    if (self._observing.items.len == 0) {
-        page.js.safeWeakRef(self);
+    if (original_length > 0 and self._observing.items.len == 0) {
+        frame.unregisterIntersectionObserver(self);
     }
 }
 
-pub fn disconnect(self: *IntersectionObserver, page: *Page) void {
-    page.unregisterIntersectionObserver(self);
-    self._observing.clearRetainingCapacity();
-    self._previous_states.clearRetainingCapacity();
-
+pub fn disconnect(self: *IntersectionObserver, frame: *Frame) void {
     for (self._pending_entries.items) |entry| {
-        entry.deinit(false, page._session);
+        entry.deinit(frame._page);
     }
     self._pending_entries.clearRetainingCapacity();
-    page.js.safeWeakRef(self);
+    self._previous_states.clearRetainingCapacity();
+
+    if (self._observing.items.len > 0) {
+        frame.unregisterIntersectionObserver(self);
+    }
+    self._observing.clearRetainingCapacity();
 }
 
-pub fn takeRecords(self: *IntersectionObserver, page: *Page) ![]*IntersectionObserverEntry {
-    const entries = try page.call_arena.dupe(*IntersectionObserverEntry, self._pending_entries.items);
+pub fn takeRecords(self: *IntersectionObserver, frame: *Frame) ![]*IntersectionObserverEntry {
+    const entries = try frame.call_arena.dupe(*IntersectionObserverEntry, self._pending_entries.items);
     self._pending_entries.clearRetainingCapacity();
     return entries;
 }
@@ -173,13 +199,13 @@ pub fn takeRecords(self: *IntersectionObserver, page: *Page) ![]*IntersectionObs
 fn calculateIntersection(
     self: *IntersectionObserver,
     target: *Element,
-    page: *Page,
+    frame: *Frame,
 ) !IntersectionData {
-    const target_rect = target.getBoundingClientRect(page);
+    const target_rect = target.getBoundingClientRect(frame);
 
     // Use root element's rect or viewport (simplified: assume 1920x1080)
     const root_rect = if (self._root) |root|
-        root.getBoundingClientRect(page)
+        root.getBoundingClientRect(frame)
     else
         // Simplified viewport - assume 1920x1080 for now
         DOMRect{
@@ -226,8 +252,8 @@ fn meetsThreshold(self: *IntersectionObserver, ratio: f64) bool {
     return false;
 }
 
-fn checkIntersection(self: *IntersectionObserver, target: *Element, page: *Page) !void {
-    const data = try self.calculateIntersection(target, page);
+fn checkIntersection(self: *IntersectionObserver, target: *Element, frame: *Frame) !void {
+    const data = try self.calculateIntersection(target, frame);
     const was_intersecting_opt = self._previous_states.get(target);
     const is_now_intersecting = data.is_intersecting and self.meetsThreshold(data.intersection_ratio);
 
@@ -238,21 +264,20 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, page: *Page)
         (was_intersecting_opt != null and was_intersecting_opt.? != is_now_intersecting);
 
     if (should_report) {
-        const arena = try page.getArena(.{ .debug = "IntersectionObserverEntry" });
-        errdefer page.releaseArena(arena);
+        const arena = try frame.getArena(.tiny, "IntersectionObserverEntry");
+        errdefer frame.releaseArena(arena);
 
         const entry = try arena.create(IntersectionObserverEntry);
         entry.* = .{
             ._arena = arena,
             ._target = target,
-            ._time = page.window._performance.now(),
+            ._time = frame.window._performance.now(),
             ._is_intersecting = is_now_intersecting,
-            ._root_bounds = try page._factory.create(data.root_bounds),
-            ._intersection_rect = try page._factory.create(data.intersection_rect),
-            ._bounding_client_rect = try page._factory.create(data.bounding_client_rect),
+            ._root_bounds = try frame._factory.create(data.root_bounds),
+            ._intersection_rect = try frame._factory.create(data.intersection_rect),
+            ._bounding_client_rect = try frame._factory.create(data.bounding_client_rect),
             ._intersection_ratio = data.intersection_ratio,
         };
-
         try self._pending_entries.append(self._arena, entry);
     }
 
@@ -261,39 +286,40 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, page: *Page)
     try self._previous_states.put(self._arena, target, is_now_intersecting);
 }
 
-pub fn checkIntersections(self: *IntersectionObserver, page: *Page) !void {
+pub fn checkIntersections(self: *IntersectionObserver, frame: *Frame) !void {
     if (self._observing.items.len == 0) {
         return;
     }
 
     for (self._observing.items) |target| {
-        try self.checkIntersection(target, page);
+        try self.checkIntersection(target, frame);
     }
 
     if (self._pending_entries.items.len > 0) {
-        try page.scheduleIntersectionDelivery();
+        try frame.scheduleIntersectionDelivery();
     }
 }
 
-pub fn deliverEntries(self: *IntersectionObserver, page: *Page) !void {
+pub fn deliverEntries(self: *IntersectionObserver, frame: *Frame) !void {
     if (self._pending_entries.items.len == 0) {
         return;
     }
 
-    const entries = try self.takeRecords(page);
+    const entries = try self.takeRecords(frame);
     var caught: js.TryCatch.Caught = undefined;
 
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
     ls.toLocal(self._callback).tryCall(void, .{ entries, self }, &caught) catch |err| {
-        log.err(.page, "IntsctObserver.deliverEntries", .{ .err = err, .caught = caught });
+        log.err(.frame, "IntsctObserver.deliverEntries", .{ .err = err, .caught = caught });
         return err;
     };
 }
 
 pub const IntersectionObserverEntry = struct {
+    _rc: lp.RC(u8) = .{},
     _arena: Allocator,
     _time: f64,
     _target: *Element,
@@ -303,8 +329,16 @@ pub const IntersectionObserverEntry = struct {
     _intersection_ratio: f64,
     _is_intersecting: bool,
 
-    pub fn deinit(self: *IntersectionObserverEntry, _: bool, session: *Session) void {
-        session.releaseArena(self._arena);
+    pub fn deinit(self: *IntersectionObserverEntry, page: *Page) void {
+        page.releaseArena(self._arena);
+    }
+
+    pub fn releaseRef(self: *IntersectionObserverEntry, page: *Page) void {
+        self._rc.release(self, page);
+    }
+
+    pub fn acquireRef(self: *IntersectionObserverEntry) void {
+        self._rc.acquire();
     }
 
     pub fn getTarget(self: *const IntersectionObserverEntry) *Element {
@@ -342,8 +376,6 @@ pub const IntersectionObserverEntry = struct {
             pub const name = "IntersectionObserverEntry";
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
-            pub const weak = true;
-            pub const finalizer = bridge.finalizer(IntersectionObserverEntry.deinit);
         };
 
         pub const target = bridge.accessor(IntersectionObserverEntry.getTarget, null, .{});
@@ -363,8 +395,6 @@ pub const JsApi = struct {
         pub const name = "IntersectionObserver";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(IntersectionObserver.deinit);
     };
 
     pub const constructor = bridge.constructor(init, .{});

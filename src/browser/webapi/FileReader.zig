@@ -17,21 +17,24 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../js/js.zig");
 
 const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
 const EventTarget = @import("EventTarget.zig");
 const ProgressEvent = @import("event/ProgressEvent.zig");
 const Blob = @import("Blob.zig");
 
+const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
 
 /// https://w3c.github.io/FileAPI/#dfn-filereader
 /// https://developer.mozilla.org/en-US/docs/Web/API/FileReader
 const FileReader = @This();
 
-_page: *Page,
+_rc: lp.RC(u8) = .{},
+_exec: *Execution,
 _proto: *EventTarget,
 _arena: Allocator,
 
@@ -56,21 +59,22 @@ const ReadyState = enum(u8) {
 
 const Result = union(enum) {
     string: []const u8,
+    binary_string: js.String.OneByte,
     arraybuffer: js.ArrayBuffer,
 };
 
-pub fn init(page: *Page) !*FileReader {
-    const arena = try page.getArena(.{ .debug = "FileReader" });
-    errdefer page.releaseArena(arena);
+pub fn init(exec: *Execution) !*FileReader {
+    const arena = try exec.getArena(.tiny, "FileReader");
+    errdefer exec.releaseArena(arena);
 
-    return page._factory.eventTargetWithAllocator(arena, FileReader{
-        ._page = page,
+    return exec._factory.eventTargetWithAllocator(arena, FileReader{
+        ._exec = exec,
         ._arena = arena,
         ._proto = undefined,
     });
 }
 
-pub fn deinit(self: *FileReader, _: bool, session: *Session) void {
+pub fn deinit(self: *FileReader, page: *Page) void {
     if (self._on_abort) |func| func.release();
     if (self._on_error) |func| func.release();
     if (self._on_load) |func| func.release();
@@ -78,7 +82,15 @@ pub fn deinit(self: *FileReader, _: bool, session: *Session) void {
     if (self._on_load_start) |func| func.release();
     if (self._on_progress) |func| func.release();
 
-    session.releaseArena(self._arena);
+    page.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *FileReader, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *FileReader) void {
+    self._rc.acquire();
 }
 
 fn asEventTarget(self: *FileReader) *EventTarget {
@@ -180,9 +192,9 @@ fn readInternal(self: *FileReader, blob: *Blob, read_type: ReadType) !void {
     self._error = null;
     self._aborted = false;
 
-    const page = self._page;
+    const exec = self._exec;
 
-    try self.dispatch(.load_start, .{ .loaded = 0, .total = blob.getSize() }, page);
+    try self.dispatch(.load_start, .{ .loaded = 0, .total = blob.getSize() }, exec);
     if (self._aborted) {
         return;
     }
@@ -190,7 +202,7 @@ fn readInternal(self: *FileReader, blob: *Blob, read_type: ReadType) !void {
     // Perform the read (synchronous since data is in memory)
     const data = blob._slice;
     const size = data.len;
-    try self.dispatch(.progress, .{ .loaded = size, .total = size }, page);
+    try self.dispatch(.progress, .{ .loaded = size, .total = size }, exec);
     if (self._aborted) {
         return;
     }
@@ -198,7 +210,7 @@ fn readInternal(self: *FileReader, blob: *Blob, read_type: ReadType) !void {
     // Process the data based on read type
     self._result = switch (read_type) {
         .arraybuffer => .{ .arraybuffer = .{ .values = data } },
-        .binary_string => .{ .string = data },
+        .binary_string => .{ .binary_string = .{ .bytes = data } },
         .text => .{ .string = data },
         .data_url => blk: {
             // Create data URL with base64 encoding
@@ -210,8 +222,8 @@ fn readInternal(self: *FileReader, blob: *Blob, read_type: ReadType) !void {
 
     self._ready_state = .done;
 
-    try self.dispatch(.load, .{ .loaded = size, .total = size }, page);
-    try self.dispatch(.load_end, .{ .loaded = size, .total = size }, page);
+    try self.dispatch(.load, .{ .loaded = size, .total = size }, exec);
+    try self.dispatch(.load_end, .{ .loaded = size, .total = size }, exec);
 }
 
 pub fn abort(self: *FileReader) !void {
@@ -223,14 +235,12 @@ pub fn abort(self: *FileReader) !void {
     self._ready_state = .done;
     self._result = null;
 
-    const page = self._page;
-
-    try self.dispatch(.abort, null, page);
-
-    try self.dispatch(.load_end, null, page);
+    const exec = self._exec;
+    try self.dispatch(.abort, null, exec);
+    try self.dispatch(.load_end, null, exec);
 }
 
-fn dispatch(self: *FileReader, comptime event_type: DispatchType, progress_: ?Progress, page: *Page) !void {
+fn dispatch(self: *FileReader, comptime event_type: DispatchType, progress_: ?Progress, exec: *Execution) !void {
     const field, const typ = comptime blk: {
         break :blk switch (event_type) {
             .abort => .{ "_on_abort", "abort" },
@@ -246,10 +256,10 @@ fn dispatch(self: *FileReader, comptime event_type: DispatchType, progress_: ?Pr
     const event = (try ProgressEvent.initTrusted(
         comptime .wrap(typ),
         .{ .total = progress.total, .loaded = progress.loaded },
-        page,
+        exec.page,
     )).asEvent();
 
-    return page._event_manager.dispatchDirect(
+    return exec.dispatch(
         self.asEventTarget(),
         event,
         @field(self, field),
@@ -309,8 +319,6 @@ pub const JsApi = struct {
         pub const name = "FileReader";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(FileReader.deinit);
     };
 
     pub const constructor = bridge.constructor(FileReader.init, .{});

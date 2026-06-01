@@ -32,7 +32,7 @@
     testing.expectEqual(testing.BASE_URL + 'element/html/hello', form.action)
 
     form.action = '/hello';
-    testing.expectEqual(testing.ORIGIN + 'hello', form.action)
+    testing.expectEqual(testing.ORIGIN + '/hello', form.action)
 
     form.action = 'https://lightpanda.io/hello';
     testing.expectEqual('https://lightpanda.io/hello', form.action)
@@ -82,6 +82,51 @@
     // Test invalid value defaults to "get"
     form.setAttribute('method', 'invalid')
     testing.expectEqual('get', form.method)
+  }
+</script>
+
+<!-- Test fixtures for form.enctype -->
+<form id="form_enctype_default"></form>
+<form id="form_enctype_url" enctype="application/x-www-form-urlencoded"></form>
+<form id="form_enctype_multipart" enctype="multipart/form-data"></form>
+<form id="form_enctype_plain" enctype="text/plain"></form>
+
+<script id="enctype_initial">
+  // Missing-value default: "application/x-www-form-urlencoded"
+  testing.expectEqual('application/x-www-form-urlencoded', $('#form_enctype_default').enctype)
+  testing.expectEqual('application/x-www-form-urlencoded', $('#form_enctype_url').enctype)
+  testing.expectEqual('multipart/form-data', $('#form_enctype_multipart').enctype)
+  testing.expectEqual('text/plain', $('#form_enctype_plain').enctype)
+</script>
+
+<script id="enctype_set">
+  {
+    const form = document.createElement('form')
+    testing.expectEqual('application/x-www-form-urlencoded', form.enctype)
+
+    form.enctype = 'multipart/form-data'
+    testing.expectEqual('multipart/form-data', form.enctype)
+    testing.expectEqual('multipart/form-data', form.getAttribute('enctype'))
+  }
+</script>
+
+<script id="enctype_normalization">
+  {
+    const form = document.createElement('form')
+
+    // Case-insensitive match against known values
+    form.setAttribute('enctype', 'MULTIPART/FORM-DATA')
+    testing.expectEqual('multipart/form-data', form.enctype)
+
+    form.setAttribute('enctype', 'Text/Plain')
+    testing.expectEqual('text/plain', form.enctype)
+
+    // Invalid-value default: "application/x-www-form-urlencoded"
+    form.setAttribute('enctype', 'application/json')
+    testing.expectEqual('application/x-www-form-urlencoded', form.enctype)
+
+    form.setAttribute('enctype', '')
+    testing.expectEqual('application/x-www-form-urlencoded', form.enctype)
   }
 </script>
 
@@ -341,5 +386,240 @@
   testing.expectEqual('c', form.elements[2].value)
 
   testing.expectEqual('', form.elements['choice'].value)
+}
+</script>
+
+<!-- Test: requestSubmit() fires the submit event (unlike submit()) -->
+<form id="test_form2" action="/should-not-navigate2" method="get">
+  <input name="q" value="test2">
+</form>
+
+<script id="requestSubmit_fires_submit_event">
+{
+  const form = $('#test_form2');
+  let submitFired = false;
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitFired = true;
+  });
+
+  form.requestSubmit();
+
+  testing.expectEqual(true, submitFired);
+}
+</script>
+
+<!-- Test: requestSubmit() with preventDefault stops navigation -->
+<form id="test_form3" action="/should-not-navigate3" method="get">
+  <input name="q" value="test3">
+</form>
+
+<script id="requestSubmit_respects_preventDefault">
+{
+  const form = $('#test_form3');
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+  });
+
+  form.requestSubmit();
+
+  // Form submission was prevented, so no navigation should be scheduled
+  testing.expectEqual(true, true);
+}
+</script>
+
+<!-- Test: requestSubmit() with non-submit-button submitter throws TypeError -->
+<form id="test_form_rs1" action="/should-not-navigate4" method="get">
+  <input id="rs1_text" type="text" name="q" value="test">
+  <input id="rs1_submit" type="submit" value="Go">
+  <input id="rs1_image" type="image" src="x.png">
+  <button id="rs1_btn_submit" type="submit">Submit</button>
+  <button id="rs1_btn_reset" type="reset">Reset</button>
+  <button id="rs1_btn_button" type="button">Button</button>
+</form>
+
+<script id="requestSubmit_rejects_non_submit_button">
+{
+  const form = $('#test_form_rs1');
+  form.addEventListener('submit', (e) => e.preventDefault());
+
+  // A text input is not a submit button — should throw TypeError
+  testing.expectError('TypeError', () => {
+    form.requestSubmit($('#rs1_text'));
+  });
+
+  // A reset button is not a submit button — should throw TypeError
+  testing.expectError('TypeError', () => {
+    form.requestSubmit($('#rs1_btn_reset'));
+  });
+
+  // A <button type="button"> is not a submit button — should throw TypeError
+  testing.expectError('TypeError', () => {
+    form.requestSubmit($('#rs1_btn_button'));
+  });
+
+  // A <div> is not a submit button — should throw TypeError
+  const div = document.createElement('div');
+  form.appendChild(div);
+  testing.expectError('TypeError', () => {
+    form.requestSubmit(div);
+  });
+}
+</script>
+
+<!-- Test: requestSubmit() accepts valid submit buttons -->
+<script id="requestSubmit_accepts_submit_buttons">
+{
+  const form = $('#test_form_rs1');
+  let submitCount = 0;
+  form.addEventListener('submit', (e) => { e.preventDefault(); submitCount++; });
+
+  // <input type="submit"> is a valid submitter
+  form.requestSubmit($('#rs1_submit'));
+  testing.expectEqual(1, submitCount);
+
+  // <input type="image"> is a valid submitter
+  form.requestSubmit($('#rs1_image'));
+  testing.expectEqual(2, submitCount);
+
+  // <button type="submit"> is a valid submitter
+  form.requestSubmit($('#rs1_btn_submit'));
+  testing.expectEqual(3, submitCount);
+}
+</script>
+
+<!-- Test: requestSubmit() with submitter not owned by form throws NotFoundError -->
+<form id="test_form_rs2" action="/should-not-navigate5" method="get">
+  <input type="text" name="q" value="test">
+</form>
+<form id="test_form_rs3">
+  <input id="rs3_submit" type="submit" value="Other Submit">
+</form>
+
+<script id="requestSubmit_rejects_wrong_form_submitter">
+{
+  const form = $('#test_form_rs2');
+
+  // Submit button belongs to a different form — should throw NotFoundError
+  testing.expectError('NotFoundError', () => {
+    form.requestSubmit($('#rs3_submit'));
+  });
+}
+</script>
+
+<!-- Test: requestSubmit(submitter) sets SubmitEvent.submitter -->
+<form id="test_form_submitter" action="/should-not-navigate6" method="get">
+  <button id="submitter_btn" type="submit">Save</button>
+</form>
+
+<script id="requestSubmit_sets_submitter">
+{
+  const form = $('#test_form_submitter');
+  const btn = $('#submitter_btn');
+  let capturedSubmitter = undefined;
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    capturedSubmitter = e.submitter;
+  });
+
+  form.requestSubmit(btn);
+  testing.expectEqual(btn, capturedSubmitter);
+}
+</script>
+
+<!-- Test: requestSubmit() without submitter sets SubmitEvent.submitter to null
+     per the HTML spec "submit a form element" algorithm step 4. -->
+<form id="test_form_submitter2" action="/should-not-navigate7" method="get">
+  <input type="text" name="q" value="test">
+</form>
+
+<script id="requestSubmit_default_submitter_is_null">
+{
+  const form = $('#test_form_submitter2');
+  let capturedSubmitter = undefined;
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    capturedSubmitter = e.submitter;
+  });
+
+  form.requestSubmit();
+  testing.expectEqual(null, capturedSubmitter);
+}
+</script>
+
+<script id="acceptCharset_property">
+{
+  const form = document.createElement('form');
+  testing.expectEqual('', form.acceptCharset);
+
+  form.acceptCharset = 'big5';
+  testing.expectEqual('big5', form.acceptCharset);
+  testing.expectEqual('big5', form.getAttribute('accept-charset'));
+}
+</script>
+
+<!-- Test: re-entrant submission from a `submit` handler is a no-op. Without the
+     "firing submission events" guard this recurses unbounded and fatally aborts
+     the V8 isolate. -->
+<form id="test_form_reentrant_submit" action="/should-not-navigate8" method="get">
+  <input type="text" name="q" value="test">
+</form>
+
+<script id="submit_reentrant_from_onsubmit_is_noop">
+{
+  const form = $('#test_form_reentrant_submit');
+  let count = 0;
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    count++;
+    // Re-entrant submit while submission events are firing must be ignored.
+    form.requestSubmit();
+  });
+
+  form.requestSubmit();
+  testing.expectEqual(1, count);
+}
+</script>
+
+<!-- Test: re-entrant submission from a `formdata` handler is a no-op. Without
+     the "constructing entry list" guard this recurses unbounded. -->
+<script id="submit_reentrant_from_formdata_is_noop">
+{
+  const form = document.createElement('form');
+  let count = 0;
+
+  form.addEventListener('formdata', () => {
+    count++;
+    // form.submit() while the entry list is being constructed must be ignored.
+    form.submit();
+  });
+
+  new FormData(form);
+  testing.expectEqual(1, count);
+}
+</script>
+
+<!-- Test: building another FormData from a `formdata` handler throws
+     InvalidStateError (and is guarded against unbounded recursion). -->
+<script id="formdata_reentrant_construction_throws">
+{
+  const form = document.createElement('form');
+  let caught = null;
+
+  form.addEventListener('formdata', () => {
+    try {
+      new FormData(form);
+    } catch (e) {
+      caught = e.name;
+    }
+  });
+
+  new FormData(form);
+  testing.expectEqual('InvalidStateError', caught);
 }
 </script>

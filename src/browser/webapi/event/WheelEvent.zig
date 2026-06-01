@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 const MouseEvent = @import("MouseEvent.zig");
+
+const String = lp.String;
 
 const WheelEvent = @This();
 
@@ -49,14 +51,14 @@ pub const Options = Event.inheritOptions(
     WheelEventOptions,
 );
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*WheelEvent {
-    const arena = try page.getArena(.{ .debug = "WheelEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*WheelEvent {
+    const arena = try frame.getArena(.medium, "WheelEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
 
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.mouseEvent(
+    const event = try frame._factory.mouseEvent(
         arena,
         type_string,
         MouseEvent{
@@ -87,10 +89,6 @@ pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*WheelEvent {
     return event;
 }
 
-pub fn deinit(self: *WheelEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
-}
-
 pub fn asEvent(self: *WheelEvent) *Event {
     return self._proto.asEvent();
 }
@@ -118,8 +116,6 @@ pub const JsApi = struct {
         pub const name = "WheelEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(WheelEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(WheelEvent.init, .{});

@@ -90,8 +90,13 @@ fn handleConnection(self: *TestHTTPServer, conn: std.net.Server.Connection) !voi
         };
 
         self.handler(&req) catch |err| {
-            std.debug.print("test http error '{s}': {}\n", .{ req.head.target, err });
-            try req.respond("server error", .{ .status = .internal_server_error });
+            switch (err) {
+                error.BrokenPipe => {},
+                else => {
+                    std.debug.print("test http error '{s}': {}\n", .{ req.head.target, err });
+                    try req.respond("server error", .{ .status = .internal_server_error });
+                },
+            }
             return;
         };
     }
@@ -100,7 +105,10 @@ fn handleConnection(self: *TestHTTPServer, conn: std.net.Server.Connection) !voi
 pub fn sendFile(req: *std.http.Server.Request, file_path: []const u8) !void {
     var url_buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&url_buf);
-    const unescaped_file_path = try URL.unescape(fba.allocator(), file_path);
+    var unescaped_file_path = try URL.unescape(fba.allocator(), file_path);
+    if (std.mem.indexOfScalarPos(u8, unescaped_file_path, 0, '?')) |pos| {
+        unescaped_file_path = unescaped_file_path[0..pos];
+    }
     var file = std.fs.cwd().openFile(unescaped_file_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return req.respond("server error", .{ .status = .not_found }),
         else => return err,
@@ -114,7 +122,7 @@ pub fn sendFile(req: *std.http.Server.Request, file_path: []const u8) !void {
         .content_length = stat.size,
         .respond_options = .{
             .extra_headers = &.{
-                .{ .name = "content-type", .value = getContentType(file_path) },
+                .{ .name = "content-type", .value = getContentType(unescaped_file_path) },
             },
         },
     });
@@ -129,6 +137,10 @@ pub fn sendFile(req: *std.http.Server.Request, file_path: []const u8) !void {
 fn getContentType(file_path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, file_path, ".js")) {
         return "application/json";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".GB2312.html")) {
+        return "text/html; charset=GB2312";
     }
 
     if (std.mem.endsWith(u8, file_path, ".html")) {

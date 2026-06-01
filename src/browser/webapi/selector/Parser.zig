@@ -18,8 +18,6 @@
 
 const std = @import("std");
 
-const Page = @import("../../Page.zig");
-
 const Node = @import("../Node.zig");
 const Attribute = @import("../element/Attribute.zig");
 
@@ -74,7 +72,7 @@ fn preprocessInput(arena: Allocator, input: []const u8) ![]const u8 {
     return result.items;
 }
 
-pub fn parseList(arena: Allocator, input: []const u8, page: *Page) ParseError![]const Selector.Selector {
+pub fn parseList(arena: Allocator, input: []const u8) ParseError![]const Selector.Selector {
     // Preprocess input to normalize line endings
     const preprocessed = try preprocessInput(arena, input);
 
@@ -140,7 +138,7 @@ pub fn parseList(arena: Allocator, input: []const u8, page: *Page) ParseError![]
         const selector_input = std.mem.trimRight(u8, trimmed[0..comma_pos], &std.ascii.whitespace);
 
         if (selector_input.len > 0) {
-            const selector = try parse(arena, selector_input, page);
+            const selector = try parse(arena, selector_input);
             try selectors.append(arena, selector);
         }
 
@@ -155,7 +153,7 @@ pub fn parseList(arena: Allocator, input: []const u8, page: *Page) ParseError![]
     return selectors.items;
 }
 
-pub fn parse(arena: Allocator, input: []const u8, page: *Page) ParseError!Selector.Selector {
+pub fn parse(arena: Allocator, input: []const u8) ParseError!Selector.Selector {
     var parser = Parser{ .input = input };
     var segments: std.ArrayList(Segment) = .empty;
     var current_compound: std.ArrayList(Part) = .empty;
@@ -164,7 +162,7 @@ pub fn parse(arena: Allocator, input: []const u8, page: *Page) ParseError!Select
     while (parser.skipSpaces()) {
         if (parser.peek() == 0) break;
 
-        const part = try parser.parsePart(arena, page);
+        const part = try parser.parsePart(arena);
         try current_compound.append(arena, part);
 
         // Check what comes after this part
@@ -238,7 +236,7 @@ pub fn parse(arena: Allocator, input: []const u8, page: *Page) ParseError!Select
         while (parser.skipSpaces()) {
             if (parser.peek() == 0) break;
 
-            const part = try parser.parsePart(arena, page);
+            const part = try parser.parsePart(arena);
             try current_compound.append(arena, part);
 
             // Check what comes after this part
@@ -289,7 +287,7 @@ pub fn parse(arena: Allocator, input: []const u8, page: *Page) ParseError!Select
     };
 }
 
-fn parsePart(self: *Parser, arena: Allocator, page: *Page) !Part {
+fn parsePart(self: *Parser, arena: Allocator) !Part {
     return switch (self.peek()) {
         '#' => .{ .id = try self.id(arena) },
         '.' => .{ .class = try self.class(arena) },
@@ -297,16 +295,17 @@ fn parsePart(self: *Parser, arena: Allocator, page: *Page) !Part {
             self.input = self.input[1..];
             break :blk .universal;
         },
-        '[' => .{ .attribute = try self.attribute(arena, page) },
-        ':' => .{ .pseudo_class = try self.pseudoClass(arena, page) },
+        '[' => .{ .attribute = try self.attribute(arena) },
+        ':' => .{ .pseudo_class = try self.pseudoClass(arena) },
         'a'...'z', 'A'...'Z', '_', '\\', 0x80...0xFF => blk: {
             // Use parseIdentifier for full escape support
             const tag_name = try self.parseIdentifier(arena, error.InvalidTagSelector);
             if (tag_name.len > 256) {
                 return error.InvalidTagSelector;
             }
+            var buf: [256]u8 = undefined;
             // Try to match as a known tag enum for optimization
-            const lower = std.ascii.lowerString(&page.buf, tag_name);
+            const lower = std.ascii.lowerString(&buf, tag_name);
             if (Node.Element.Tag.parseForMatch(lower)) |known_tag| {
                 break :blk .{ .tag = known_tag };
             }
@@ -373,7 +372,7 @@ fn consumeUntilCommaOrParen(self: *Parser) []const u8 {
     return result;
 }
 
-fn pseudoClass(self: *Parser, arena: Allocator, page: *Page) !Selector.PseudoClass {
+fn pseudoClass(self: *Parser, arena: Allocator) !Selector.PseudoClass {
     if (comptime IS_DEBUG) {
         // Should have been verified by caller
         std.debug.assert(self.peek() == ':');
@@ -445,7 +444,7 @@ fn pseudoClass(self: *Parser, arena: Allocator, page: *Page) !Selector.PseudoCla
                 if (self.peek() == 0) return error.InvalidPseudoClass;
 
                 // Parse a full selector (with potential combinators and compounds)
-                const selector = try parse(arena, self.consumeUntilCommaOrParen(), page);
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
                 try selectors.append(arena, selector);
 
                 _ = self.skipSpaces();
@@ -472,7 +471,7 @@ fn pseudoClass(self: *Parser, arena: Allocator, page: *Page) !Selector.PseudoCla
                 if (self.peek() == ')') break;
                 if (self.peek() == 0) return error.InvalidPseudoClass;
 
-                const selector = try parse(arena, self.consumeUntilCommaOrParen(), page);
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
                 try selectors.append(arena, selector);
 
                 _ = self.skipSpaces();
@@ -499,7 +498,7 @@ fn pseudoClass(self: *Parser, arena: Allocator, page: *Page) !Selector.PseudoCla
                 if (self.peek() == ')') break;
                 if (self.peek() == 0) return error.InvalidPseudoClass;
 
-                const selector = try parse(arena, self.consumeUntilCommaOrParen(), page);
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
                 try selectors.append(arena, selector);
 
                 _ = self.skipSpaces();
@@ -526,7 +525,7 @@ fn pseudoClass(self: *Parser, arena: Allocator, page: *Page) !Selector.PseudoCla
                 if (self.peek() == ')') break;
                 if (self.peek() == 0) return error.InvalidPseudoClass;
 
-                const selector = try parse(arena, self.consumeUntilCommaOrParen(), page);
+                const selector = try parse(arena, self.consumeUntilCommaOrParen());
                 try selectors.append(arena, selector);
 
                 _ = self.skipSpaces();
@@ -898,7 +897,7 @@ fn tag(self: *Parser) ![]const u8 {
     return input[0..i];
 }
 
-fn attribute(self: *Parser, arena: Allocator, page: *Page) !Selector.Attribute {
+fn attribute(self: *Parser, arena: Allocator) !Selector.Attribute {
     if (comptime IS_DEBUG) {
         // should have been verified by caller
         std.debug.assert(self.peek() == '[');
@@ -910,8 +909,7 @@ fn attribute(self: *Parser, arena: Allocator, page: *Page) !Selector.Attribute {
     const attr_name = try self.attributeName();
 
     // Normalize the name to lowercase for fast matching (consistent with Attribute.normalizeNameForLookup)
-    const normalized = try Attribute.normalizeNameForLookup(.wrap(attr_name), page);
-    const name = try normalized.dupe(arena);
+    const name = try Attribute.normalizeNameForLookupAlloc(arena, .wrap(attr_name));
     var case_insensitive = false;
     _ = self.skipSpaces();
 
@@ -923,8 +921,7 @@ fn attribute(self: *Parser, arena: Allocator, page: *Page) !Selector.Attribute {
     const matcher_type = try self.attributeMatcher();
     _ = self.skipSpaces();
 
-    const value_raw = try self.attributeValue();
-    const value = try arena.dupe(u8, value_raw);
+    const value = try self.attributeValue(arena);
     _ = self.skipSpaces();
 
     // Parse optional case-sensitivity flag
@@ -1004,7 +1001,7 @@ fn attributeMatcher(self: *Parser) !std.meta.FieldEnum(Selector.AttributeMatcher
     };
 }
 
-fn attributeValue(self: *Parser) ![]const u8 {
+fn attributeValue(self: *Parser, arena: Allocator) ![]const u8 {
     const input = self.input;
     if (input.len == 0) {
         return error.InvalidAttributeSelector;
@@ -1012,10 +1009,41 @@ fn attributeValue(self: *Parser) ![]const u8 {
 
     const quote = input[0];
     if (quote == '"' or quote == '\'') {
-        const end = std.mem.indexOfScalarPos(u8, input, 1, quote) orelse return error.InvalidAttributeSelector;
-        const value = input[1..end];
-        self.input = input[end + 1 ..];
-        return value;
+        // Walk the string respecting backslash escapes per CSS Syntax Level 3 §4.3.5.
+        // Decode \\ \" \' and \<hex digits>, treat \<newline> as a line continuation,
+        // and stop at the matching unescaped closing quote.
+        // https://drafts.csswg.org/css-syntax/#consume-string-token
+        var result = try std.ArrayList(u8).initCapacity(arena, input.len);
+        var i: usize = 1;
+        while (i < input.len and input[i] != quote) {
+            const b = input[i];
+            if (b == '\\') {
+                if (i + 1 >= input.len) {
+                    // Backslash at EOF inside a string is a parse error per spec;
+                    // surface it as a missing closing quote.
+                    return error.InvalidAttributeSelector;
+                }
+                const after = input[i + 1];
+                if (after == '\n') {
+                    // Escaped newline inside a string is a line continuation: drop both.
+                    i += 2;
+                    continue;
+                }
+                const escape = try parseEscape(input[i + 1 ..], arena);
+                try result.appendSlice(arena, escape.bytes);
+                i += 1 + escape.consumed;
+                continue;
+            }
+            if (b == '\n') {
+                // Bare newline terminates a string token (parse error).
+                return error.InvalidAttributeSelector;
+            }
+            try result.append(arena, b);
+            i += 1;
+        }
+        if (i >= input.len) return error.InvalidAttributeSelector;
+        self.input = input[i + 1 ..];
+        return result.items;
     }
 
     var i: usize = 0;
@@ -1034,7 +1062,7 @@ fn attributeValue(self: *Parser) ![]const u8 {
 
     const value = input[0..i];
     self.input = input[i..];
-    return value;
+    return arena.dupe(u8, value);
 }
 
 fn asUint(comptime string: anytype) std.meta.Int(
@@ -1546,5 +1574,98 @@ test "Selector: Parser.parseNthPattern" {
         try testing.expectEqual(2, pattern.a);
         try testing.expectEqual(1, pattern.b);
         try testing.expectEqual("  )", parser.input);
+    }
+}
+
+test "Selector: Parser.attributeValue" {
+    defer testing.reset();
+    const arena = testing.arena_allocator;
+
+    // Unquoted identifier value (unchanged path).
+    {
+        var parser = Parser{ .input = "abc]" };
+        try testing.expectEqual("abc", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Plain double-quoted value with no escapes.
+    {
+        var parser = Parser{ .input = "\"abc\"]" };
+        try testing.expectEqual("abc", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Plain single-quoted value with no escapes.
+    {
+        var parser = Parser{ .input = "'abc']" };
+        try testing.expectEqual("abc", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped backslash inside a double-quoted value: "abc\\def" -> abc\def.
+    {
+        var parser = Parser{ .input = "\"abc\\\\def\"]" };
+        try testing.expectEqual("abc\\def", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped quote inside a double-quoted value: "foo\"bar" -> foo"bar.
+    {
+        var parser = Parser{ .input = "\"foo\\\"bar\"]" };
+        try testing.expectEqual("foo\"bar", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped single quote inside a single-quoted value: 'foo\'bar' -> foo'bar.
+    {
+        var parser = Parser{ .input = "'foo\\'bar']" };
+        try testing.expectEqual("foo'bar", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape with explicit space terminator: "\41 B" -> "AB" (space is consumed).
+    {
+        var parser = Parser{ .input = "\"\\41 B\"]" };
+        try testing.expectEqual("AB", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape consumes up to 6 hex digits with no delimiter: "\41B" -> "ƛ" (U+041B).
+    {
+        var parser = Parser{ .input = "\"\\41B\"]" };
+        try testing.expectEqual("\u{041B}", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Hex escape decoding to a multi-byte UTF-8 sequence: "\1F3A8" -> "🎨".
+    {
+        var parser = Parser{ .input = "\"\\1F3A8\"]" };
+        try testing.expectEqual("🎨", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Escaped newline inside a string is a line continuation (drops the newline).
+    {
+        var parser = Parser{ .input = "\"foo\\\nbar\"]" };
+        try testing.expectEqual("foobar", try parser.attributeValue(arena));
+        try testing.expectEqual("]", parser.input);
+    }
+
+    // Missing closing quote.
+    {
+        var parser = Parser{ .input = "\"abc" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    // Unescaped newline inside a string terminates with a parse error.
+    {
+        var parser = Parser{ .input = "\"abc\ndef\"]" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
+    }
+
+    // Trailing backslash before EOF is a parse error.
+    {
+        var parser = Parser{ .input = "\"abc\\" };
+        try testing.expectError(error.InvalidAttributeSelector, parser.attributeValue(arena));
     }
 }

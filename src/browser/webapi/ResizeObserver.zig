@@ -16,7 +16,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
 const js = @import("../js/js.zig");
 const Element = @import("Element.zig");
 
@@ -62,5 +61,6 @@ pub const JsApi = struct {
 
     pub const constructor = bridge.constructor(ResizeObserver.init, .{});
     pub const observe = bridge.function(ResizeObserver.observe, .{});
+    pub const unobserve = bridge.function(ResizeObserver.unobserve, .{});
     pub const disconnect = bridge.function(ResizeObserver.disconnect, .{});
 };

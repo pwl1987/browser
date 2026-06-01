@@ -335,7 +335,7 @@ pub const DateTime = struct {
         }
         const tm = try parser.time(false);
 
-        if (parser.consumeIf(' ') == false) {
+        if (parser.unconsumed() == 0 or parser.consumeIf(' ') == false) {
             return error.InvalidTime;
         }
 
@@ -354,7 +354,7 @@ pub const DateTime = struct {
             return error.OutsideJulianPeriod;
         }
 
-        // Per the spec, it can be argued thatt 't' and even ' ' should be allowed,
+        // Per the spec, it can be argued that 't' and even ' ' should be allowed,
         // but certainly not encouraged.
         if (parser.consumeIf('T') == false) {
             return error.InvalidDateTime;
@@ -569,7 +569,7 @@ fn writeDate(into: []u8, date: Date) u8 {
     // cast year to a u16 so it doesn't insert a sign
     // we don't want the + sign, ever
     // and we don't even want it to insert the - sign, because it screws up
-    // the padding (we need to do it ourselfs)
+    // the padding (we need to do it ourselves)
     const year = date.year;
     if (year < 0) {
         _ = std.fmt.printInt(into[1..], @as(u16, @intCast(year * -1)), 10, .lower, .{ .width = 4, .fill = '0' });
@@ -1495,6 +1495,9 @@ test "DateTime: parse RFC822" {
     try testing.expectError(error.InvalidTime, DateTime.parse("Wed, 01 Jan 20 20:1a:22  Z", .rfc822));
     try testing.expectError(error.InvalidTime, DateTime.parse("Wed, 01 Jan 20 20:1a:22 X", .rfc822));
     try testing.expectError(error.InvalidTime, DateTime.parse("Wed, 01 Jan 20 20:1a:22 ZZ", .rfc822));
+
+    // Missing timezone - input ends exactly at time boundary (was causing index out of bounds)
+    try testing.expectError(error.InvalidTime, DateTime.parse("Wed, 01 Jan 2020 10:10:10", .rfc822));
 
     {
         const dt = try DateTime.parse("31 Dec 68 23:59 Z", .rfc822);

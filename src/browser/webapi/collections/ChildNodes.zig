@@ -18,9 +18,11 @@
 
 const std = @import("std");
 
-const Node = @import("../Node.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
+
+const Node = @import("../Node.zig");
+
 const GenericIterator = @import("iterator.zig").Entry;
 
 // Optimized for node.childNodes, which has to be a live list.
@@ -38,9 +40,9 @@ pub const KeyIterator = GenericIterator(Iterator, "0");
 pub const ValueIterator = GenericIterator(Iterator, "1");
 pub const EntryIterator = GenericIterator(Iterator, null);
 
-pub fn init(node: *Node, page: *Page) !*ChildNodes {
-    const arena = try page.getArena(.{ .debug = "ChildNodes" });
-    errdefer page.releaseArena(arena);
+pub fn init(node: *Node, frame: *Frame) !*ChildNodes {
+    const arena = try frame.getArena(.small, "ChildNodes");
+    errdefer frame.releaseArena(arena);
 
     const self = try arena.create(ChildNodes);
     self.* = .{
@@ -49,17 +51,17 @@ pub fn init(node: *Node, page: *Page) !*ChildNodes {
         ._last_index = 0,
         ._last_node = null,
         ._last_length = null,
-        ._cached_version = page.version,
+        ._cached_version = frame._page.dom_version,
     };
     return self;
 }
 
-pub fn deinit(self: *const ChildNodes, session: *Session) void {
-    session.releaseArena(self._arena);
+pub fn deinit(self: *const ChildNodes, page: *Page) void {
+    page.releaseArena(self._arena);
 }
 
-pub fn length(self: *ChildNodes, page: *Page) !u32 {
-    if (self.versionCheck(page)) {
+pub fn length(self: *ChildNodes, frame: *const Frame) !u32 {
+    if (self.versionCheck(frame)) {
         if (self._last_length) |cached_length| {
             return cached_length;
         }
@@ -72,16 +74,16 @@ pub fn length(self: *ChildNodes, page: *Page) !u32 {
     return len;
 }
 
-pub fn getAtIndex(self: *ChildNodes, index: usize, page: *Page) !?*Node {
-    _ = self.versionCheck(page);
+pub fn getAtIndex(self: *ChildNodes, index: usize, frame: *const Frame) !?*Node {
+    _ = self.versionCheck(frame);
 
     var current = self._last_index;
     var node: ?*std.DoublyLinkedList.Node = null;
-    if (index < current) {
+    if (index < current or self._last_node == null) {
         current = 0;
         node = self.first() orelse return null;
     } else {
-        node = self._last_node orelse self.first() orelse return null;
+        node = self._last_node;
     }
     defer self._last_index = current;
 
@@ -101,20 +103,20 @@ pub fn first(self: *const ChildNodes) ?*std.DoublyLinkedList.Node {
     return &(self._node._children orelse return null).first()._child_link;
 }
 
-pub fn keys(self: *ChildNodes, page: *Page) !*KeyIterator {
-    return .init(.{ .list = self }, page);
+pub fn keys(self: *ChildNodes, frame: *Frame) !*KeyIterator {
+    return .init(.{ .list = self }, frame);
 }
 
-pub fn values(self: *ChildNodes, page: *Page) !*ValueIterator {
-    return .init(.{ .list = self }, page);
+pub fn values(self: *ChildNodes, frame: *Frame) !*ValueIterator {
+    return .init(.{ .list = self }, frame);
 }
 
-pub fn entries(self: *ChildNodes, page: *Page) !*EntryIterator {
-    return .init(.{ .list = self }, page);
+pub fn entries(self: *ChildNodes, frame: *Frame) !*EntryIterator {
+    return .init(.{ .list = self }, frame);
 }
 
-fn versionCheck(self: *ChildNodes, page: *Page) bool {
-    const current = page.version;
+fn versionCheck(self: *ChildNodes, frame: *const Frame) bool {
+    const current = frame._page.dom_version;
     if (current == self._cached_version) {
         return true;
     }
@@ -126,8 +128,12 @@ fn versionCheck(self: *ChildNodes, page: *Page) bool {
 }
 
 const NodeList = @import("NodeList.zig");
-pub fn runtimeGenericWrap(self: *ChildNodes, page: *Page) !*NodeList {
-    return page._factory.create(NodeList{ ._data = .{ .child_nodes = self } });
+pub fn runtimeGenericWrap(self: *ChildNodes, _: *const Frame) !*NodeList {
+    const nl = try self._arena.create(NodeList);
+    nl.* = .{
+        ._data = .{ .child_nodes = self },
+    };
+    return nl;
 }
 
 const Iterator = struct {
@@ -136,9 +142,9 @@ const Iterator = struct {
 
     const Entry = struct { u32, *Node };
 
-    pub fn next(self: *Iterator, page: *Page) !?Entry {
+    pub fn next(self: *Iterator, frame: *const Frame) !?Entry {
         const index = self.index;
-        const node = try self.list.getAtIndex(index, page) orelse return null;
+        const node = try self.list.getAtIndex(index, frame) orelse return null;
         self.index = index + 1;
         return .{ index, node };
     }

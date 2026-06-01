@@ -19,23 +19,30 @@
 const std = @import("std");
 
 const js = @import("../../js/js.zig");
-const net_http = @import("../../../network/http.zig");
+const http = @import("../../../network/http.zig");
 
 const URL = @import("../URL.zig");
-const Page = @import("../../Page.zig");
-const Headers = @import("Headers.zig");
 const Blob = @import("../Blob.zig");
+const AbortSignal = @import("../AbortSignal.zig");
+
+const Headers = @import("Headers.zig");
+const body_init = @import("body_init.zig");
+const BodyInit = body_init.BodyInit;
+
+const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
 
 const Request = @This();
 
 _url: [:0]const u8,
-_method: net_http.Method,
+_method: http.Method,
 _headers: ?*Headers,
 _body: ?[]const u8,
 _arena: Allocator,
 _cache: Cache,
 _credentials: Credentials,
+_signal: ?*AbortSignal,
+_body_used: bool = false,
 
 pub const Input = union(enum) {
     request: *Request,
@@ -45,10 +52,14 @@ pub const Input = union(enum) {
 pub const InitOpts = struct {
     method: ?[]const u8 = null,
     headers: ?Headers.InitOpts = null,
-    body: ?[]const u8 = null,
+    body: ?BodyInit = null,
     cache: Cache = .default,
     credentials: Credentials = .@"same-origin",
+    signal: ?*AbortSignal = null,
+    priority: ?[]const u8 = null,
 };
+
+const Priority = enum { high, low, auto };
 
 const Credentials = enum {
     omit,
@@ -67,37 +78,60 @@ const Cache = enum {
     pub const js_enum_from_string = true;
 };
 
-pub fn init(input: Input, opts_: ?InitOpts, page: *Page) !*Request {
-    const arena = page.arena;
+pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
+    const arena = exec.arena;
     const url = switch (input) {
-        .url => |u| try URL.resolve(arena, page.base(), u, .{ .always_dupe = true }),
+        .url => |u| try URL.resolve(arena, exec.base(), u, .{ .always_dupe = true, .encoding = exec.charset.* }),
         .request => |r| try arena.dupeZ(u8, r._url),
     };
 
     const opts = opts_ orelse InitOpts{};
+    if (opts.priority) |p| {
+        if (std.meta.stringToEnum(Priority, p) == null) {
+            return error.InvalidArgument;
+        }
+    }
+
     const method = if (opts.method) |m|
-        try parseMethod(m, page)
+        try parseMethod(m, exec)
     else switch (input) {
         .url => .GET,
         .request => |r| r._method,
     };
 
-    const headers = if (opts.headers) |headers_init| switch (headers_init) {
+    var headers = if (opts.headers) |headers_init| switch (headers_init) {
         .obj => |h| h,
-        else => try Headers.init(headers_init, page),
+        else => try Headers.init(headers_init, exec),
     } else switch (input) {
         .url => null,
         .request => |r| r._headers,
     };
 
-    const body = if (opts.body) |b|
-        try arena.dupe(u8, b)
-    else switch (input) {
+    const body = if (opts.body) |b| blk: {
+        const extracted = try b.extract(arena);
+        // Per Fetch §6.5 step 11, the default Content-Type only applies if
+        // the user has not already set one via the headers init dict.
+        if (extracted.content_type) |ct| {
+            const hs = headers orelse try Headers.init(null, exec);
+            if (!hs.has("content-type", exec)) {
+                try hs.append("content-type", ct, exec);
+            }
+            headers = hs;
+        }
+        break :blk extracted.bytes;
+    } else switch (input) {
         .url => null,
         .request => |r| r._body,
     };
 
-    return page._factory.create(Request{
+    const signal = if (opts.signal) |s|
+        s
+    else switch (input) {
+        .url => null,
+        .request => |r| r._signal,
+    };
+
+    return exec._factory.create(Request{
         ._url = url,
         ._arena = arena,
         ._method = method,
@@ -105,17 +139,18 @@ pub fn init(input: Input, opts_: ?InitOpts, page: *Page) !*Request {
         ._cache = opts.cache,
         ._credentials = opts.credentials,
         ._body = body,
+        ._signal = signal,
     });
 }
 
-fn parseMethod(method: []const u8, page: *Page) !net_http.Method {
+fn parseMethod(method: []const u8, exec: *const Execution) !http.Method {
     if (method.len > "propfind".len) {
         return error.InvalidMethod;
     }
 
-    const lower = std.ascii.lowerString(&page.buf, method);
+    const lower = std.ascii.lowerString(exec.buf, method);
 
-    const method_lookup = std.StaticStringMap(net_http.Method).initComptime(.{
+    const method_lookup = std.StaticStringMap(http.Method).initComptime(.{
         .{ "get", .GET },
         .{ "post", .POST },
         .{ "delete", .DELETE },
@@ -144,55 +179,92 @@ pub fn getCredentials(self: *const Request) []const u8 {
     return @tagName(self._credentials);
 }
 
-pub fn getHeaders(self: *Request, page: *Page) !*Headers {
+pub fn getSignal(self: *const Request) ?*AbortSignal {
+    return self._signal;
+}
+
+pub fn getHeaders(self: *Request, exec: *const Execution) !*Headers {
     if (self._headers) |headers| {
         return headers;
     }
 
-    const headers = try Headers.init(null, page);
+    const headers = try Headers.init(null, exec);
     self._headers = headers;
     return headers;
 }
 
-pub fn blob(self: *Request, page: *Page) !js.Promise {
-    const body = self._body orelse "";
-    const headers = try self.getHeaders(page);
-    const content_type = try headers.get("content-type", page) orelse "";
-
-    const b = try Blob.initWithMimeValidation(
-        &.{body},
-        .{ .type = content_type },
-        true,
-        page,
-    );
-
-    return page.js.local.?.resolvePromise(b);
+pub fn getBodyUsed(self: *const Request) bool {
+    if (self._body == null) {
+        return false;
+    }
+    return self._body_used;
 }
 
-pub fn text(self: *const Request, page: *Page) !js.Promise {
-    const body = self._body orelse "";
-    return page.js.local.?.resolvePromise(body);
+// Marks a present body consumed; returns a rejected promise if it already was.
+fn consume(self: *Request, local: *const js.Local) ?js.Promise {
+    if (self._body == null) {
+        return null;
+    }
+
+    if (self._body_used) {
+        return local.rejectPromise(.{ .type_error = "Body has already been read" });
+    }
+    self._body_used = true;
+    return null;
 }
 
-pub fn json(self: *const Request, page: *Page) !js.Promise {
+pub fn blob(self: *Request, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| {
+        return rejected;
+    }
+
     const body = self._body orelse "";
-    const local = page.js.local.?;
-    const value = local.parseJSON(body) catch |err| {
-        return local.rejectPromise(.{@errorName(err)});
+    const headers = try self.getHeaders(exec);
+    const content_type = try headers.get("content-type", exec) orelse "";
+
+    const b = try Blob.initFromBytes(body, content_type, true, exec.page);
+    return local.resolvePromise(b);
+}
+
+pub fn text(self: *Request, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| {
+        return rejected;
+    }
+    return local.resolvePromise(body_init.stripUtf8Bom(self._body orelse ""));
+}
+
+pub fn json(self: *Request, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| {
+        return rejected;
+    }
+
+    const value = local.parseJSON(body_init.stripUtf8Bom(self._body orelse "")) catch {
+        return local.rejectPromise(.{ .syntax_error = "failed to parse" });
     };
     return local.resolvePromise(try value.persist());
 }
 
-pub fn arrayBuffer(self: *const Request, page: *Page) !js.Promise {
-    return page.js.local.?.resolvePromise(js.ArrayBuffer{ .values = self._body orelse "" });
+pub fn arrayBuffer(self: *Request, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| {
+        return rejected;
+    }
+    return local.resolvePromise(js.ArrayBuffer{ .values = self._body orelse "" });
 }
 
-pub fn bytes(self: *const Request, page: *Page) !js.Promise {
-    return page.js.local.?.resolvePromise(js.TypedArray(u8){ .values = self._body orelse "" });
+pub fn bytes(self: *Request, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| {
+        return rejected;
+    }
+    return local.resolvePromise(js.TypedArray(u8){ .values = self._body orelse "" });
 }
 
-pub fn clone(self: *const Request, page: *Page) !*Request {
-    return page._factory.create(Request{
+pub fn clone(self: *const Request, exec: *const Execution) !*Request {
+    return exec._factory.create(Request{
         ._url = self._url,
         ._arena = self._arena,
         ._method = self._method,
@@ -200,6 +272,7 @@ pub fn clone(self: *const Request, page: *Page) !*Request {
         ._cache = self._cache,
         ._credentials = self._credentials,
         ._body = self._body,
+        ._signal = self._signal,
     });
 }
 
@@ -218,6 +291,8 @@ pub const JsApi = struct {
     pub const headers = bridge.accessor(Request.getHeaders, null, .{});
     pub const cache = bridge.accessor(Request.getCache, null, .{});
     pub const credentials = bridge.accessor(Request.getCredentials, null, .{});
+    pub const signal = bridge.accessor(Request.getSignal, null, .{});
+    pub const bodyUsed = bridge.accessor(Request.getBodyUsed, null, .{});
     pub const blob = bridge.function(Request.blob, .{});
     pub const text = bridge.function(Request.text, .{});
     pub const json = bridge.function(Request.json, .{});

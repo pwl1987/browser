@@ -17,10 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const lp = @import("lightpanda");
 const string = @import("../../string.zig");
 
+const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
+const Session = @import("../Session.zig");
 
 const js = @import("js.zig");
 const Local = @import("Local.zig");
@@ -28,23 +30,37 @@ const Context = @import("Context.zig");
 const TaggedOpaque = @import("TaggedOpaque.zig");
 
 const v8 = js.v8;
+const log = lp.log;
 const ArenaAllocator = std.heap.ArenaAllocator;
-
 const CALL_ARENA_RETAIN = 1024 * 16;
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Caller = @This();
+
 local: Local,
 prev_local: ?*const js.Local,
 prev_context: *Context,
 
 // Takes the raw v8 isolate and extracts the context from it.
-pub fn init(self: *Caller, v8_isolate: *v8.Isolate) void {
-    const v8_context = v8.v8__Isolate__GetCurrentContext(v8_isolate).?;
-    initWithContext(self, Context.fromC(v8_context), v8_context);
+// Returns false if the context has been destroyed (e.g., navigated-away iframe),
+// in which case a JS exception has been thrown and the caller should return immediately.
+pub fn init(self: *Caller, v8_isolate: *v8.Isolate) bool {
+    const ctx, const v8_context = Context.fromIsolate(.{ .handle = v8_isolate }) orelse {
+        throwDetachedError(v8_isolate);
+        return false;
+    };
+    initWithContext(self, ctx, v8_context);
+    return true;
 }
 
-fn initWithContext(self: *Caller, ctx: *Context, v8_context: *const v8.Context) void {
+fn throwDetachedError(isolate: *v8.Isolate) void {
+    const message = "Cannot execute in detached context (e.g., navigated-away iframe)";
+    const v8_message = v8.v8__String__NewFromUtf8(isolate, message.ptr, v8.kNormal, @intCast(message.len));
+    const js_exception = v8.v8__Exception__Error(v8_message);
+    _ = v8.v8__Isolate__ThrowException(isolate, js_exception);
+}
+
+pub fn initWithContext(self: *Caller, ctx: *Context, v8_context: *const v8.Context) void {
     ctx.call_depth += 1;
     self.* = Caller{
         .local = .{
@@ -54,15 +70,15 @@ fn initWithContext(self: *Caller, ctx: *Context, v8_context: *const v8.Context) 
             .isolate = ctx.isolate,
         },
         .prev_local = ctx.local,
-        .prev_context = ctx.page.js,
+        .prev_context = ctx.global.getJs(),
     };
-    ctx.page.js = ctx;
+    ctx.global.setJs(ctx);
     ctx.local = &self.local;
 }
 
-pub fn initFromHandle(self: *Caller, handle: ?*const v8.FunctionCallbackInfo) void {
+pub fn initFromHandle(self: *Caller, handle: ?*const v8.FunctionCallbackInfo) bool {
     const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
-    self.init(isolate);
+    return self.init(isolate);
 }
 
 pub fn deinit(self: *Caller) void {
@@ -87,13 +103,17 @@ pub fn deinit(self: *Caller) void {
 
     ctx.call_depth = call_depth;
     ctx.local = self.prev_local;
-    ctx.page.js = self.prev_context;
+    ctx.global.setJs(self.prev_context);
 }
 
 pub const CallOpts = struct {
     dom_exception: bool = false,
     null_as_undefined: bool = false,
     as_typed_array: bool = false,
+    // Constructor-only. When true, `new.target` is pulled from the
+    // FunctionCallbackInfo and passed as the first argument to the Zig
+    // function (as a js.Function). See bridge.Constructor.Opts.
+    new_target: bool = false,
 };
 
 pub fn constructor(self: *Caller, comptime T: type, func: anytype, handle: *const v8.FunctionCallbackInfo, comptime opts: CallOpts) void {
@@ -110,15 +130,20 @@ pub fn constructor(self: *Caller, comptime T: type, func: anytype, handle: *cons
         return;
     }
 
-    self._constructor(func, info) catch |err| {
+    self._constructor(func, info, opts) catch |err| {
         handleError(T, @TypeOf(func), local, err, info, opts);
     };
 }
 
-fn _constructor(self: *Caller, func: anytype, info: FunctionCallbackInfo) !void {
+fn _constructor(self: *Caller, func: anytype, info: FunctionCallbackInfo, comptime opts: CallOpts) !void {
     const F = @TypeOf(func);
     const local = &self.local;
-    const args = try getArgs(F, 0, local, info);
+    const offset: comptime_int = if (opts.new_target) 1 else 0;
+    var args = try getArgs(F, offset, local, info);
+    if (comptime opts.new_target) {
+        const new_target_handle = v8.v8__FunctionCallbackInfo__NewTarget(info.handle).?;
+        @field(args, "0") = js.Function{ .local = local, .handle = @ptrCast(new_target_handle) };
+    }
     const res = @call(.auto, func, args);
 
     const ReturnType = @typeInfo(F).@"fn".return_type orelse {
@@ -128,7 +153,7 @@ fn _constructor(self: *Caller, func: anytype, info: FunctionCallbackInfo) !void 
     const new_this_handle = info.getThis();
     var this = js.Object{ .local = local, .handle = new_this_handle };
     if (@typeInfo(ReturnType) == .error_union) {
-        const non_error_res = res catch |err| return err;
+        const non_error_res = try res;
         this = try local.mapZigInstanceToJs(new_this_handle, non_error_res);
     } else {
         this = try local.mapZigInstanceToJs(new_this_handle, res);
@@ -169,7 +194,7 @@ fn _getIndex(comptime T: type, local: *const Local, func: anytype, idx: u32, inf
     @field(args, "0") = try TaggedOpaque.fromJS(*T, info.getThis());
     @field(args, "1") = idx;
     if (@typeInfo(F).@"fn".params.len == 3) {
-        @field(args, "2") = local.ctx.page;
+        @field(args, "2") = getGlobalArg(@TypeOf(args.@"2"), local.ctx);
     }
     const ret = @call(.auto, func, args);
     return handleIndexedReturn(T, F, true, local, ret, info, opts);
@@ -196,7 +221,7 @@ fn _getNamedIndex(comptime T: type, local: *const Local, func: anytype, name: *c
     @field(args, "0") = try TaggedOpaque.fromJS(*T, info.getThis());
     @field(args, "1") = try nameToString(local, @TypeOf(args.@"1"), name);
     if (@typeInfo(F).@"fn".params.len == 3) {
-        @field(args, "2") = local.ctx.page;
+        @field(args, "2") = getGlobalArg(@TypeOf(args.@"2"), local.ctx);
     }
     const ret = @call(.auto, func, args);
     return handleIndexedReturn(T, F, true, local, ret, info, opts);
@@ -224,7 +249,7 @@ fn _setNamedIndex(comptime T: type, local: *const Local, func: anytype, name: *c
     @field(args, "1") = try nameToString(local, @TypeOf(args.@"1"), name);
     @field(args, "2") = try local.jsValueToZig(@TypeOf(@field(args, "2")), js_value);
     if (@typeInfo(F).@"fn".params.len == 4) {
-        @field(args, "3") = local.ctx.page;
+        @field(args, "3") = getGlobalArg(@TypeOf(args.@"3"), local.ctx);
     }
     const ret = @call(.auto, func, args);
     return handleIndexedReturn(T, F, false, local, ret, info, opts);
@@ -250,7 +275,7 @@ fn _deleteNamedIndex(comptime T: type, local: *const Local, func: anytype, name:
     @field(args, "0") = try TaggedOpaque.fromJS(*T, info.getThis());
     @field(args, "1") = try nameToString(local, @TypeOf(args.@"1"), name);
     if (@typeInfo(F).@"fn".params.len == 3) {
-        @field(args, "2") = local.ctx.page;
+        @field(args, "2") = getGlobalArg(@TypeOf(args.@"2"), local.ctx);
     }
     const ret = @call(.auto, func, args);
     return handleIndexedReturn(T, F, false, local, ret, info, opts);
@@ -276,7 +301,7 @@ fn _getEnumerator(comptime T: type, local: *const Local, func: anytype, info: Pr
     var args: ParameterTypes(F) = undefined;
     @field(args, "0") = try TaggedOpaque.fromJS(*T, info.getThis());
     if (@typeInfo(F).@"fn".params.len == 2) {
-        @field(args, "1") = local.ctx.page;
+        @field(args, "1") = getGlobalArg(@TypeOf(args.@"1"), local.ctx);
     }
     const ret = @call(.auto, func, args);
     return handleIndexedReturn(T, F, true, local, ret, info, opts);
@@ -347,8 +372,10 @@ fn handleError(comptime T: type, comptime F: type, local: *const Local, err: any
         error.TryCatchRethrow => return,
         error.InvalidArgument => isolate.createTypeError("invalid argument"),
         error.TypeError => isolate.createTypeError(""),
+        error.Idna => isolate.createTypeError("invalid domain"),
+        error.RangeError => isolate.createRangeError(""),
         error.OutOfMemory => isolate.createError("out of memory"),
-        error.IllegalConstructor => isolate.createError("Illegal Contructor"),
+        error.IllegalConstructor => isolate.createError("Illegal Constructor"),
         else => blk: {
             if (comptime opts.dom_exception) {
                 const DOMException = @import("../webapi/DOMException.zig");
@@ -430,8 +457,39 @@ fn tupleFieldName(comptime i: usize) [:0]const u8 {
     };
 }
 
+fn isFrame(comptime T: type) bool {
+    return T == *Frame or T == *const Frame;
+}
+
 fn isPage(comptime T: type) bool {
     return T == *Page or T == *const Page;
+}
+
+fn isSession(comptime T: type) bool {
+    return T == *Session or T == *const Session;
+}
+
+fn isExecution(comptime T: type) bool {
+    return T == *js.Execution or T == *const js.Execution;
+}
+
+fn getGlobalArg(comptime T: type, ctx: *Context) T {
+    if (comptime isFrame(T)) {
+        return switch (ctx.global) {
+            .frame => |frame| frame,
+            .worker => unreachable,
+        };
+    }
+
+    if (comptime isPage(T)) {
+        return ctx.page;
+    }
+
+    if (comptime isExecution(T)) {
+        return &ctx.execution;
+    }
+
+    @compileError("Unsupported global arg type: " ++ @typeName(T));
 }
 
 // These wrap the raw v8 C API to provide a cleaner interface.
@@ -505,11 +563,17 @@ pub const Function = struct {
     pub const Opts = struct {
         noop: bool = false,
         static: bool = false,
+        wpt_only: bool = false,
+        deletable: bool = true,
         dom_exception: bool = false,
         as_typed_array: bool = false,
         null_as_undefined: bool = false,
         cache: ?Caching = null,
         embedded_receiver: bool = false,
+        exposed: Exposed = .both,
+        ce_reactions: bool = false,
+
+        pub const Exposed = enum { both, window, worker };
 
         // We support two ways to cache a value directly into a v8::Object. The
         // difference between the two is like the difference between a Map
@@ -537,9 +601,10 @@ pub const Function = struct {
 
     pub fn call(comptime T: type, info_handle: *const v8.FunctionCallbackInfo, func: anytype, comptime opts: Opts) void {
         const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(info_handle).?;
-        const v8_context = v8.v8__Isolate__GetCurrentContext(v8_isolate).?;
-
-        const ctx = Context.fromC(v8_context);
+        const ctx, const v8_context = Context.fromIsolate(.{ .handle = v8_isolate }) orelse {
+            throwDetachedError(v8_isolate);
+            return;
+        };
         const info = FunctionCallbackInfo{ .handle = info_handle };
 
         var hs: js.HandleScope = undefined;
@@ -560,6 +625,26 @@ pub const Function = struct {
         var caller: Caller = undefined;
         caller.initWithContext(ctx, v8_context);
         defer caller.deinit();
+
+        // [CEReactions] entry: open a reactions scope so any custom-element
+        // callbacks queued by DOM mutation inside `func` fire after it
+        // returns, never mid-algorithm.
+        var ce_checkpoint: usize = undefined;
+        const ce_frame: ?*Frame = if (comptime opts.ce_reactions) switch (ctx.global) {
+            .frame => |frame| frame,
+            .worker => null,
+        } else null;
+
+        if (comptime opts.ce_reactions) {
+            if (ce_frame) |frame| {
+                ce_checkpoint = frame._ce_reactions.push();
+            }
+        }
+        defer if (comptime opts.ce_reactions) {
+            if (ce_frame) |frame| {
+                frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
+            }
+        };
 
         const js_value = _call(T, &caller.local, info, func, opts) catch |err| {
             handleError(T, @TypeOf(func), &caller.local, err, info, .{
@@ -615,10 +700,21 @@ pub const Function = struct {
 
         switch (cache) {
             .internal => |idx| {
+                // Defensive check: verify object has enough internal fields.
+                // This guards against edge cases where signature check passes but
+                // the receiver doesn't have expected internal fields (e.g., global
+                // proxy vs global object, cross-context scenarios).
+                if (v8.v8__Object__InternalFieldCount(js_this) <= idx) {
+                    if (comptime IS_DEBUG) {
+                        std.debug.assert(false);
+                    }
+                    return false;
+                }
+
                 if (v8.v8__Object__GetInternalField(js_this, idx)) |cached| {
                     // means we can't cache undefined, since we can't tell the
                     // difference between "it isn't in the cache" and  "it's
-                    // in the cache with a valud of undefined"
+                    // in the cache with a value of undefined"
                     if (!v8.v8__Value__IsUndefined(cached)) {
                         return_value.set(cached);
                         return true;
@@ -703,16 +799,17 @@ fn getArgs(comptime F: type, comptime offset: usize, local: *const Local, info: 
             return args;
         }
 
-        // If the last parameter is the Page, set it, and exclude it
-        // from our params slice, because we don't want to bind it to
-        // a JS argument
-        if (comptime isPage(params[params.len - 1].type.?)) {
-            @field(args, tupleFieldName(params.len - 1 + offset)) = local.ctx.page;
+        // If the last parameter is Frame/Page/Session/Execution, set it from
+        // context and exclude it from our params slice, because we don't want
+        // to bind it to a JS argument.
+        const LastParamType = params[params.len - 1].type.?;
+        if (comptime isFrame(LastParamType) or isPage(LastParamType) or isExecution(LastParamType) or isSession(LastParamType)) {
+            @field(args, tupleFieldName(params.len - 1 + offset)) = getGlobalArg(LastParamType, local.ctx);
             break :blk params[0 .. params.len - 1];
         }
 
-        // we have neither a Page nor a JsObject. All params must be
-        // bound to a JavaScript value.
+        // we have neither a Frame/Page/Session/Execution nor a JsObject.
+        // All params must be bound to a JavaScript value.
         break :blk params;
     };
 
@@ -759,8 +856,14 @@ fn getArgs(comptime F: type, comptime offset: usize, local: *const Local, info: 
             }
         }
 
-        if (comptime isPage(param.type.?)) {
-            @compileError("Page must be the last parameter (or 2nd last if there's a JsThis): " ++ @typeName(F));
+        if (comptime isFrame(param.type.?)) {
+            @compileError("Frame must be the last parameter: " ++ @typeName(F));
+        } else if (comptime isPage(param.type.?)) {
+            @compileError("Page must be the last parameter: " ++ @typeName(F));
+        } else if (comptime isExecution(param.type.?)) {
+            @compileError("Execution must be the last parameter: " ++ @typeName(F));
+        } else if (comptime isSession(param.type.?)) {
+            @compileError("Session must be the last parameter: " ++ @typeName(F));
         } else if (i >= js_parameter_count) {
             if (@typeInfo(param.type.?) != .optional) {
                 return error.InvalidArgument;
@@ -768,7 +871,23 @@ fn getArgs(comptime F: type, comptime offset: usize, local: *const Local, info: 
             @field(args, tupleFieldName(field_index)) = null;
         } else {
             const js_val = info.getArg(@intCast(i), local);
-            @field(args, tupleFieldName(field_index)) = local.jsValueToZig(param.type.?, js_val) catch {
+            // Only fold errors we don't recognize into InvalidArgument; let
+            // domain-meaningful ones (e.g. InvalidCharacterError from a
+            // String.OneByte param) propagate so handleError can map them
+            // to the right DOMException. Compared by name because the per-
+            // type instantiation of jsValueToZig may not include such errors
+            // in its inferred error set.
+            @field(args, tupleFieldName(field_index)) = local.jsValueToZig(param.type.?, js_val) catch |err| {
+                const DOMException = @import("../webapi/DOMException.zig");
+                if (DOMException.fromError(err) != null) {
+                    // I don't love this. But we have [a few] cases when trying to
+                    // map a JS Value that we have a specific DOMException to throw.
+                    // Ideally we should only do this if dom_exception = true in the
+                    // bridge definition. But we don't have access to that here.
+                    // Instead, we just rely on the fact that local.jsValueToZig
+                    // only throws a DOMException-known error when it should.
+                    return err;
+                }
                 return error.InvalidArgument;
             };
         }

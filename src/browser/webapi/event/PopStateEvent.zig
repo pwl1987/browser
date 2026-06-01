@@ -17,13 +17,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 // https://developer.mozilla.org/en-US/docs/Web/API/PopStateEvent
@@ -38,23 +39,23 @@ const PopStateEventOptions = struct {
 
 const Options = Event.inheritOptions(PopStateEvent, PopStateEventOptions);
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*PopStateEvent {
-    const arena = try page.getArena(.{ .debug = "PopStateEvent" });
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*PopStateEvent {
+    const arena = try frame.getArena(.tiny, "PopStateEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, _opts, false, page);
+    return initWithTrusted(arena, type_string, _opts, false, frame);
 }
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*PopStateEvent {
-    const arena = try page.getArena(.{ .debug = "PopStateEvent.trusted" });
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*PopStateEvent {
+    const arena = try frame.getArena(.tiny, "PopStateEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*PopStateEvent {
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*PopStateEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         PopStateEvent{
@@ -67,17 +68,13 @@ fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool
     return event;
 }
 
-pub fn deinit(self: *PopStateEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
-}
-
 pub fn asEvent(self: *PopStateEvent) *Event {
     return self._proto;
 }
 
-pub fn getState(self: *PopStateEvent, page: *Page) !?js.Value {
+pub fn getState(self: *PopStateEvent, frame: *Frame) !?js.Value {
     const s = self._state orelse return null;
-    return try page.js.local.?.parseJSON(s);
+    return try frame.js.local.?.parseJSON(s);
 }
 
 pub fn hasUAVisualTransition(_: *PopStateEvent) bool {
@@ -92,8 +89,6 @@ pub const JsApi = struct {
         pub const name = "PopStateEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(PopStateEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(PopStateEvent.init, .{});
